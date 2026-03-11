@@ -1,0 +1,12 @@
+node_modules
+dist
+.env
+.env.local
+.env.*.local
+npm-debug.log*
+.DS_Store
+*.tsbuildinfo
+.git
+.gitignore
+vitest.config.ts
+src/__tests__
