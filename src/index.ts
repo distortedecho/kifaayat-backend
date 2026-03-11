@@ -22,16 +22,18 @@ import admin from "./routes/admin.js";
 
 const app = new Hono();
 
-// CORS - allow mobile dev origins
+const allowedOrigins = [
+  "http://localhost:19006",
+  "http://localhost:8081",
+  "http://localhost:3000",
+  "http://localhost:5173",
+  ...(process.env.CORS_ORIGINS?.split(",").map((o) => o.trim()).filter(Boolean) ?? []),
+];
+
 app.use(
   "*",
   cors({
-    origin: [
-      "http://localhost:19006",
-      "http://localhost:8081",
-      "http://localhost:3000",
-      "http://localhost:5173",
-    ],
+    origin: allowedOrigins,
     allowMethods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
     allowHeaders: ["Content-Type", "Authorization", "x-guest-token"],
     exposeHeaders: ["Content-Length"],
