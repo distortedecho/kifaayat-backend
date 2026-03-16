@@ -5,6 +5,7 @@ import { createSupabaseAdmin } from "../lib/supabase.js";
 import {
   LISTING_CATEGORIES,
   LISTING_CONDITIONS,
+  LISTING_STATUSES,
   OCCASION_TAGS,
 } from "../types/listings.js";
 import {
@@ -655,6 +656,203 @@ admin.post("/listings/:id/photos", async (c) => {
   }
 
   return c.json({ photo }, 201);
+});
+
+// ============================================================
+// Admin Listing CRUD (get single, update, status change, delete)
+// ============================================================
+
+admin.get("/listings/:id", async (c) => {
+  const listingId = c.req.param("id");
+  const supabase = createSupabaseAdmin();
+
+  const { data: listing, error } = await supabase
+    .from("listings")
+    .select(
+      "*, listing_photos(*), profiles!listings_seller_id_fkey(id, display_name, avatar_url, location, stripe_onboarding_complete)"
+    )
+    .eq("id", listingId)
+    .single();
+
+  if (error || !listing) {
+    return c.json({ error: "Listing not found" }, 404);
+  }
+
+  const result = {
+    ...listing,
+    photos: (listing.listing_photos || []).sort(
+      (a: { position: number }, b: { position: number }) => a.position - b.position
+    ),
+    seller: listing.profiles || null,
+    listing_photos: undefined,
+    profiles: undefined,
+  };
+
+  return c.json({ listing: result });
+});
+
+const adminUpdateListingSchema = z.object({
+  title: z.string().min(1).max(200).optional(),
+  description: z.string().max(2000).nullable().optional(),
+  category: z.enum(LISTING_CATEGORIES as unknown as [string, ...string[]]).optional(),
+  condition: z.enum(LISTING_CONDITIONS as unknown as [string, ...string[]]).optional(),
+  measurements: z
+    .object({
+      bust: z.string().optional(),
+      waist: z.string().optional(),
+      hip: z.string().optional(),
+      length: z.string().optional(),
+      sleeve_length: z.string().optional(),
+      chest: z.string().optional(),
+      age_range: z.string().optional(),
+    })
+    .nullable()
+    .optional(),
+  occasion_tags: z.array(z.enum(OCCASION_TAGS as unknown as [string, ...string[]])).optional(),
+  colors: z.array(z.string()).optional(),
+  price_amount: z.number().int().positive().optional(),
+  price_currency: z.enum(["AUD", "USD", "NZD"]).optional(),
+  original_price_amount: z.number().int().positive().nullable().optional(),
+  negotiable: z.boolean().optional(),
+  shipping_info: z.string().max(500).nullable().optional(),
+});
+
+admin.put("/listings/:id", async (c) => {
+  const listingId = c.req.param("id");
+  const supabase = createSupabaseAdmin();
+
+  const body = await c.req.json();
+  const parsed = adminUpdateListingSchema.safeParse(body);
+
+  if (!parsed.success) {
+    return c.json({ error: "Validation failed", details: parsed.error.flatten().fieldErrors }, 400);
+  }
+
+  const { data: existing, error: fetchError } = await supabase
+    .from("listings")
+    .select("id")
+    .eq("id", listingId)
+    .single();
+
+  if (fetchError || !existing) {
+    return c.json({ error: "Listing not found" }, 404);
+  }
+
+  const updateData: Record<string, unknown> = {};
+  const input = parsed.data;
+  if (input.title !== undefined) updateData.title = input.title;
+  if (input.description !== undefined) updateData.description = input.description;
+  if (input.category !== undefined) updateData.category = input.category;
+  if (input.condition !== undefined) updateData.condition = input.condition;
+  if (input.measurements !== undefined) updateData.measurements = input.measurements;
+  if (input.occasion_tags !== undefined) updateData.occasion_tags = input.occasion_tags;
+  if (input.colors !== undefined) updateData.colors = input.colors;
+  if (input.price_amount !== undefined) updateData.price_amount = input.price_amount;
+  if (input.price_currency !== undefined) updateData.price_currency = input.price_currency;
+  if (input.original_price_amount !== undefined) updateData.original_price_amount = input.original_price_amount;
+  if (input.negotiable !== undefined) updateData.negotiable = input.negotiable;
+  if (input.shipping_info !== undefined) updateData.shipping_info = input.shipping_info;
+
+  if (Object.keys(updateData).length === 0) {
+    return c.json({ error: "No fields to update" }, 400);
+  }
+
+  const { data: updated, error: updateError } = await supabase
+    .from("listings")
+    .update(updateData)
+    .eq("id", listingId)
+    .select()
+    .single();
+
+  if (updateError) {
+    console.error("Error updating listing:", updateError);
+    return c.json({ error: "Failed to update listing" }, 500);
+  }
+
+  return c.json({ listing: updated });
+});
+
+admin.patch("/listings/:id/status", async (c) => {
+  const listingId = c.req.param("id");
+  const supabase = createSupabaseAdmin();
+
+  const statusSchema = z.object({
+    status: z.enum(LISTING_STATUSES as unknown as [string, ...string[]]),
+  });
+
+  const body = await c.req.json();
+  const parsed = statusSchema.safeParse(body);
+
+  if (!parsed.success) {
+    return c.json({ error: "Invalid status", details: parsed.error.flatten().fieldErrors }, 400);
+  }
+
+  const { data: existing, error: fetchError } = await supabase
+    .from("listings")
+    .select("id, status")
+    .eq("id", listingId)
+    .single();
+
+  if (fetchError || !existing) {
+    return c.json({ error: "Listing not found" }, 404);
+  }
+
+  if (existing.status === parsed.data.status) {
+    return c.json({ error: `Listing is already '${parsed.data.status}'` }, 400);
+  }
+
+  const { data: updated, error: updateError } = await supabase
+    .from("listings")
+    .update({ status: parsed.data.status, rejection_reason: null })
+    .eq("id", listingId)
+    .select()
+    .single();
+
+  if (updateError) {
+    console.error("Error updating listing status:", updateError);
+    return c.json({ error: "Failed to update listing status" }, 500);
+  }
+
+  return c.json({ listing: updated });
+});
+
+admin.delete("/listings/:id", async (c) => {
+  const listingId = c.req.param("id");
+  const supabase = createSupabaseAdmin();
+
+  const { data: listing, error: fetchError } = await supabase
+    .from("listings")
+    .select("id")
+    .eq("id", listingId)
+    .single();
+
+  if (fetchError || !listing) {
+    return c.json({ error: "Listing not found" }, 404);
+  }
+
+  const { data: photos } = await supabase
+    .from("listing_photos")
+    .select("storage_path")
+    .eq("listing_id", listingId);
+
+  if (photos && photos.length > 0) {
+    const paths = photos.map((p) => p.storage_path);
+    await supabase.storage.from("listing-photos").remove(paths);
+  }
+
+  await supabase.from("listing_photos").delete().eq("listing_id", listingId);
+
+  const { error: deleteError } = await supabase
+    .from("listings")
+    .delete()
+    .eq("id", listingId);
+
+  if (deleteError) {
+    console.error("Error deleting listing:", deleteError);
+    return c.json({ error: "Failed to delete listing" }, 500);
+  }
+
+  return c.json({ success: true });
 });
 
 // ============================================================
