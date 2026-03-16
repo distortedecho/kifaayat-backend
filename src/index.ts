@@ -27,13 +27,19 @@ const allowedOrigins = [
   "http://localhost:8081",
   "http://localhost:3000",
   "http://localhost:5173",
+  "https://kifaayat-admin.vercel.app",
   ...(process.env.CORS_ORIGINS?.split(",").map((o) => o.trim()).filter(Boolean) ?? []),
 ];
 
 app.use(
   "*",
   cors({
-    origin: allowedOrigins,
+    origin: (origin) => {
+      if (!origin) return allowedOrigins[0];
+      if (allowedOrigins.includes(origin)) return origin;
+      if (origin.endsWith(".vercel.app")) return origin;
+      return null;
+    },
     allowMethods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
     allowHeaders: ["Content-Type", "Authorization", "x-guest-token"],
     exposeHeaders: ["Content-Length"],
