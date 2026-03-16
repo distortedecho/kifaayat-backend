@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import { GoogleGenerativeAI } from "@google/generative-ai";
+import { GoogleGenAI } from "@google/genai";
 import { clerkMiddleware } from "../middleware/clerk.js";
 import { removeBackground } from "../lib/background-removal.js";
 import {
@@ -60,14 +60,7 @@ ai.post("/analyze", clerkMiddleware, async (c) => {
     return c.json({ error: "AI service not configured", fallback: true } satisfies AIErrorResponse, 503);
   }
 
-  const genAI = new GoogleGenerativeAI(apiKey);
-  const model = genAI.getGenerativeModel({
-    model: "gemini-3.1-pro-preview",
-    generationConfig: {
-      responseMimeType: "application/json",
-      temperature: 0.2,
-    },
-  });
+  const genAI = new GoogleGenAI({ apiKey });
 
   // Build multimodal prompt with inline image data
   const imageParts = photos.map((photo) => ({
@@ -101,8 +94,15 @@ Return valid JSON only, no markdown formatting.`;
   let lastError: unknown;
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      const result = await model.generateContent([prompt, ...imageParts]);
-      const responseText = result.response.text();
+      const result = await genAI.models.generateContent({
+        model: "gemini-2.5-flash",
+        contents: [prompt, ...imageParts],
+        config: {
+          responseMimeType: "application/json",
+          temperature: 0.2,
+        },
+      });
+      const responseText = result.text ?? "";
       const parsed = JSON.parse(responseText);
 
       // Map and validate response

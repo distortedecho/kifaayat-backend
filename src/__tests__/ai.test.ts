@@ -12,15 +12,15 @@ vi.mock("../middleware/clerk.js", () => ({
   }),
 }));
 
-// Mock @google/generative-ai
+// Mock @google/genai
 const mockGenerateContent = vi.fn();
-vi.mock("@google/generative-ai", () => {
+vi.mock("@google/genai", () => {
   return {
-    GoogleGenerativeAI: class MockGoogleGenerativeAI {
-      constructor(_apiKey: string) {}
-      getGenerativeModel() {
-        return { generateContent: mockGenerateContent };
-      }
+    GoogleGenAI: class MockGoogleGenAI {
+      constructor(_config: { apiKey: string }) {}
+      models = {
+        generateContent: mockGenerateContent,
+      };
     },
   };
 });
@@ -71,9 +71,7 @@ describe("POST /api/ai/analyze", () => {
     };
 
     mockGenerateContent.mockResolvedValue({
-      response: {
-        text: () => JSON.stringify(mockResponse),
-      },
+      text: JSON.stringify(mockResponse),
     });
 
     const app = createApp();
@@ -162,9 +160,7 @@ describe("POST /api/ai/analyze", () => {
     };
 
     mockGenerateContent.mockResolvedValue({
-      response: {
-        text: () => JSON.stringify(mockResponse),
-      },
+      text: JSON.stringify(mockResponse),
     });
 
     const app = createApp();
