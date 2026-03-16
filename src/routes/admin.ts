@@ -170,6 +170,67 @@ async function sendListingReviewEmail(params: {
 }
 
 // ============================================================
+// All Listings (browse, filter, search)
+// ============================================================
+
+admin.get("/listings/all", async (c) => {
+  const supabase = createSupabaseAdmin();
+
+  const status = c.req.query("status") || "";
+  const search = c.req.query("search") || "";
+  const category = c.req.query("category") || "";
+  const sort = c.req.query("sort") || "created_at";
+  const order = c.req.query("order") || "desc";
+  const page = parseInt(c.req.query("page") || "1", 10);
+  const limit = Math.min(parseInt(c.req.query("limit") || "50", 10), 100);
+  const offset = (page - 1) * limit;
+
+  const allowedSortCols = ["created_at", "price_amount", "title", "category"];
+  const sortCol = allowedSortCols.includes(sort) ? sort : "created_at";
+  const ascending = order === "asc";
+
+  let query = supabase
+    .from("listings")
+    .select(
+      "*, listing_photos(*), profiles!listings_seller_id_fkey(display_name, avatar_url, location)",
+      { count: "exact" }
+    )
+    .order(sortCol, { ascending })
+    .range(offset, offset + limit - 1);
+
+  if (status && status !== "all") {
+    query = query.eq("status", status);
+  }
+
+  if (search) {
+    query = query.ilike("title", `%${search}%`);
+  }
+
+  if (category) {
+    query = query.eq("category", category);
+  }
+
+  const { data: listings, error, count } = await query;
+
+  if (error) {
+    console.error("Error fetching all listings:", error);
+    return c.json({ error: "Failed to fetch listings" }, 500);
+  }
+
+  const result = (listings || []).map((listing) => ({
+    ...listing,
+    photos: (listing.listing_photos || []).sort(
+      (a: { position: number }, b: { position: number }) => a.position - b.position
+    ),
+    seller: listing.profiles || null,
+    listing_photos: undefined,
+    profiles: undefined,
+  }));
+
+  return c.json({ listings: result, total: count || 0, page, limit });
+});
+
+// ============================================================
 // Listing Review Queue
 // ============================================================
 
