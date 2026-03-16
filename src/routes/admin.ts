@@ -91,7 +91,9 @@ admin.post("/auth/refresh", async (c) => {
 // Protected routes (require admin auth)
 // ============================================================
 
+admin.use("/listings", adminAuthMiddleware);
 admin.use("/listings/*", adminAuthMiddleware);
+admin.use("/users", adminAuthMiddleware);
 admin.use("/users/*", adminAuthMiddleware);
 admin.use("/dashboard", adminAuthMiddleware);
 admin.use("/dashboard/*", adminAuthMiddleware);
