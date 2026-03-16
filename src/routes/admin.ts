@@ -1,8 +1,12 @@
 import { Hono } from "hono";
 import { z } from "zod";
-import { createClerkClient } from "@clerk/backend";
-import { clerkMiddleware } from "../middleware/clerk.js";
+import { adminAuthMiddleware } from "../middleware/adminAuth.js";
 import { createSupabaseAdmin } from "../lib/supabase.js";
+import {
+  LISTING_CATEGORIES,
+  LISTING_CONDITIONS,
+  OCCASION_TAGS,
+} from "../types/listings.js";
 import {
   createNotification,
   listingApprovedNotification,
@@ -12,30 +16,86 @@ import {
 const admin = new Hono();
 
 // ============================================================
-// Admin Guard Middleware
+// Public Auth Route (no middleware)
 // ============================================================
 
-async function isAdmin(clerkUserId: string): Promise<{ admin: boolean; profileId: string | null }> {
+admin.post("/auth/login", async (c) => {
+  const bodySchema = z.object({
+    email: z.string().email(),
+    password: z.string().min(1),
+  });
+
+  const body = await c.req.json();
+  const parsed = bodySchema.safeParse(body);
+
+  if (!parsed.success) {
+    return c.json({ error: "Invalid email or password" }, 400);
+  }
+
   const supabase = createSupabaseAdmin();
-  const { data, error } = await supabase
-    .from("profiles")
-    .select("id, is_admin")
-    .eq("clerk_id", clerkUserId)
-    .single();
+  const { data, error } = await supabase.auth.signInWithPassword({
+    email: parsed.data.email,
+    password: parsed.data.password,
+  });
 
-  if (error || !data) return { admin: false, profileId: null };
-  return { admin: data.is_admin === true, profileId: data.id };
-}
+  if (error || !data.session) {
+    return c.json({ error: "Invalid email or password" }, 401);
+  }
 
-// Apply Clerk auth + admin check to ALL routes
-admin.use("*", clerkMiddleware, async (c, next) => {
-  const clerkUserId = c.get("clerkUserId");
-  const { admin: isAdminUser } = await isAdmin(clerkUserId);
-  if (!isAdminUser) {
+  const adminEmails = (process.env.ADMIN_EMAILS || "")
+    .split(",")
+    .map((e) => e.trim().toLowerCase())
+    .filter(Boolean);
+
+  if (adminEmails.length > 0 && !adminEmails.includes(data.user.email?.toLowerCase() || "")) {
     return c.json({ error: "Forbidden: admin access required" }, 403);
   }
-  await next();
+
+  return c.json({
+    access_token: data.session.access_token,
+    refresh_token: data.session.refresh_token,
+    expires_at: data.session.expires_at,
+    user: {
+      id: data.user.id,
+      email: data.user.email,
+    },
+  });
 });
+
+admin.post("/auth/refresh", async (c) => {
+  const bodySchema = z.object({ refresh_token: z.string().min(1) });
+  const body = await c.req.json();
+  const parsed = bodySchema.safeParse(body);
+
+  if (!parsed.success) {
+    return c.json({ error: "refresh_token required" }, 400);
+  }
+
+  const supabase = createSupabaseAdmin();
+  const { data, error } = await supabase.auth.refreshSession({
+    refresh_token: parsed.data.refresh_token,
+  });
+
+  if (error || !data.session) {
+    return c.json({ error: "Invalid refresh token" }, 401);
+  }
+
+  return c.json({
+    access_token: data.session.access_token,
+    refresh_token: data.session.refresh_token,
+    expires_at: data.session.expires_at,
+  });
+});
+
+// ============================================================
+// Protected routes (require admin auth)
+// ============================================================
+
+admin.use("/listings/*", adminAuthMiddleware);
+admin.use("/users/*", adminAuthMiddleware);
+admin.use("/dashboard", adminAuthMiddleware);
+admin.use("/dashboard/*", adminAuthMiddleware);
+admin.use("/settings", adminAuthMiddleware);
 
 // ============================================================
 // Helpers
@@ -54,7 +114,7 @@ function parseRange(range: string | undefined): Date | null {
 
 /**
  * Fire-and-forget email notification for listing review.
- * Looks up seller email via Clerk, then POSTs to email-hooks endpoint.
+ * Looks up seller email from Clerk (still used for mobile users), then POSTs to email-hooks.
  */
 async function sendListingReviewEmail(params: {
   sellerClerkId: string;
@@ -66,15 +126,27 @@ async function sendListingReviewEmail(params: {
   rejectionReason?: string;
 }): Promise<void> {
   try {
-    const clerk = createClerkClient({
-      secretKey: process.env.CLERK_SECRET_KEY || "",
-    });
-    const user = await clerk.users.getUser(params.sellerClerkId);
-    const sellerEmail = user.emailAddresses[0]?.emailAddress;
+    // Look up seller email via Clerk (mobile users still use Clerk)
+    let sellerEmail: string | null = null;
+    try {
+      const { createClerkClient } = await import("@clerk/backend");
+      const clerk = createClerkClient({
+        secretKey: process.env.CLERK_SECRET_KEY || "",
+      });
+      const user = await clerk.users.getUser(params.sellerClerkId);
+      sellerEmail = user.emailAddresses[0]?.emailAddress || null;
+    } catch {
+      console.warn("[admin] Could not look up seller email via Clerk");
+    }
+
     if (!sellerEmail) return;
 
-    const port = process.env.PORT || "3001";
-    await fetch(`http://localhost:${port}/api/email-hooks/listing-review`, {
+    const baseUrl =
+      process.env.API_URL ||
+      process.env.BACKEND_URL ||
+      `http://localhost:${process.env.PORT || "3001"}`;
+
+    await fetch(`${baseUrl}/api/email-hooks/listing-review`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -84,7 +156,7 @@ async function sendListingReviewEmail(params: {
         seller_email: sellerEmail,
         seller_name: params.sellerName,
         listing_title: params.listingTitle,
-        listing_photo_url: params.listingPhotoUrl,
+        listing_photo_url: params.listingPhotoUrl || undefined,
         listing_id: params.listingId,
         approved: params.approved,
         rejection_reason: params.rejectionReason,
@@ -99,10 +171,6 @@ async function sendListingReviewEmail(params: {
 // Listing Review Queue
 // ============================================================
 
-/**
- * GET /api/admin/listings/pending
- * Returns all pending_review listings with photos and seller info.
- */
 admin.get("/listings/pending", async (c) => {
   const supabase = createSupabaseAdmin();
   const sort = c.req.query("sort") || "oldest_first";
@@ -144,15 +212,10 @@ admin.get("/listings/pending", async (c) => {
   return c.json({ listings: result, total: count || 0 });
 });
 
-/**
- * POST /api/admin/listings/:id/approve
- * Approve a single listing (pending_review -> active).
- */
 admin.post("/listings/:id/approve", async (c) => {
   const listingId = c.req.param("id");
   const supabase = createSupabaseAdmin();
 
-  // Fetch listing with seller info
   const { data: listing, error: fetchError } = await supabase
     .from("listings")
     .select("*, profiles!listings_seller_id_fkey(id, clerk_id, display_name, avatar_url, stripe_account_id, stripe_onboarding_complete)")
@@ -167,13 +230,11 @@ admin.post("/listings/:id/approve", async (c) => {
     return c.json({ error: `Cannot approve listing with status '${listing.status}'` }, 400);
   }
 
-  // Gate: seller must have completed Stripe onboarding
   const seller = listing.profiles as { id: string; clerk_id: string; display_name: string; avatar_url: string; stripe_account_id: string | null; stripe_onboarding_complete: boolean } | null;
   if (!seller?.stripe_onboarding_complete) {
     return c.json({ error: "Cannot approve: seller has not completed Stripe onboarding" }, 400);
   }
 
-  // Update status
   const { data: updated, error: updateError } = await supabase
     .from("listings")
     .update({ status: "active", rejection_reason: null })
@@ -186,7 +247,6 @@ admin.post("/listings/:id/approve", async (c) => {
     return c.json({ error: "Failed to approve listing" }, 500);
   }
 
-  // Fire-and-forget: in-app + push notification
   if (seller) {
     const template = listingApprovedNotification(listing.title);
     createNotification({
@@ -197,7 +257,6 @@ admin.post("/listings/:id/approve", async (c) => {
       data: { listing_id: listingId },
     }).catch((err) => console.error("[admin] Notification error:", err));
 
-    // Get cover photo URL for email
     const { data: coverPhoto } = await supabase
       .from("listing_photos")
       .select("url")
@@ -206,7 +265,6 @@ admin.post("/listings/:id/approve", async (c) => {
       .limit(1)
       .single();
 
-    // Fire-and-forget: email
     sendListingReviewEmail({
       sellerClerkId: seller.clerk_id,
       sellerName: seller.display_name || "Seller",
@@ -220,10 +278,6 @@ admin.post("/listings/:id/approve", async (c) => {
   return c.json({ listing: updated });
 });
 
-/**
- * POST /api/admin/listings/:id/reject
- * Reject a single listing (pending_review -> draft).
- */
 admin.post("/listings/:id/reject", async (c) => {
   const listingId = c.req.param("id");
   const supabase = createSupabaseAdmin();
@@ -240,7 +294,6 @@ admin.post("/listings/:id/reject", async (c) => {
 
   const { reason } = parsed.data;
 
-  // Fetch listing with seller info
   const { data: listing, error: fetchError } = await supabase
     .from("listings")
     .select("*, profiles!listings_seller_id_fkey(id, clerk_id, display_name, avatar_url)")
@@ -255,7 +308,6 @@ admin.post("/listings/:id/reject", async (c) => {
     return c.json({ error: `Cannot reject listing with status '${listing.status}'` }, 400);
   }
 
-  // Update status
   const { data: updated, error: updateError } = await supabase
     .from("listings")
     .update({ status: "draft", rejection_reason: reason })
@@ -268,7 +320,6 @@ admin.post("/listings/:id/reject", async (c) => {
     return c.json({ error: "Failed to reject listing" }, 500);
   }
 
-  // Fire-and-forget: in-app + push notification
   const seller = listing.profiles as { id: string; clerk_id: string; display_name: string; avatar_url: string } | null;
   if (seller) {
     const template = listingRejectedNotification(listing.title, reason);
@@ -280,7 +331,6 @@ admin.post("/listings/:id/reject", async (c) => {
       data: { listing_id: listingId },
     }).catch((err) => console.error("[admin] Notification error:", err));
 
-    // Get cover photo URL for email
     const { data: coverPhoto } = await supabase
       .from("listing_photos")
       .select("url")
@@ -289,7 +339,6 @@ admin.post("/listings/:id/reject", async (c) => {
       .limit(1)
       .single();
 
-    // Fire-and-forget: email
     sendListingReviewEmail({
       sellerClerkId: seller.clerk_id,
       sellerName: seller.display_name || "Seller",
@@ -304,10 +353,6 @@ admin.post("/listings/:id/reject", async (c) => {
   return c.json({ listing: updated });
 });
 
-/**
- * POST /api/admin/listings/batch
- * Batch approve or reject multiple listings.
- */
 admin.post("/listings/batch", async (c) => {
   const supabase = createSupabaseAdmin();
 
@@ -332,7 +377,6 @@ admin.post("/listings/batch", async (c) => {
 
   for (const id of listing_ids) {
     try {
-      // Fetch listing with seller info
       const { data: listing, error: fetchError } = await supabase
         .from("listings")
         .select("*, profiles!listings_seller_id_fkey(id, clerk_id, display_name, avatar_url, stripe_account_id, stripe_onboarding_complete)")
@@ -349,7 +393,6 @@ admin.post("/listings/batch", async (c) => {
         continue;
       }
 
-      // Gate: seller must have completed Stripe onboarding for approval
       const seller = listing.profiles as { id: string; clerk_id: string; display_name: string; avatar_url: string; stripe_account_id: string | null; stripe_onboarding_complete: boolean } | null;
       if (action === "approve" && !seller?.stripe_onboarding_complete) {
         results.push({ id, success: false, error: "Seller has not completed Stripe onboarding" });
@@ -373,7 +416,6 @@ admin.post("/listings/batch", async (c) => {
 
       results.push({ id, success: true });
 
-      // Fire-and-forget notifications
       if (seller) {
         const template =
           action === "approve"
@@ -388,7 +430,6 @@ admin.post("/listings/batch", async (c) => {
           data: { listing_id: id },
         }).catch((err) => console.error("[admin] Batch notification error:", err));
 
-        // Get cover photo URL for email
         const { data: coverPhoto } = await supabase
           .from("listing_photos")
           .select("url")
@@ -407,7 +448,7 @@ admin.post("/listings/batch", async (c) => {
           rejectionReason: reason,
         }).catch((err) => console.error("[admin] Batch email error:", err));
       }
-    } catch (err) {
+    } catch {
       results.push({ id, success: false, error: "Unexpected error" });
     }
   }
@@ -416,13 +457,147 @@ admin.post("/listings/batch", async (c) => {
 });
 
 // ============================================================
+// Admin Create Listing (direct to active, skips review)
+// ============================================================
+
+const adminCreateListingSchema = z.object({
+  title: z.string().min(1).max(200),
+  description: z.string().max(2000).optional(),
+  category: z.enum(LISTING_CATEGORIES as unknown as [string, ...string[]]),
+  condition: z.enum(LISTING_CONDITIONS as unknown as [string, ...string[]]),
+  measurements: z
+    .object({
+      bust: z.string().optional(),
+      waist: z.string().optional(),
+      hip: z.string().optional(),
+      length: z.string().optional(),
+      sleeve_length: z.string().optional(),
+      chest: z.string().optional(),
+      age_range: z.string().optional(),
+    })
+    .optional(),
+  occasion_tags: z.array(z.enum(OCCASION_TAGS as unknown as [string, ...string[]])).optional(),
+  colors: z.array(z.string()).optional(),
+  price_amount: z.number().int().positive(),
+  price_currency: z.enum(["AUD", "USD", "NZD"]).optional(),
+  original_price_amount: z.number().int().positive().optional(),
+  negotiable: z.boolean().optional(),
+  shipping_info: z.string().max(500).optional(),
+});
+
+admin.post("/listings", async (c) => {
+  const supabase = createSupabaseAdmin();
+  const adminProfileId = c.get("adminProfileId");
+
+  const body = await c.req.json();
+  const parsed = adminCreateListingSchema.safeParse(body);
+
+  if (!parsed.success) {
+    return c.json({ error: "Validation failed", details: parsed.error.flatten().fieldErrors }, 400);
+  }
+
+  const { data: listing, error } = await supabase
+    .from("listings")
+    .insert({
+      seller_id: adminProfileId,
+      title: parsed.data.title,
+      description: parsed.data.description || null,
+      category: parsed.data.category,
+      condition: parsed.data.condition,
+      measurements: parsed.data.measurements || {},
+      occasion_tags: parsed.data.occasion_tags || [],
+      colors: parsed.data.colors || [],
+      price_amount: parsed.data.price_amount,
+      price_currency: parsed.data.price_currency || "AUD",
+      original_price_amount: parsed.data.original_price_amount || null,
+      negotiable: parsed.data.negotiable ?? false,
+      shipping_info: parsed.data.shipping_info || null,
+      status: "active",
+    })
+    .select()
+    .single();
+
+  if (error) {
+    console.error("Error creating admin listing:", error);
+    return c.json({ error: "Failed to create listing" }, 500);
+  }
+
+  return c.json({ listing }, 201);
+});
+
+admin.post("/listings/:id/photos", async (c) => {
+  const listingId = c.req.param("id");
+  const supabase = createSupabaseAdmin();
+
+  const { data: listing } = await supabase
+    .from("listings")
+    .select("id, seller_id")
+    .eq("id", listingId)
+    .single();
+
+  if (!listing) {
+    return c.json({ error: "Listing not found" }, 404);
+  }
+
+  const formData = await c.req.formData();
+  const file = formData.get("photo") as File | null;
+
+  if (!file) {
+    return c.json({ error: "No photo provided" }, 400);
+  }
+
+  const { count } = await supabase
+    .from("listing_photos")
+    .select("id", { count: "exact", head: true })
+    .eq("listing_id", listingId);
+
+  if (count && count >= 15) {
+    return c.json({ error: "Maximum 15 photos per listing" }, 400);
+  }
+
+  const position = count || 0;
+  const ext = file.name.split(".").pop() || "jpg";
+  const storagePath = `listings/${listingId}/${Date.now()}_${position}.${ext}`;
+
+  const buffer = await file.arrayBuffer();
+
+  const { error: uploadError } = await supabase.storage
+    .from("listing-photos")
+    .upload(storagePath, buffer, {
+      contentType: file.type || "image/jpeg",
+      upsert: false,
+    });
+
+  if (uploadError) {
+    console.error("Photo upload error:", uploadError);
+    return c.json({ error: "Failed to upload photo" }, 500);
+  }
+
+  const { data: urlData } = supabase.storage.from("listing-photos").getPublicUrl(storagePath);
+
+  const { data: photo, error: dbError } = await supabase
+    .from("listing_photos")
+    .insert({
+      listing_id: listingId,
+      storage_path: storagePath,
+      url: urlData.publicUrl,
+      position,
+    })
+    .select()
+    .single();
+
+  if (dbError) {
+    console.error("Photo DB insert error:", dbError);
+    return c.json({ error: "Failed to save photo record" }, 500);
+  }
+
+  return c.json({ photo }, 201);
+});
+
+// ============================================================
 // User Management
 // ============================================================
 
-/**
- * GET /api/admin/users
- * List all users with listing/order counts.
- */
 admin.get("/users", async (c) => {
   const supabase = createSupabaseAdmin();
   const search = c.req.query("search") || "";
@@ -447,7 +622,6 @@ admin.get("/users", async (c) => {
     return c.json({ error: "Failed to fetch users" }, 500);
   }
 
-  // Fetch computed counts for each user
   const users = await Promise.all(
     (profiles || []).map(async (profile) => {
       const [listingCount, orderData] = await Promise.all([
@@ -474,10 +648,6 @@ admin.get("/users", async (c) => {
   return c.json({ users, total: count || 0, page, limit });
 });
 
-/**
- * POST /api/admin/users/:id/suspend
- * Suspend a user.
- */
 admin.post("/users/:id/suspend", async (c) => {
   const userId = c.req.param("id");
   const supabase = createSupabaseAdmin();
@@ -510,10 +680,6 @@ admin.post("/users/:id/suspend", async (c) => {
   return c.json({ user });
 });
 
-/**
- * POST /api/admin/users/:id/unsuspend
- * Unsuspend a user.
- */
 admin.post("/users/:id/unsuspend", async (c) => {
   const userId = c.req.param("id");
   const supabase = createSupabaseAdmin();
@@ -536,10 +702,6 @@ admin.post("/users/:id/unsuspend", async (c) => {
   return c.json({ user });
 });
 
-/**
- * POST /api/admin/users/:id/ban
- * Ban a user and deactivate all their active listings.
- */
 admin.post("/users/:id/ban", async (c) => {
   const userId = c.req.param("id");
   const supabase = createSupabaseAdmin();
@@ -554,7 +716,6 @@ admin.post("/users/:id/ban", async (c) => {
     return c.json({ error: "Validation failed", details: parsed.error.flatten().fieldErrors }, 400);
   }
 
-  // Ban user
   const { data: user, error } = await supabase
     .from("profiles")
     .update({
@@ -570,7 +731,6 @@ admin.post("/users/:id/ban", async (c) => {
     return c.json({ error: "Failed to ban user" }, 500);
   }
 
-  // Deactivate all active listings by this user
   await supabase
     .from("listings")
     .update({ status: "deactivated" })
@@ -584,15 +744,10 @@ admin.post("/users/:id/ban", async (c) => {
 // Dashboard Analytics
 // ============================================================
 
-/**
- * GET /api/admin/dashboard
- * Dashboard metrics for a time range.
- */
 admin.get("/dashboard", async (c) => {
   const supabase = createSupabaseAdmin();
   const rangeDate = parseRange(c.req.query("range"));
 
-  // Build date-filtered queries
   let ordersQuery = supabase.from("orders").select("amount, commission_amount");
   let listingsCreatedQuery = supabase.from("listings").select("id", { count: "exact", head: true });
 
@@ -602,28 +757,21 @@ admin.get("/dashboard", async (c) => {
     listingsCreatedQuery = listingsCreatedQuery.gte("created_at", rangeISO);
   }
 
-  const [
-    ordersResult,
-    listingsCreatedResult,
-    activeListingsResult,
-    pendingResult,
-    usersResult,
-  ] = await Promise.all([
-    ordersQuery,
-    listingsCreatedQuery,
-    supabase.from("listings").select("id", { count: "exact", head: true }).eq("status", "active"),
-    supabase.from("listings").select("id", { count: "exact", head: true }).eq("status", "pending_review"),
-    supabase.from("profiles").select("id", { count: "exact", head: true }),
-  ]);
+  const [ordersResult, listingsCreatedResult, activeListingsResult, pendingResult, usersResult] =
+    await Promise.all([
+      ordersQuery,
+      listingsCreatedQuery,
+      supabase.from("listings").select("id", { count: "exact", head: true }).eq("status", "active"),
+      supabase.from("listings").select("id", { count: "exact", head: true }).eq("status", "pending_review"),
+      supabase.from("profiles").select("id", { count: "exact", head: true }),
+    ]);
 
   const orders = ordersResult.data || [];
   const totalGmv = orders.reduce((sum, o) => sum + (o.amount || 0), 0);
   const platformRevenue = orders.reduce((sum, o) => sum + (o.commission_amount || 0), 0);
   const listingsCreated = listingsCreatedResult.count || 0;
   const orderCount = orders.length;
-  const conversionRate = listingsCreated > 0
-    ? Math.round((orderCount / listingsCreated) * 1000) / 10
-    : 0;
+  const conversionRate = listingsCreated > 0 ? Math.round((orderCount / listingsCreated) * 1000) / 10 : 0;
 
   return c.json({
     metrics: {
@@ -637,20 +785,14 @@ admin.get("/dashboard", async (c) => {
   });
 });
 
-/**
- * GET /api/admin/dashboard/timeseries
- * Time-series data for charts.
- */
 admin.get("/dashboard/timeseries", async (c) => {
   const supabase = createSupabaseAdmin();
   const range = c.req.query("range") || "30d";
   const rangeDate = parseRange(range);
 
-  // Default to 30 days if no range date
   const startDate = rangeDate || new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
   const endDate = new Date();
 
-  // Generate list of dates in range
   const dates: string[] = [];
   const current = new Date(startDate);
   while (current <= endDate) {
@@ -658,27 +800,16 @@ admin.get("/dashboard/timeseries", async (c) => {
     current.setDate(current.getDate() + 1);
   }
 
-  // Fetch raw data
   const [ordersResult, listingsResult, usersResult] = await Promise.all([
-    supabase
-      .from("orders")
-      .select("amount, created_at")
-      .gte("created_at", startDate.toISOString()),
-    supabase
-      .from("listings")
-      .select("created_at")
-      .gte("created_at", startDate.toISOString()),
-    supabase
-      .from("profiles")
-      .select("created_at")
-      .gte("created_at", startDate.toISOString()),
+    supabase.from("orders").select("amount, created_at").gte("created_at", startDate.toISOString()),
+    supabase.from("listings").select("created_at").gte("created_at", startDate.toISOString()),
+    supabase.from("profiles").select("created_at").gte("created_at", startDate.toISOString()),
   ]);
 
   const orders = ordersResult.data || [];
   const listings = listingsResult.data || [];
   const users = usersResult.data || [];
 
-  // Aggregate by date
   const gmvByDate: Record<string, number> = {};
   const listingsByDate: Record<string, number> = {};
   const usersByDate: Record<string, number> = {};
@@ -696,7 +827,6 @@ admin.get("/dashboard/timeseries", async (c) => {
     usersByDate[date] = (usersByDate[date] || 0) + 1;
   }
 
-  // Fill gaps with zeros
   const series = dates.map((date) => ({
     date,
     gmv: gmvByDate[date] || 0,
@@ -707,10 +837,6 @@ admin.get("/dashboard/timeseries", async (c) => {
   return c.json({ series });
 });
 
-/**
- * GET /api/admin/dashboard/export
- * CSV export of dashboard metrics.
- */
 admin.get("/dashboard/export", async (c) => {
   const supabase = createSupabaseAdmin();
   const range = c.req.query("range") || "30d";
@@ -719,7 +845,6 @@ admin.get("/dashboard/export", async (c) => {
   const startDate = rangeDate || new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
   const endDate = new Date();
 
-  // Generate list of dates in range
   const dates: string[] = [];
   const current = new Date(startDate);
   while (current <= endDate) {
@@ -727,27 +852,16 @@ admin.get("/dashboard/export", async (c) => {
     current.setDate(current.getDate() + 1);
   }
 
-  // Fetch raw data
   const [ordersResult, listingsResult, usersResult] = await Promise.all([
-    supabase
-      .from("orders")
-      .select("amount, commission_amount, created_at")
-      .gte("created_at", startDate.toISOString()),
-    supabase
-      .from("listings")
-      .select("created_at")
-      .gte("created_at", startDate.toISOString()),
-    supabase
-      .from("profiles")
-      .select("created_at")
-      .gte("created_at", startDate.toISOString()),
+    supabase.from("orders").select("amount, commission_amount, created_at").gte("created_at", startDate.toISOString()),
+    supabase.from("listings").select("created_at").gte("created_at", startDate.toISOString()),
+    supabase.from("profiles").select("created_at").gte("created_at", startDate.toISOString()),
   ]);
 
   const orders = ordersResult.data || [];
   const listings = listingsResult.data || [];
   const users = usersResult.data || [];
 
-  // Aggregate by date
   const gmvByDate: Record<string, number> = {};
   const revenueByDate: Record<string, number> = {};
   const ordersByDate: Record<string, number> = {};
@@ -769,7 +883,6 @@ admin.get("/dashboard/export", async (c) => {
     usersByDate[date] = (usersByDate[date] || 0) + 1;
   }
 
-  // Build CSV
   const csvRows = ["Date,GMV,Platform Revenue,New Listings,New Users,New Orders"];
   for (const date of dates) {
     csvRows.push(
@@ -792,10 +905,6 @@ admin.get("/dashboard/export", async (c) => {
 // Admin Settings (Commission)
 // ============================================================
 
-/**
- * GET /api/admin/settings
- * Read admin settings (commission_rate).
- */
 admin.get("/settings", async (c) => {
   const supabase = createSupabaseAdmin();
 
@@ -813,12 +922,8 @@ admin.get("/settings", async (c) => {
   return c.json({ settings: { commission_rate: data.commission_rate } });
 });
 
-/**
- * PUT /api/admin/settings
- * Update commission_rate.
- */
 admin.put("/settings", async (c) => {
-  const clerkUserId = c.get("clerkUserId");
+  const adminProfileId = c.get("adminProfileId");
   const supabase = createSupabaseAdmin();
 
   const settingsSchema = z.object({
@@ -831,10 +936,6 @@ admin.put("/settings", async (c) => {
     return c.json({ error: "Validation failed", details: parsed.error.flatten().fieldErrors }, 400);
   }
 
-  // Look up admin profile ID for updated_by
-  const { admin: _, profileId } = await isAdmin(clerkUserId);
-
-  // Get the first (only) settings row
   const { data: existing } = await supabase
     .from("admin_settings")
     .select("id")
@@ -849,7 +950,7 @@ admin.put("/settings", async (c) => {
     .from("admin_settings")
     .update({
       commission_rate: parsed.data.commission_rate,
-      updated_by: profileId,
+      updated_by: adminProfileId,
     })
     .eq("id", existing.id)
     .select("commission_rate")

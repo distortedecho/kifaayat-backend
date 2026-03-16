@@ -37,7 +37,7 @@ const createListingSchema = z.object({
     .array(z.enum(OCCASION_TAGS as unknown as [string, ...string[]]))
     .optional(),
   colors: z.array(z.string()).optional(),
-  price_amount: z.number().int().positive("Price must be a positive integer (in cents)"),
+  price_amount: z.number().int().nonnegative("Price must be a non-negative integer (in cents)"),
   price_currency: z.enum(["AUD", "USD", "NZD"]).optional(),
   original_price_amount: z.number().int().positive().optional(),
   negotiable: z.boolean().optional(),

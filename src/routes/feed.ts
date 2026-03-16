@@ -104,8 +104,7 @@ feed.get("/", optionalClerkMiddleware, async (c) => {
   // --- Trending: 8 listings ordered by wishlist count ---
   // First try to get listings with most wishlist saves
   const { data: trendingIds, error: trendingError } = await supabase
-    .rpc("get_trending_listing_ids", { result_limit: 8 })
-    .select("*");
+    .rpc("get_trending_listing_ids", { result_limit: 8 });
 
   let trendingItems: ListingSummary[] = [];
 

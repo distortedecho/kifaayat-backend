@@ -190,7 +190,7 @@ const listingReviewSchema = z.object({
   seller_email: z.string().email(),
   seller_name: z.string().min(1),
   listing_title: z.string().min(1),
-  listing_photo_url: z.string().url(),
+  listing_photo_url: z.string().url().optional().or(z.literal("")),
   listing_id: z.string().min(1),
   approved: z.boolean(),
   rejection_reason: z.string().optional(),
