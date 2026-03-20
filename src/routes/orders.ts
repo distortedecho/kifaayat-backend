@@ -1,6 +1,8 @@
 import { Hono } from "hono";
 import { z } from "zod";
 import { clerkMiddleware, optionalClerkMiddleware } from "../middleware/clerk.js";
+import { requireProfile } from "../middleware/requireProfile.js";
+import { getProfileByClerkId } from "../lib/profiles.js";
 import { createSupabaseAdmin } from "../lib/supabase.js";
 import {
   createNotification,
@@ -18,6 +20,7 @@ import {
   generateOrderNumber,
 } from "../types/transactions.js";
 import { getCommissionRate } from "../lib/commission.js";
+import { isFirstCompletedOrder, awardReferralCredits } from "../lib/referrals.js";
 
 const orders = new Hono();
 
@@ -45,20 +48,6 @@ const shipOrderSchema = z.object({
 // ============================================================
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
-async function getProfileByClerkId(
-  clerkUserId: string
-): Promise<{ id: string; display_name: string | null } | null> {
-  const supabase = createSupabaseAdmin();
-  const { data, error } = await supabase
-    .from("profiles")
-    .select("id, display_name")
-    .eq("clerk_id", clerkUserId)
-    .single();
-
-  if (error || !data) return null;
-  return data;
-}
 
 // ============================================================
 // Routes
@@ -178,14 +167,9 @@ orders.post("/", optionalClerkMiddleware, async (c) => {
  * GET /api/orders/mine
  * Buyer's order history.
  */
-orders.get("/mine", clerkMiddleware, async (c) => {
-  const clerkUserId = c.get("clerkUserId");
+orders.get("/mine", clerkMiddleware, requireProfile, async (c) => {
+  const profile = c.get("profile");
   const supabase = createSupabaseAdmin();
-
-  const profile = await getProfileByClerkId(clerkUserId);
-  if (!profile) {
-    return c.json({ error: "Profile not found" }, 404);
-  }
 
   const { data: ordersData, error } = await supabase
     .from("orders")
@@ -253,14 +237,9 @@ orders.get("/mine", clerkMiddleware, async (c) => {
  * GET /api/orders/sales
  * Seller's incoming orders.
  */
-orders.get("/sales", clerkMiddleware, async (c) => {
-  const clerkUserId = c.get("clerkUserId");
+orders.get("/sales", clerkMiddleware, requireProfile, async (c) => {
+  const profile = c.get("profile");
   const supabase = createSupabaseAdmin();
-
-  const profile = await getProfileByClerkId(clerkUserId);
-  if (!profile) {
-    return c.json({ error: "Profile not found" }, 404);
-  }
 
   const { data: ordersData, error } = await supabase
     .from("orders")
@@ -328,18 +307,13 @@ orders.get("/sales", clerkMiddleware, async (c) => {
  * GET /api/orders/:id
  * Get single order with full details.
  */
-orders.get("/:id", clerkMiddleware, async (c) => {
+orders.get("/:id", clerkMiddleware, requireProfile, async (c) => {
   const orderId = c.req.param("id");
-  const clerkUserId = c.get("clerkUserId");
+  const profile = c.get("profile");
   const supabase = createSupabaseAdmin();
 
   if (!UUID_REGEX.test(orderId)) {
     return c.json({ error: "Invalid order ID format" }, 400);
-  }
-
-  const profile = await getProfileByClerkId(clerkUserId);
-  if (!profile) {
-    return c.json({ error: "Profile not found" }, 404);
   }
 
   const { data: order, error } = await supabase
@@ -366,18 +340,13 @@ orders.get("/:id", clerkMiddleware, async (c) => {
  * PATCH /api/orders/:id/ship
  * Seller marks order as shipped.
  */
-orders.patch("/:id/ship", clerkMiddleware, async (c) => {
+orders.patch("/:id/ship", clerkMiddleware, requireProfile, async (c) => {
   const orderId = c.req.param("id");
-  const clerkUserId = c.get("clerkUserId");
+  const profile = c.get("profile");
   const supabase = createSupabaseAdmin();
 
   if (!UUID_REGEX.test(orderId)) {
     return c.json({ error: "Invalid order ID format" }, 400);
-  }
-
-  const profile = await getProfileByClerkId(clerkUserId);
-  if (!profile) {
-    return c.json({ error: "Profile not found" }, 404);
   }
 
   // Parse body
@@ -458,18 +427,13 @@ orders.patch("/:id/ship", clerkMiddleware, async (c) => {
  * PATCH /api/orders/:id/deliver
  * Buyer confirms delivery.
  */
-orders.patch("/:id/deliver", clerkMiddleware, async (c) => {
+orders.patch("/:id/deliver", clerkMiddleware, requireProfile, async (c) => {
   const orderId = c.req.param("id");
-  const clerkUserId = c.get("clerkUserId");
+  const profile = c.get("profile");
   const supabase = createSupabaseAdmin();
 
   if (!UUID_REGEX.test(orderId)) {
     return c.json({ error: "Invalid order ID format" }, 400);
-  }
-
-  const profile = await getProfileByClerkId(clerkUserId);
-  if (!profile) {
-    return c.json({ error: "Profile not found" }, 404);
   }
 
   // Fetch order
@@ -529,18 +493,13 @@ orders.patch("/:id/deliver", clerkMiddleware, async (c) => {
  * PATCH /api/orders/:id/complete
  * Mark order as complete.
  */
-orders.patch("/:id/complete", clerkMiddleware, async (c) => {
+orders.patch("/:id/complete", clerkMiddleware, requireProfile, async (c) => {
   const orderId = c.req.param("id");
-  const clerkUserId = c.get("clerkUserId");
+  const profile = c.get("profile");
   const supabase = createSupabaseAdmin();
 
   if (!UUID_REGEX.test(orderId)) {
     return c.json({ error: "Invalid order ID format" }, 400);
-  }
-
-  const profile = await getProfileByClerkId(clerkUserId);
-  if (!profile) {
-    return c.json({ error: "Profile not found" }, 404);
   }
 
   // Fetch order
@@ -609,6 +568,35 @@ orders.patch("/:id/complete", clerkMiddleware, async (c) => {
     ...sellerTemplate,
     data: { order_id: orderId, listing_id: order.listing_id },
   });
+
+  // Fire-and-forget referral credit check
+  if (order.buyer_id) {
+    (async () => {
+      try {
+        const isFirst = await isFirstCompletedOrder(order.buyer_id);
+        if (isFirst) {
+          // Check if buyer was referred
+          const { data: referral } = await supabase
+            .from("referrals")
+            .select("*, referral_codes!referrals_referral_code_id_fkey(user_id)")
+            .eq("referred_id", order.buyer_id)
+            .eq("status", "pending")
+            .single();
+
+          if (referral) {
+            await awardReferralCredits({
+              referrer_id: (referral.referral_codes as any).user_id,
+              referred_id: order.buyer_id,
+              referral_code_id: referral.referral_code_id,
+              qualifying_order_id: orderId,
+            });
+          }
+        }
+      } catch (err) {
+        console.error("Error processing referral credit:", err);
+      }
+    })();
+  }
 
   return c.json({ order: updatedOrder });
 });
@@ -699,6 +687,34 @@ orders.post("/cron/auto-complete", async (c) => {
       ...sellerAutoTemplate,
       data: { order_id: order.id, listing_id: order.listing_id },
     });
+
+    // Fire-and-forget referral credit check
+    if (order.buyer_id) {
+      (async () => {
+        try {
+          const isFirst = await isFirstCompletedOrder(order.buyer_id);
+          if (isFirst) {
+            const { data: referral } = await supabase
+              .from("referrals")
+              .select("*, referral_codes!referrals_referral_code_id_fkey(user_id)")
+              .eq("referred_id", order.buyer_id)
+              .eq("status", "pending")
+              .single();
+
+            if (referral) {
+              await awardReferralCredits({
+                referrer_id: (referral.referral_codes as any).user_id,
+                referred_id: order.buyer_id,
+                referral_code_id: referral.referral_code_id,
+                qualifying_order_id: order.id,
+              });
+            }
+          }
+        } catch (err) {
+          console.error("Error processing referral credit (auto-complete):", err);
+        }
+      })();
+    }
   }
 
   return c.json({ completed: completedCount });

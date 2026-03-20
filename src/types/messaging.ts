@@ -1,6 +1,8 @@
 // ============================================================
-// Phase 5: Messaging Types
+// Phase 5: Messaging Types (extended Phase 19)
 // ============================================================
+
+export type MessageType = 'text' | 'image' | 'photo_request' | 'payment_link';
 
 // Conversation as stored in DB
 export interface Conversation {
@@ -19,7 +21,10 @@ export interface Message {
   id: string;
   conversation_id: string;
   sender_id: string;
-  content: string;
+  content: string | null;  // null for image-only messages
+  message_type: MessageType;
+  image_url: string | null;
+  metadata: Record<string, unknown>;
   read_at: string | null;
   created_at: string;
 }

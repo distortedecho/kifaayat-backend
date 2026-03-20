@@ -2,14 +2,17 @@ import { Hono } from "hono";
 import Stripe from "stripe";
 import { z } from "zod";
 import { clerkMiddleware, optionalClerkMiddleware } from "../middleware/clerk.js";
+import { requireProfile } from "../middleware/requireProfile.js";
+import { getProfileByClerkId } from "../lib/profiles.js";
 import { createSupabaseAdmin } from "../lib/supabase.js";
 import { createNotification, orderPaidNotification } from "../lib/notifications.js";
 import {
   generateOrderNumber,
   type OrderStatus,
 } from "../types/transactions.js";
-import { getCommissionRate } from "../lib/commission.js";
+import { getCommissionRate, getSellerCommissionRate } from "../lib/commission.js";
 import type { StripeAccountStatus, StripeStatusResponse } from "../types/stripe.js";
+import { redeemCredits } from "../lib/referrals.js";
 
 let _stripe: Stripe | null = null;
 
@@ -46,29 +49,17 @@ const paymentIntentSchema = z.object({
   offer_id: z.string().uuid("offer_id must be a valid UUID").optional(),
 });
 
+const boostPaymentIntentSchema = z.object({
+  listing_id: z.string().uuid("listing_id must be a valid UUID"),
+});
+
+const boostConfirmSchema = z.object({
+  boost_id: z.string().uuid("boost_id must be a valid UUID"),
+});
+
 // ============================================================
 // Helpers
 // ============================================================
-
-/**
- * Look up the profile for a given Clerk user ID.
- * Returns profile id, stripe_account_id, stripe_onboarding_complete, and email-relevant fields.
- */
-async function getProfileByClerkId(clerkUserId: string) {
-  const supabase = createSupabaseAdmin();
-  const { data, error } = await supabase
-    .from("profiles")
-    .select("id, stripe_account_id, stripe_onboarding_complete")
-    .eq("clerk_id", clerkUserId)
-    .single();
-
-  if (error || !data) return null;
-  return data as {
-    id: string;
-    stripe_account_id: string | null;
-    stripe_onboarding_complete: boolean;
-  };
-}
 
 /**
  * Map Stripe account details to our internal status.
@@ -92,6 +83,100 @@ function mapAccountToStatus(account: Stripe.Account): StripeAccountStatus {
 // ============================================================
 // Routes
 // ============================================================
+
+/**
+ * POST /api/stripe/boost-payment-intent
+ * Create a Stripe PaymentIntent for boosting a listing (direct charge -- platform revenue).
+ */
+stripeRoutes.post("/boost-payment-intent", clerkMiddleware, requireProfile, async (c) => {
+  const profile = c.get("profile");
+  const supabase = createSupabaseAdmin();
+
+  // Parse and validate body
+  const body = await c.req.json();
+  const parsed = boostPaymentIntentSchema.safeParse(body);
+  if (!parsed.success) {
+    return c.json(
+      { error: "Validation failed", details: parsed.error.flatten().fieldErrors },
+      400
+    );
+  }
+
+  const { listing_id } = parsed.data;
+
+  // Verify listing exists and belongs to this seller
+  const { data: listing, error: listingError } = await supabase
+    .from("listings")
+    .select("id, seller_id, status")
+    .eq("id", listing_id)
+    .single();
+
+  if (listingError || !listing) {
+    return c.json({ error: "Listing not found" }, 404);
+  }
+
+  if (listing.seller_id !== profile.id) {
+    return c.json({ error: "Not authorized to boost this listing" }, 403);
+  }
+
+  if (listing.status !== "active") {
+    return c.json({ error: "Only active listings can be boosted" }, 400);
+  }
+
+  // Fetch boost config from admin_settings
+  const { data: settings } = await supabase
+    .from("admin_settings")
+    .select("boost_price_cents, boost_duration_days")
+    .limit(1)
+    .single();
+
+  const boostPriceCents = settings?.boost_price_cents ?? 500;
+  const boostDurationDays = settings?.boost_duration_days ?? 7;
+
+  // Create PaymentIntent as a DIRECT charge (platform revenue, no transfer_data)
+  try {
+    const paymentIntent = await getStripe().paymentIntents.create({
+      amount: boostPriceCents,
+      currency: "aud",
+      metadata: {
+        checkout_type: "boost",
+        listing_id,
+        seller_profile_id: profile.id,
+      },
+    });
+
+    // Create a pending boost record
+    const startsAt = new Date().toISOString();
+    const endsAt = new Date(Date.now() + boostDurationDays * 86400000).toISOString();
+
+    const { data: boost, error: boostError } = await supabase
+      .from("listing_boosts")
+      .insert({
+        listing_id,
+        seller_id: profile.id,
+        stripe_payment_intent_id: paymentIntent.id,
+        amount_paid: boostPriceCents,
+        starts_at: startsAt,
+        ends_at: endsAt,
+        status: "pending",
+      })
+      .select("id")
+      .single();
+
+    if (boostError) {
+      console.error("Error creating boost record:", boostError);
+      return c.json({ error: "Failed to create boost record" }, 500);
+    }
+
+    return c.json({
+      clientSecret: paymentIntent.client_secret,
+      boostId: boost.id,
+    });
+  } catch (error) {
+    console.error("Error creating boost payment intent:", error);
+    return c.json({ error: "Failed to create payment intent" }, 500);
+  }
+});
 
 /**
  * POST /api/stripe/payment-intent
@@ -188,9 +273,9 @@ stripeRoutes.post("/payment-intent", optionalClerkMiddleware, async (c) => {
   const sellerStripeAccountId = sellerProfile?.stripe_account_id || null;
   const sellerOnboardingComplete = sellerProfile?.stripe_onboarding_complete ?? false;
 
-  // Calculate commission
+  // Calculate commission (tier-specific rate for seller)
   const amount = paymentAmount; // already in cents
-  const commissionRate = await getCommissionRate();
+  const commissionRate = await getSellerCommissionRate(listing.seller_id);
   const commission = Math.round(amount * commissionRate / 100);
 
   // Build PaymentIntent params
@@ -238,13 +323,8 @@ stripeRoutes.post("/payment-intent", optionalClerkMiddleware, async (c) => {
  * POST /api/stripe/create-account
  * Create a Stripe Express account for the seller. Idempotent -- returns existing if present.
  */
-stripeRoutes.post("/create-account", clerkMiddleware, async (c) => {
-  const clerkUserId = c.get("clerkUserId");
-
-  const profile = await getProfileByClerkId(clerkUserId);
-  if (!profile) {
-    return c.json({ error: "Profile not found" }, 404);
-  }
+stripeRoutes.post("/create-account", clerkMiddleware, requireProfile, async (c) => {
+  const profile = c.get("profile");
 
   // If already has a Stripe account, return it
   if (profile.stripe_account_id) {
@@ -287,13 +367,8 @@ stripeRoutes.post("/create-account", clerkMiddleware, async (c) => {
  * GET /api/stripe/onboarding-url
  * Generate a Stripe AccountLink URL for the seller to complete onboarding.
  */
-stripeRoutes.get("/onboarding-url", clerkMiddleware, async (c) => {
-  const clerkUserId = c.get("clerkUserId");
-
-  const profile = await getProfileByClerkId(clerkUserId);
-  if (!profile) {
-    return c.json({ error: "Profile not found" }, 404);
-  }
+stripeRoutes.get("/onboarding-url", clerkMiddleware, requireProfile, async (c) => {
+  const profile = c.get("profile");
 
   if (!profile.stripe_account_id) {
     return c.json({ error: "Create account first" }, 400);
@@ -360,13 +435,8 @@ h1{color:#d97706;font-size:1.5rem}p{color:#6b7280;margin-top:0.5rem}</style></he
  * GET /api/stripe/account-status
  * Return the seller's Stripe account verification status.
  */
-stripeRoutes.get("/account-status", clerkMiddleware, async (c) => {
-  const clerkUserId = c.get("clerkUserId");
-
-  const profile = await getProfileByClerkId(clerkUserId);
-  if (!profile) {
-    return c.json({ error: "Profile not found" }, 404);
-  }
+stripeRoutes.get("/account-status", clerkMiddleware, requireProfile, async (c) => {
+  const profile = c.get("profile");
 
   if (!profile.stripe_account_id) {
     const response: StripeStatusResponse = {
@@ -448,11 +518,197 @@ stripeRoutes.post("/webhook", async (c) => {
     }
   }
 
-  // Handle payment_intent.succeeded — create order, transition listing, notify seller
+  // Handle payment_intent.succeeded — create order(s), transition listing(s), notify seller(s)
   if (event.type === "payment_intent.succeeded") {
     const paymentIntent = event.data.object as Stripe.PaymentIntent;
     const metadata = paymentIntent.metadata;
 
+    // --- BOOST CHECKOUT ---
+    if (metadata.checkout_type === "boost") {
+      const boostListingId = metadata.listing_id;
+      const sellerProfileId = metadata.seller_profile_id;
+
+      if (!boostListingId) {
+        console.error("Boost payment missing listing_id in metadata");
+        return c.json({ received: true });
+      }
+
+      // Fetch boost duration from admin_settings
+      const { data: boostSettings } = await supabase
+        .from("admin_settings")
+        .select("boost_duration_days")
+        .limit(1)
+        .single();
+      const boostDurationDays = boostSettings?.boost_duration_days ?? 7;
+
+      // Check for existing active boost to extend
+      const { data: existingBoost } = await supabase
+        .from("listing_boosts")
+        .select("id, ends_at")
+        .eq("listing_id", boostListingId)
+        .eq("status", "active")
+        .gt("ends_at", new Date().toISOString())
+        .limit(1)
+        .single();
+
+      if (existingBoost) {
+        // Extend existing boost
+        const newEndsAt = new Date(
+          new Date(existingBoost.ends_at).getTime() + boostDurationDays * 86400000
+        ).toISOString();
+        await supabase
+          .from("listing_boosts")
+          .update({ ends_at: newEndsAt })
+          .eq("id", existingBoost.id);
+        // Cancel any pending boosts for this listing
+        await supabase
+          .from("listing_boosts")
+          .update({ status: "cancelled" })
+          .eq("listing_id", boostListingId)
+          .eq("status", "pending");
+      } else {
+        // Activate the pending boost
+        await supabase
+          .from("listing_boosts")
+          .update({ status: "active" })
+          .eq("listing_id", boostListingId)
+          .eq("status", "pending");
+      }
+
+      // Send boost_activated notification
+      if (sellerProfileId) {
+        await createNotification({
+          user_id: sellerProfileId,
+          type: "boost_activated",
+          title: "Boost Activated",
+          body: "Your listing boost is now active! It will appear at the top of search results.",
+          data: { listing_id: boostListingId },
+        });
+      }
+
+      return c.json({ received: true });
+    }
+
+    // --- CART CHECKOUT ---
+    if (metadata.checkout_type === "cart") {
+      const cartCheckoutId = metadata.cart_checkout_id;
+      const buyerProfileId = metadata.buyer_profile_id;
+      const currency = paymentIntent.currency.toUpperCase();
+
+      let sellerGroups: Array<{
+        seller_id: string;
+        stripe_account_id: string;
+        items_subtotal: number;
+        shipping_total: number;
+        commission_amount: number;
+        commission_rate: number;
+        seller_payout: number;
+        listing_ids: string[];
+      }>;
+
+      try {
+        sellerGroups = JSON.parse(metadata.seller_groups);
+      } catch (parseError) {
+        console.error("Failed to parse seller_groups metadata:", parseError);
+        return c.json({ received: true });
+      }
+
+      for (const group of sellerGroups) {
+        // 1. Create order for this seller group
+        const orderNumber = generateOrderNumber();
+        const groupTotal = group.items_subtotal + group.shipping_total;
+
+        const { data: order, error: orderError } = await supabase
+          .from("orders")
+          .insert({
+            order_number: orderNumber,
+            listing_id: group.listing_ids[0], // primary listing
+            buyer_id: buyerProfileId || null,
+            seller_id: group.seller_id,
+            amount: groupTotal,
+            currency,
+            commission_rate: group.commission_rate,
+            commission_amount: group.commission_amount,
+            seller_payout: group.seller_payout,
+            stripe_payment_intent_id: paymentIntent.id,
+            status: "paid" as OrderStatus,
+          })
+          .select()
+          .single();
+
+        if (orderError) {
+          console.error(
+            `Error creating order for seller ${group.seller_id}:`,
+            orderError
+          );
+          continue;
+        }
+
+        // 2. Mark all group listings as 'sold'
+        await supabase
+          .from("listings")
+          .update({ status: "sold" })
+          .in("id", group.listing_ids);
+
+        // 3. Create Stripe Transfer to seller
+        if (group.stripe_account_id) {
+          try {
+            await getStripe().transfers.create({
+              amount: group.seller_payout,
+              currency: currency.toLowerCase(),
+              destination: group.stripe_account_id,
+              transfer_group: `cart_${cartCheckoutId}`,
+              metadata: {
+                order_number: orderNumber,
+                seller_id: group.seller_id,
+              },
+            });
+          } catch (transferError) {
+            console.error(
+              `Transfer failed for seller ${group.seller_id}:`,
+              transferError
+            );
+            // Payment already collected -- log for manual resolution
+          }
+        }
+
+        // 4. Send notification to seller
+        if (order) {
+          const paidTemplate = orderPaidNotification(
+            `Order #${orderNumber}`,
+            groupTotal,
+            currency,
+            group.seller_payout
+          );
+          await createNotification({
+            user_id: group.seller_id,
+            type: "order_paid",
+            ...paidTemplate,
+            data: { order_id: order.id },
+          });
+        }
+      }
+
+      // 5. Clear buyer's cart
+      if (buyerProfileId) {
+        await supabase
+          .from("cart_items")
+          .delete()
+          .eq("user_id", buyerProfileId);
+      }
+
+      // 6. Redeem credits if any were applied
+      const creditApplied = parseInt(metadata.credit_applied || "0", 10);
+      if (creditApplied > 0 && buyerProfileId) {
+        await redeemCredits(buyerProfileId, creditApplied).catch((err) => {
+          console.error("Error redeeming credits in cart webhook:", err);
+        });
+      }
+
+      return c.json({ received: true });
+    }
+
+    // --- EXISTING SINGLE-ITEM LOGIC (unchanged) ---
     const listingId = metadata.listing_id;
     const buyerEmail = metadata.buyer_email || "";
     const buyerProfileId = metadata.buyer_profile_id || null;
@@ -475,10 +731,10 @@ stripeRoutes.post("/webhook", async (c) => {
       return c.json({ received: true });
     }
 
-    // Calculate commission
+    // Calculate commission (tier-specific rate for seller)
     const amount = paymentIntent.amount;
     const currency = paymentIntent.currency.toUpperCase();
-    const commissionRate = await getCommissionRate();
+    const commissionRate = await getSellerCommissionRate(listing.seller_id);
     const commissionAmount = Math.round(amount * (commissionRate / 100));
     const sellerPayout = amount - commissionAmount;
 

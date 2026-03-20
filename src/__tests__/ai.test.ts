@@ -68,6 +68,15 @@ describe("POST /api/ai/analyze", () => {
       colors_confidence: 95,
       occasion_tags: ["Wedding", "Sangeet"],
       occasion_tags_confidence: 85,
+      photo_quality: [
+        { index: 0, is_blurry: false, is_dark: false, quality_score: 92, issues: [] },
+      ],
+      designer_name: "Sabyasachi Mukherjee",
+      designer_name_confidence: 40,
+      fabric_types: ["Silk", "Velvet"],
+      fabric_types_confidence: 85,
+      work_types: ["Zardozi", "Sequin"],
+      work_types_confidence: 78,
     };
 
     mockGenerateContent.mockResolvedValue({
@@ -98,6 +107,24 @@ describe("POST /api/ai/analyze", () => {
     expect(body.condition).toBeDefined();
     expect(body.colors).toBeDefined();
     expect(body.occasion_tags).toBeDefined();
+
+    // v2 fields
+    expect(body.photo_quality).toBeDefined();
+    expect(body.photo_quality.value).toHaveLength(1);
+    expect(body.photo_quality.value[0].quality_score).toBe(92);
+    expect(body.photo_quality.value[0].is_blurry).toBe(false);
+
+    expect(body.designer_name).toBeDefined();
+    expect(body.designer_name.value).toBe("Sabyasachi Mukherjee");
+    expect(body.designer_name.confidence).toBe(40);
+
+    expect(body.fabric_types).toBeDefined();
+    expect(body.fabric_types.value).toEqual(["Silk", "Velvet"]);
+    expect(body.fabric_types.confidence).toBe(85);
+
+    expect(body.work_types).toBeDefined();
+    expect(body.work_types.value).toEqual(["Zardozi", "Sequin"]);
+    expect(body.work_types.confidence).toBe(78);
   });
 
   it("returns 400 when no photos provided", async () => {
@@ -157,6 +184,13 @@ describe("POST /api/ai/analyze", () => {
       colors_confidence: 95,
       occasion_tags: ["Wedding"],
       occasion_tags_confidence: 85,
+      photo_quality: [],
+      designer_name: null,
+      designer_name_confidence: 0,
+      fabric_types: [],
+      fabric_types_confidence: 0,
+      work_types: [],
+      work_types_confidence: 0,
     };
 
     mockGenerateContent.mockResolvedValue({

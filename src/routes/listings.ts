@@ -1,12 +1,18 @@
 import { Hono } from "hono";
 import { z } from "zod";
 import { clerkMiddleware, optionalClerkMiddleware } from "../middleware/clerk.js";
+import { requireProfile } from "../middleware/requireProfile.js";
+import { getProfileByClerkId } from "../lib/profiles.js";
 import { createSupabaseAdmin } from "../lib/supabase.js";
+import { computeRiskScore } from "../lib/risk-scoring.js";
 import {
   LISTING_CATEGORIES,
   LISTING_CONDITIONS,
   OCCASION_TAGS,
   REQUIRED_MEASUREMENTS,
+  FABRIC_TYPES,
+  WORK_TYPES,
+  DRY_CLEANING_STATUSES,
   type ListingCategory,
   type Measurements,
 } from "../types/listings.js";
@@ -43,7 +49,40 @@ const createListingSchema = z.object({
   negotiable: z.boolean().optional(),
   shipping_info: z.string().max(500).optional(),
   status: z.enum(["draft", "active"]).optional().default("draft"),
-});
+
+  // v2 fields — required for new listings
+  fabric_types: z.array(z.string()).min(1, "At least one fabric type is required"),
+  items_included: z.array(z.string()).min(1, "At least one item is required"),
+
+  // v2 fields — optional
+  work_types: z.array(z.string()).optional(),
+  designer_name: z.string().max(200).optional(),
+  is_known_designer: z.boolean().optional(),
+  designer_verification_url: z.string().url().optional(),
+  country_of_origin: z.string().max(100).optional(),
+  dry_cleaning_status: z.enum(DRY_CLEANING_STATUSES as unknown as [string, ...string[]]).optional(),
+  alteration_room: z.string().max(500).optional(),
+  fit_tips: z.string().max(1000).optional(),
+
+  // Rental fields
+  is_rentable: z.boolean().optional(),
+  rental_daily_rate: z.number().int().positive().optional(),
+  rental_4to7_rate: z.number().int().positive().optional(),
+  rental_8to14_rate: z.number().int().positive().optional(),
+  rental_cleaning_fee: z.number().int().nonnegative().optional(),
+  rental_security_deposit: z.number().int().nonnegative().optional(),
+
+  // Shipping v2
+  shipping_cost_amount: z.number().int().nonnegative().optional(),
+  free_shipping: z.boolean().optional(),
+
+  // Video
+  video_url: z.string().url().optional(),
+  video_storage_path: z.string().optional(),
+}).refine(
+  (data) => !data.is_rentable || (data.rental_daily_rate !== undefined && data.rental_daily_rate > 0),
+  { message: "rental_daily_rate is required when is_rentable is true", path: ["rental_daily_rate"] }
+);
 
 const updateListingSchema = z.object({
   title: z.string().min(1).max(200).optional(),
@@ -72,7 +111,38 @@ const updateListingSchema = z.object({
   shipping_info: z.string().max(500).nullable().optional(),
   // Status restricted — cannot set to 'reserved' or 'sold' via update
   status: z.enum(["draft", "pending_review", "active", "deactivated"]).optional(),
-});
+
+  // v2 fields — all optional on updates
+  fabric_types: z.array(z.string()).min(1).optional(),
+  items_included: z.array(z.string()).min(1).optional(),
+  work_types: z.array(z.string()).optional(),
+  designer_name: z.string().max(200).nullable().optional(),
+  is_known_designer: z.boolean().optional(),
+  designer_verification_url: z.string().url().nullable().optional(),
+  country_of_origin: z.string().max(100).nullable().optional(),
+  dry_cleaning_status: z.enum(DRY_CLEANING_STATUSES as unknown as [string, ...string[]]).nullable().optional(),
+  alteration_room: z.string().max(500).nullable().optional(),
+  fit_tips: z.string().max(1000).nullable().optional(),
+
+  // Rental fields
+  is_rentable: z.boolean().optional(),
+  rental_daily_rate: z.number().int().positive().nullable().optional(),
+  rental_4to7_rate: z.number().int().positive().nullable().optional(),
+  rental_8to14_rate: z.number().int().positive().nullable().optional(),
+  rental_cleaning_fee: z.number().int().nonnegative().nullable().optional(),
+  rental_security_deposit: z.number().int().nonnegative().nullable().optional(),
+
+  // Shipping v2
+  shipping_cost_amount: z.number().int().nonnegative().nullable().optional(),
+  free_shipping: z.boolean().optional(),
+
+  // Video
+  video_url: z.string().url().nullable().optional(),
+  video_storage_path: z.string().nullable().optional(),
+}).refine(
+  (data) => !data.is_rentable || (data.rental_daily_rate !== undefined && data.rental_daily_rate !== null && data.rental_daily_rate > 0),
+  { message: "rental_daily_rate is required when is_rentable is true", path: ["rental_daily_rate"] }
+);
 
 const statusUpdateSchema = z.object({
   status: z.enum(["draft", "active", "pending_review", "deactivated", "reserved", "sold"]),
@@ -86,24 +156,6 @@ const photoReorderSchema = z.object({
 // ============================================================
 // Helpers
 // ============================================================
-
-/**
- * Look up the profile UUID for a given Clerk user ID.
- * Returns null if no profile exists.
- */
-async function getProfileByClerkId(
-  clerkUserId: string
-): Promise<{ id: string; profile_complete: boolean } | null> {
-  const supabase = createSupabaseAdmin();
-  const { data, error } = await supabase
-    .from("profiles")
-    .select("id, profile_complete")
-    .eq("clerk_id", clerkUserId)
-    .single();
-
-  if (error || !data) return null;
-  return data;
-}
 
 /**
  * Validate that required measurements for a category are present.
@@ -131,6 +183,8 @@ async function validateListingCompleteness(
     category?: string | null;
     condition?: string | null;
     price_amount?: number | null;
+    fabric_types?: string[] | null;
+    items_included?: string[] | null;
   }
 ): Promise<string | null> {
   const missing: string[] = [];
@@ -139,6 +193,8 @@ async function validateListingCompleteness(
   if (!listingData.category) missing.push("category");
   if (!listingData.condition) missing.push("condition");
   if (!listingData.price_amount) missing.push("price_amount");
+  if (!listingData.fabric_types?.length) missing.push("fabric_types");
+  if (!listingData.items_included?.length) missing.push("items_included");
 
   // Check photo count
   const supabase = createSupabaseAdmin();
@@ -159,8 +215,9 @@ async function validateListingCompleteness(
 }
 
 // Valid status transitions (Phase 3: draft -> pending_review for admin moderation)
+// "active" added to draft transitions for Tier 2+ auto-approve path
 const VALID_TRANSITIONS: Record<string, string[]> = {
-  draft: ["pending_review"],           // was ["active"] — now goes through review
+  draft: ["pending_review", "active"], // active used by auto-approve for Tier 2+ sellers
   pending_review: ["active", "draft"], // admin approves to active, or rejects back to draft
   active: ["reserved", "deactivated"],
   reserved: ["active", "sold"],
@@ -192,14 +249,9 @@ async function isAdmin(clerkUserId: string): Promise<boolean> {
  * GET /api/listings/me
  * Return all listings by the current seller, ordered by updated_at DESC.
  */
-listings.get("/me", clerkMiddleware, async (c) => {
-  const clerkUserId = c.get("clerkUserId");
+listings.get("/me", clerkMiddleware, requireProfile, async (c) => {
+  const profile = c.get("profile");
   const supabase = createSupabaseAdmin();
-
-  const profile = await getProfileByClerkId(clerkUserId);
-  if (!profile) {
-    return c.json({ error: "Profile not found" }, 404);
-  }
 
   const statusFilter = c.req.query("status");
 
@@ -220,13 +272,31 @@ listings.get("/me", clerkMiddleware, async (c) => {
     return c.json({ error: "Failed to fetch listings" }, 500);
   }
 
-  // Sort photos by position for each listing
+  // Fetch active boosts for this seller's listings in one query
+  const { data: activeBoosts } = await supabase
+    .from("listing_boosts")
+    .select("listing_id, ends_at")
+    .eq("seller_id", profile.id)
+    .eq("status", "active")
+    .gt("ends_at", new Date().toISOString());
+
+  // Build a map of listing_id -> boost ends_at
+  const boostMap: Record<string, string> = {};
+  if (activeBoosts) {
+    for (const boost of activeBoosts) {
+      boostMap[boost.listing_id] = boost.ends_at;
+    }
+  }
+
+  // Sort photos by position for each listing and add stats + boost info
   const result = (listingsData || []).map((listing) => ({
     ...listing,
     photos: (listing.listing_photos || []).sort(
       (a: { position: number }, b: { position: number }) => a.position - b.position
     ),
     listing_photos: undefined,
+    boost_status: boostMap[listing.id] ? "active" as const : null,
+    boost_ends_at: boostMap[listing.id] || null,
   }));
 
   return c.json({ listings: result });
@@ -236,15 +306,11 @@ listings.get("/me", clerkMiddleware, async (c) => {
  * POST /api/listings
  * Create a new listing.
  */
-listings.post("/", clerkMiddleware, async (c) => {
-  const clerkUserId = c.get("clerkUserId");
+listings.post("/", clerkMiddleware, requireProfile, async (c) => {
+  const profile = c.get("profile");
   const supabase = createSupabaseAdmin();
 
-  // Look up profile
-  const profile = await getProfileByClerkId(clerkUserId);
-  if (!profile) {
-    return c.json({ error: "Profile not found. Please complete your profile first." }, 403);
-  }
+  // Check profile completeness
   if (!profile.profile_complete) {
     return c.json({ error: "Profile must be complete before creating listings." }, 403);
   }
@@ -295,6 +361,34 @@ listings.post("/", clerkMiddleware, async (c) => {
       negotiable: input.negotiable || false,
       status: input.status,
       shipping_info: input.shipping_info || null,
+
+      // v2 fields
+      fabric_types: input.fabric_types,
+      items_included: input.items_included,
+      work_types: input.work_types || [],
+      designer_name: input.designer_name || null,
+      is_known_designer: input.is_known_designer || false,
+      designer_verification_url: input.designer_verification_url || null,
+      country_of_origin: input.country_of_origin || null,
+      dry_cleaning_status: input.dry_cleaning_status || null,
+      alteration_room: input.alteration_room || null,
+      fit_tips: input.fit_tips || null,
+
+      // Rental fields
+      is_rentable: input.is_rentable || false,
+      rental_daily_rate: input.rental_daily_rate || null,
+      rental_4to7_rate: input.rental_4to7_rate || null,
+      rental_8to14_rate: input.rental_8to14_rate || null,
+      rental_cleaning_fee: input.rental_cleaning_fee || null,
+      rental_security_deposit: input.rental_security_deposit || null,
+
+      // Shipping v2
+      shipping_cost_amount: input.shipping_cost_amount || null,
+      free_shipping: input.free_shipping || false,
+
+      // Video
+      video_url: input.video_url || null,
+      video_storage_path: input.video_storage_path || null,
     })
     .select()
     .single();
@@ -323,7 +417,7 @@ listings.get("/:id", optionalClerkMiddleware, async (c) => {
 
   const { data: listing, error } = await supabase
     .from("listings")
-    .select("*, listing_photos(*), profiles!listings_seller_id_fkey(id, display_name, avatar_url, location)")
+    .select("*, listing_photos(*), profiles!listings_seller_id_fkey(id, display_name, avatar_url, location, trust_tier)")
     .eq("id", listingId)
     .single();
 
@@ -342,6 +436,12 @@ listings.get("/:id", optionalClerkMiddleware, async (c) => {
       return c.json({ error: "Listing not found" }, 404);
     }
   }
+
+  // Fire-and-forget view count increment (atomic SQL function)
+  supabase.rpc("increment_view_count", { p_listing_id: listingId }).then(
+    () => {},
+    (err: unknown) => console.error("View count increment error:", err)
+  );
 
   // Shape response
   const photos = (listing.listing_photos || []).sort(
@@ -364,21 +464,15 @@ listings.get("/:id", optionalClerkMiddleware, async (c) => {
  * PUT /api/listings/:id
  * Update a listing (seller only).
  */
-listings.put("/:id", clerkMiddleware, async (c) => {
+listings.put("/:id", clerkMiddleware, requireProfile, async (c) => {
   const listingId = c.req.param("id");
-  const clerkUserId = c.get("clerkUserId");
+  const profile = c.get("profile");
   const supabase = createSupabaseAdmin();
 
   // Validate UUID format
   const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
   if (!uuidRegex.test(listingId)) {
     return c.json({ error: "Invalid listing ID format" }, 400);
-  }
-
-  // Verify requester is the seller
-  const profile = await getProfileByClerkId(clerkUserId);
-  if (!profile) {
-    return c.json({ error: "Profile not found" }, 403);
   }
 
   const { data: existing, error: fetchError } = await supabase
@@ -449,6 +543,34 @@ listings.put("/:id", clerkMiddleware, async (c) => {
   if (input.shipping_info !== undefined) updateData.shipping_info = input.shipping_info;
   if (input.status !== undefined) updateData.status = input.status;
 
+  // v2 fields
+  if (input.fabric_types !== undefined) updateData.fabric_types = input.fabric_types;
+  if (input.items_included !== undefined) updateData.items_included = input.items_included;
+  if (input.work_types !== undefined) updateData.work_types = input.work_types;
+  if (input.designer_name !== undefined) updateData.designer_name = input.designer_name;
+  if (input.is_known_designer !== undefined) updateData.is_known_designer = input.is_known_designer;
+  if (input.designer_verification_url !== undefined) updateData.designer_verification_url = input.designer_verification_url;
+  if (input.country_of_origin !== undefined) updateData.country_of_origin = input.country_of_origin;
+  if (input.dry_cleaning_status !== undefined) updateData.dry_cleaning_status = input.dry_cleaning_status;
+  if (input.alteration_room !== undefined) updateData.alteration_room = input.alteration_room;
+  if (input.fit_tips !== undefined) updateData.fit_tips = input.fit_tips;
+
+  // Rental fields
+  if (input.is_rentable !== undefined) updateData.is_rentable = input.is_rentable;
+  if (input.rental_daily_rate !== undefined) updateData.rental_daily_rate = input.rental_daily_rate;
+  if (input.rental_4to7_rate !== undefined) updateData.rental_4to7_rate = input.rental_4to7_rate;
+  if (input.rental_8to14_rate !== undefined) updateData.rental_8to14_rate = input.rental_8to14_rate;
+  if (input.rental_cleaning_fee !== undefined) updateData.rental_cleaning_fee = input.rental_cleaning_fee;
+  if (input.rental_security_deposit !== undefined) updateData.rental_security_deposit = input.rental_security_deposit;
+
+  // Shipping v2
+  if (input.shipping_cost_amount !== undefined) updateData.shipping_cost_amount = input.shipping_cost_amount;
+  if (input.free_shipping !== undefined) updateData.free_shipping = input.free_shipping;
+
+  // Video
+  if (input.video_url !== undefined) updateData.video_url = input.video_url;
+  if (input.video_storage_path !== undefined) updateData.video_storage_path = input.video_storage_path;
+
   const { data: updated, error: updateError } = await supabase
     .from("listings")
     .update(updateData)
@@ -468,21 +590,16 @@ listings.put("/:id", clerkMiddleware, async (c) => {
  * PATCH /api/listings/:id/status
  * Update listing status with transition validation.
  */
-listings.patch("/:id/status", clerkMiddleware, async (c) => {
+listings.patch("/:id/status", clerkMiddleware, requireProfile, async (c) => {
   const listingId = c.req.param("id");
   const clerkUserId = c.get("clerkUserId");
+  const profile = c.get("profile");
   const supabase = createSupabaseAdmin();
 
   // Validate UUID format
   const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
   if (!uuidRegex.test(listingId)) {
     return c.json({ error: "Invalid listing ID format" }, 400);
-  }
-
-  // Verify requester is the seller
-  const profile = await getProfileByClerkId(clerkUserId);
-  if (!profile) {
-    return c.json({ error: "Profile not found" }, 403);
   }
 
   const { data: existing, error: fetchError } = await supabase
@@ -510,7 +627,8 @@ listings.patch("/:id/status", clerkMiddleware, async (c) => {
     );
   }
 
-  const { status: newStatus, rejection_reason: rejectionReason } = parsed.data;
+  let { status: newStatus } = parsed.data;
+  const { rejection_reason: rejectionReason } = parsed.data;
 
   // Enforce valid transitions
   const allowedTransitions = VALID_TRANSITIONS[existing.status] || [];
@@ -529,6 +647,35 @@ listings.patch("/:id/status", clerkMiddleware, async (c) => {
     const completenessError = await validateListingCompleteness(listingId, existing);
     if (completenessError) {
       return c.json({ error: completenessError }, 400);
+    }
+
+    // Check auto-approve config: tiers with risk-based auto-approve stay in
+    // pending_review (computeRiskScore will auto-approve async if risk is low).
+    // Tiers without risk config or with enabled=false keep the old direct auto-approve.
+    const { data: sellerProfile } = await supabase
+      .from("profiles")
+      .select("trust_tier")
+      .eq("id", existing.seller_id)
+      .single();
+
+    const sellerTier = sellerProfile?.trust_tier ?? 0;
+
+    const { data: adminSettings } = await supabase
+      .from("admin_settings")
+      .select("auto_approve_config")
+      .single();
+
+    const autoApproveConfig = (adminSettings?.auto_approve_config as Record<string, { enabled: boolean; max_risk: number }>) ?? {};
+    const tierConfig = autoApproveConfig[String(sellerTier)];
+
+    if (tierConfig?.enabled) {
+      // Risk-based auto-approve: keep as pending_review, trigger async risk scoring
+      // computeRiskScore will auto-approve if score < max_risk
+      console.log(`Listing ${listingId} entering pending_review with risk scoring for tier ${sellerTier} seller`);
+    } else if (sellerTier >= 2) {
+      // Legacy auto-approve for tiers without risk config
+      newStatus = "active";
+      console.log(`Auto-approved listing ${listingId} for tier ${sellerTier} seller (no risk config)`);
     }
   }
 
@@ -573,16 +720,23 @@ listings.patch("/:id/status", clerkMiddleware, async (c) => {
     return c.json({ error: "Failed to update listing status" }, 500);
   }
 
+  // Trigger async risk scoring when listing enters pending_review
+  if (newStatus === "pending_review") {
+    computeRiskScore(listingId).catch((err) =>
+      console.error("Risk scoring failed:", err)
+    );
+  }
+
   return c.json({ listing: updated });
 });
 
 /**
- * POST /api/listings/:id/photos
- * Upload a photo for a listing (seller only).
+ * PATCH /api/listings/:id/sale
+ * Apply or remove a sale discount (1-70%) on a listing.
  */
-listings.post("/:id/photos", clerkMiddleware, async (c) => {
+listings.patch("/:id/sale", clerkMiddleware, requireProfile, async (c) => {
   const listingId = c.req.param("id");
-  const clerkUserId = c.get("clerkUserId");
+  const profile = c.get("profile");
   const supabase = createSupabaseAdmin();
 
   // Validate UUID format
@@ -591,10 +745,194 @@ listings.post("/:id/photos", clerkMiddleware, async (c) => {
     return c.json({ error: "Invalid listing ID format" }, 400);
   }
 
-  // Verify requester is the seller
-  const profile = await getProfileByClerkId(clerkUserId);
-  if (!profile) {
-    return c.json({ error: "Profile not found" }, 403);
+  const saleSchema = z.object({
+    discount_percentage: z.number().int().min(1).max(70).nullable(),
+  });
+
+  const body = await c.req.json();
+  const parsed = saleSchema.safeParse(body);
+  if (!parsed.success) {
+    return c.json(
+      { error: "Validation failed", details: parsed.error.flatten().fieldErrors },
+      400
+    );
+  }
+
+  const { discount_percentage } = parsed.data;
+
+  // Fetch listing
+  const { data: listing, error: fetchError } = await supabase
+    .from("listings")
+    .select("id, seller_id, price_amount, original_price_amount, sale_percentage")
+    .eq("id", listingId)
+    .single();
+
+  if (fetchError || !listing) {
+    return c.json({ error: "Listing not found" }, 404);
+  }
+
+  if (listing.seller_id !== profile.id) {
+    return c.json({ error: "Not authorized to update this listing" }, 403);
+  }
+
+  let updateData: Record<string, unknown>;
+
+  if (discount_percentage !== null) {
+    // Applying a sale
+    // Use original_price_amount as base if already set, otherwise use current price_amount
+    const originalPrice = listing.original_price_amount ?? listing.price_amount;
+    const newPrice = Math.round(originalPrice * (1 - discount_percentage / 100));
+
+    updateData = {
+      price_amount: newPrice,
+      sale_percentage: discount_percentage,
+      original_price_amount: originalPrice,
+    };
+  } else {
+    // Removing a sale: restore original price
+    if (listing.original_price_amount) {
+      updateData = {
+        price_amount: listing.original_price_amount,
+        sale_percentage: null,
+        original_price_amount: null,
+      };
+    } else {
+      // No sale to remove, just clear sale_percentage
+      updateData = {
+        sale_percentage: null,
+      };
+    }
+  }
+
+  const { data: updated, error: updateError } = await supabase
+    .from("listings")
+    .update(updateData)
+    .eq("id", listingId)
+    .select()
+    .single();
+
+  if (updateError) {
+    console.error("Error updating listing sale:", updateError);
+    return c.json({ error: "Failed to update sale" }, 500);
+  }
+
+  return c.json({ listing: updated });
+});
+
+/**
+ * POST /api/listings/:id/boost/confirm
+ * Confirm a boost purchase after payment (activates the pending boost).
+ */
+listings.post("/:id/boost/confirm", clerkMiddleware, requireProfile, async (c) => {
+  const listingId = c.req.param("id");
+  const profile = c.get("profile");
+  const supabase = createSupabaseAdmin();
+
+  // Validate UUID format
+  const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  if (!uuidRegex.test(listingId)) {
+    return c.json({ error: "Invalid listing ID format" }, 400);
+  }
+
+  const confirmSchema = z.object({
+    boost_id: z.string().uuid("boost_id must be a valid UUID"),
+  });
+
+  const body = await c.req.json();
+  const parsed = confirmSchema.safeParse(body);
+  if (!parsed.success) {
+    return c.json(
+      { error: "Validation failed", details: parsed.error.flatten().fieldErrors },
+      400
+    );
+  }
+
+  const { boost_id } = parsed.data;
+
+  // Verify boost exists, belongs to seller, is pending, and matches listing
+  const { data: boost, error: boostError } = await supabase
+    .from("listing_boosts")
+    .select("id, listing_id, seller_id, status, ends_at")
+    .eq("id", boost_id)
+    .single();
+
+  if (boostError || !boost) {
+    return c.json({ error: "Boost not found" }, 404);
+  }
+
+  if (boost.seller_id !== profile.id) {
+    return c.json({ error: "Not authorized to confirm this boost" }, 403);
+  }
+
+  if (boost.listing_id !== listingId) {
+    return c.json({ error: "Boost does not belong to this listing" }, 400);
+  }
+
+  if (boost.status !== "pending") {
+    return c.json({ error: `Boost is not pending (status: ${boost.status})` }, 400);
+  }
+
+  // Check for existing active boost on this listing
+  const { data: existingActive } = await supabase
+    .from("listing_boosts")
+    .select("id, ends_at")
+    .eq("listing_id", listingId)
+    .eq("status", "active")
+    .gt("ends_at", new Date().toISOString())
+    .limit(1)
+    .single();
+
+  // Fetch boost duration from admin_settings
+  const { data: settings } = await supabase
+    .from("admin_settings")
+    .select("boost_duration_days")
+    .limit(1)
+    .single();
+  const boostDurationDays = settings?.boost_duration_days ?? 7;
+
+  let updatedEndsAt: string;
+
+  if (existingActive) {
+    // Extend existing active boost and cancel the new pending one
+    updatedEndsAt = new Date(
+      new Date(existingActive.ends_at).getTime() + boostDurationDays * 86400000
+    ).toISOString();
+
+    await supabase
+      .from("listing_boosts")
+      .update({ ends_at: updatedEndsAt })
+      .eq("id", existingActive.id);
+
+    await supabase
+      .from("listing_boosts")
+      .update({ status: "cancelled" })
+      .eq("id", boost_id);
+  } else {
+    // Activate the pending boost
+    updatedEndsAt = boost.ends_at;
+
+    await supabase
+      .from("listing_boosts")
+      .update({ status: "active" })
+      .eq("id", boost_id);
+  }
+
+  return c.json({ success: true, ends_at: updatedEndsAt });
+});
+
+/**
+ * POST /api/listings/:id/photos
+ * Upload a photo for a listing (seller only).
+ */
+listings.post("/:id/photos", clerkMiddleware, requireProfile, async (c) => {
+  const listingId = c.req.param("id");
+  const profile = c.get("profile");
+  const supabase = createSupabaseAdmin();
+
+  // Validate UUID format
+  const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  if (!uuidRegex.test(listingId)) {
+    return c.json({ error: "Invalid listing ID format" }, 400);
   }
 
   const { data: existing, error: fetchError } = await supabase
@@ -697,22 +1035,16 @@ listings.post("/:id/photos", clerkMiddleware, async (c) => {
  * DELETE /api/listings/:id/photos/:photoId
  * Delete a photo from a listing (seller only).
  */
-listings.delete("/:id/photos/:photoId", clerkMiddleware, async (c) => {
+listings.delete("/:id/photos/:photoId", clerkMiddleware, requireProfile, async (c) => {
   const listingId = c.req.param("id");
   const photoId = c.req.param("photoId");
-  const clerkUserId = c.get("clerkUserId");
+  const profile = c.get("profile");
   const supabase = createSupabaseAdmin();
 
   // Validate UUID format
   const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
   if (!uuidRegex.test(listingId) || !uuidRegex.test(photoId)) {
     return c.json({ error: "Invalid ID format" }, 400);
-  }
-
-  // Verify requester is the seller
-  const profile = await getProfileByClerkId(clerkUserId);
-  if (!profile) {
-    return c.json({ error: "Profile not found" }, 403);
   }
 
   const { data: listing, error: listingError } = await supabase
@@ -784,21 +1116,15 @@ listings.delete("/:id/photos/:photoId", clerkMiddleware, async (c) => {
  * PUT /api/listings/:id/photos/reorder
  * Reorder photos for a listing (seller only).
  */
-listings.put("/:id/photos/reorder", clerkMiddleware, async (c) => {
+listings.put("/:id/photos/reorder", clerkMiddleware, requireProfile, async (c) => {
   const listingId = c.req.param("id");
-  const clerkUserId = c.get("clerkUserId");
+  const profile = c.get("profile");
   const supabase = createSupabaseAdmin();
 
   // Validate UUID format
   const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
   if (!uuidRegex.test(listingId)) {
     return c.json({ error: "Invalid listing ID format" }, 400);
-  }
-
-  // Verify requester is the seller
-  const profile = await getProfileByClerkId(clerkUserId);
-  if (!profile) {
-    return c.json({ error: "Profile not found" }, 403);
   }
 
   const { data: listing, error: listingError } = await supabase

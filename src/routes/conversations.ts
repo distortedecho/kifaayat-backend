@@ -2,14 +2,17 @@ import { Hono } from "hono";
 import { z } from "zod";
 import { clerkMiddleware } from "../middleware/clerk.js";
 import { createSupabaseAdmin } from "../lib/supabase.js";
+import { scanMessageContent } from "../lib/content-scanner.js";
 import type {
   Conversation,
   Message,
+  MessageType,
   ConversationListItem,
   MessageListResponse,
   ConversationListResponse,
   UnreadCountResponse,
 } from "../types/messaging.js";
+import { createNotification } from "../lib/notifications.js";
 
 const conversations = new Hono();
 
@@ -22,11 +25,14 @@ const createConversationSchema = z.object({
 });
 
 const sendMessageSchema = z.object({
-  content: z
-    .string()
-    .min(1, "Message cannot be empty")
-    .max(2000, "Message must be 2000 characters or less"),
-});
+  content: z.string().max(2000).optional(),
+  message_type: z.enum(['text', 'image', 'photo_request', 'payment_link']).default('text'),
+  image_url: z.string().url().optional(),
+  metadata: z.record(z.unknown()).optional(),
+}).refine(
+  (data) => data.message_type === 'text' ? (data.content && data.content.length > 0) : true,
+  { message: "Text messages require content" }
+);
 
 // ============================================================
 // Helpers
@@ -473,15 +479,18 @@ conversations.post("/:id/messages", clerkMiddleware, async (c) => {
     );
   }
 
-  const { content } = parsed.data;
+  const { content, message_type, image_url, metadata } = parsed.data;
 
-  // Insert message
+  // Insert message with multi-type support
   const { data: message, error: insertError } = await supabase
     .from("messages")
     .insert({
       conversation_id: conversationId,
       sender_id: profileId,
-      content,
+      content: content || null,
+      message_type,
+      image_url: image_url || null,
+      metadata: metadata || {},
     })
     .select()
     .single();
@@ -491,12 +500,29 @@ conversations.post("/:id/messages", clerkMiddleware, async (c) => {
     return c.json({ error: "Failed to send message" }, 500);
   }
 
+  // Fire-and-forget: scan message content for phone numbers, emails, external URLs
+  if (content) {
+    scanMessageContent(message.id, content, profileId).catch((err) =>
+      console.error("Message scan failed:", err)
+    );
+  }
+
+  // Build last_message_preview based on type
+  const previewMap: Record<string, string> = {
+    image: "[Photo]",
+    photo_request: "[Photo Request]",
+    payment_link: "[Payment Link]",
+  };
+  const preview = content
+    ? truncate(content, 100)
+    : previewMap[message_type] || "[Message]";
+
   // Update conversation with last message info
   const { error: updateError } = await supabase
     .from("conversations")
     .update({
       last_message_at: new Date().toISOString(),
-      last_message_preview: truncate(content, 100),
+      last_message_preview: preview,
     })
     .eq("id", conversationId);
 
@@ -504,6 +530,51 @@ conversations.post("/:id/messages", clerkMiddleware, async (c) => {
     console.error("Error updating conversation last message:", updateError);
     // Non-blocking — message was still sent
   }
+
+  // Fire-and-forget new_message notification (debounced per conversation)
+  const recipientId = conversation.buyer_id === profileId
+    ? conversation.seller_id
+    : conversation.buyer_id;
+
+  (async () => {
+    try {
+      // Check if recipient received a new_message notification for this conversation in the last 5 minutes
+      const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+      const { count: recentCount } = await supabase
+        .from("notifications")
+        .select("id", { count: "exact", head: true })
+        .eq("user_id", recipientId)
+        .eq("type", "new_message")
+        .gte("created_at", fiveMinutesAgo)
+        .contains("data", { conversation_id: conversationId });
+
+      if (recentCount && recentCount > 0) {
+        return; // Already notified recently, skip
+      }
+
+      // Get sender display name
+      const { data: senderProfile } = await supabase
+        .from("profiles")
+        .select("display_name")
+        .eq("id", profileId)
+        .single();
+
+      const senderName = senderProfile?.display_name || "Someone";
+      const notifBody = content
+        ? truncate(content, 100)
+        : previewMap[message_type] || "[Message]";
+
+      await createNotification({
+        user_id: recipientId,
+        type: "new_message" as any, // Cast: "new_message" added to NOTIFICATION_TYPES in Plan 19-02
+        title: `New message from ${senderName}`,
+        body: notifBody,
+        data: { conversation_id: conversationId, listing_id: conversation.listing_id },
+      });
+    } catch (err) {
+      console.error("Error sending new_message notification (fire-and-forget):", err);
+    }
+  })();
 
   return c.json({ message }, 201);
 });

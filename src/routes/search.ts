@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import { optionalClerkMiddleware } from "../middleware/clerk.js";
 import { createSupabaseAdmin } from "../lib/supabase.js";
 import { LISTING_CATEGORIES, LISTING_CONDITIONS, OCCASION_TAGS } from "../types/listings.js";
+import { type ListingBadge, BADGE_PRIORITY } from "../types/trust.js";
 
 const search = new Hono();
 
@@ -20,6 +21,9 @@ interface ListingSummary {
   cover_photo_url: string | null;
   seller_name: string | null;
   seller_location: string | null;
+  badges: string[];
+  seller_trust_tier: number;
+  is_boosted: boolean;
 }
 
 // Size filter maps to bust measurement ranges (in inches)
@@ -39,6 +43,50 @@ const NO_BUST_CATEGORIES = ["Saree", "Dupatta", "Jewellery"];
 // ============================================================
 // Helpers
 // ============================================================
+
+/**
+ * Compute up to 2 listing badges in priority order.
+ */
+function computeListingBadges(
+  sellerTrustTier: number,
+  createdAt: string,
+  priceAmount: number,
+  category: string,
+  salePercentage: number | null,
+  categoryMedians: Record<string, number>
+): string[] {
+  const badges: string[] = [];
+
+  for (const badge of BADGE_PRIORITY) {
+    if (badges.length >= 2) break;
+
+    switch (badge) {
+      case "Top Seller":
+        if (sellerTrustTier >= 3) badges.push(badge);
+        break;
+      case "Sale":
+        if (salePercentage !== null && salePercentage > 0) badges.push(badge);
+        break;
+      case "Best Value":
+        if (
+          categoryMedians[category] !== undefined &&
+          priceAmount < categoryMedians[category] * 0.75
+        )
+          badges.push(badge);
+        break;
+      case "New": {
+        const sevenDaysAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
+        if (new Date(createdAt).getTime() > sevenDaysAgo) badges.push(badge);
+        break;
+      }
+      case "Verified":
+        if (sellerTrustTier >= 1) badges.push(badge);
+        break;
+    }
+  }
+
+  return badges;
+}
 
 /**
  * Escape special characters for Postgres text search.
@@ -68,6 +116,14 @@ function buildTsQuery(terms: string[]): string {
 search.get("/", optionalClerkMiddleware, async (c) => {
   const supabase = createSupabaseAdmin();
 
+  // Fetch cached category medians for Best Value badge computation
+  const { data: settingsRow } = await supabase
+    .from("admin_settings")
+    .select("category_medians")
+    .single();
+  const categoryMedians: Record<string, number> =
+    (settingsRow?.category_medians as Record<string, number>) ?? {};
+
   // Parse query params
   const q = c.req.query("q")?.trim() || "";
   const category = c.req.query("category");
@@ -75,6 +131,7 @@ search.get("/", optionalClerkMiddleware, async (c) => {
   const occasion = c.req.query("occasion"); // comma-separated
   const color = c.req.query("color"); // comma-separated
   const location = c.req.query("location");
+  const market = c.req.query("market"); // AU, US, NZ -- filters by seller location
   const size = c.req.query("size");
   const priceMinStr = c.req.query("price_min");
   const priceMaxStr = c.req.query("price_max");
@@ -97,6 +154,9 @@ search.get("/", optionalClerkMiddleware, async (c) => {
   }
   if (location && !["AU", "US", "NZ"].includes(location)) {
     return c.json({ error: "Invalid location filter" }, 400);
+  }
+  if (market && !["AU", "US", "NZ"].includes(market)) {
+    return c.json({ error: "Invalid market filter" }, 400);
   }
   if (size && !Object.keys(SIZE_RANGES).includes(size)) {
     return c.json({ error: "Invalid size filter" }, 400);
@@ -137,7 +197,7 @@ search.get("/", optionalClerkMiddleware, async (c) => {
   let query = supabase
     .from("listings")
     .select(
-      "id, title, description, price_amount, price_currency, original_price_amount, category, condition, measurements, occasion_tags, colors, created_at, listing_photos(url, position), profiles!listings_seller_id_fkey(display_name, location)",
+      "id, title, description, price_amount, price_currency, original_price_amount, category, condition, measurements, occasion_tags, colors, created_at, listing_photos(url, position), profiles!listings_seller_id_fkey(display_name, location, trust_tier)",
       { count: "estimated" }
     )
     .eq("status", "active");
@@ -225,6 +285,11 @@ search.get("/", optionalClerkMiddleware, async (c) => {
     query = query.eq("profiles.location", location);
   }
 
+  // Market filter: same mechanism as location but uses `market` param
+  if (market) {
+    query = query.eq("profiles.location", market);
+  }
+
   // --- Apply sort ---
   switch (sort) {
     case "newest":
@@ -292,18 +357,37 @@ search.get("/", optionalClerkMiddleware, async (c) => {
 
   const allRows = rows || [];
 
-  // If location filter is active, the join filter may have returned listings
+  // If location/market filter is active, the join filter may have returned listings
   // where the profiles join is null — filter those out
+  const locationFilter = location || market;
   let filteredRows = allRows;
-  if (location) {
+  if (locationFilter) {
     filteredRows = allRows.filter((row: Record<string, unknown>) => {
       const profiles = row.profiles as Record<string, unknown> | null;
-      return profiles && profiles.location === location;
+      return profiles && profiles.location === locationFilter;
     });
   }
 
   const hasMore = filteredRows.length > limit;
   const pageRows = hasMore ? filteredRows.slice(0, limit) : filteredRows;
+
+  // Batch-check active boosts for search result listings
+  const searchListingIds = pageRows.map((r: Record<string, unknown>) => r.id as string);
+  const searchBoostedIds = new Set<string>();
+  if (searchListingIds.length > 0) {
+    const { data: searchBoostRows } = await supabase
+      .from("listing_boosts")
+      .select("listing_id")
+      .in("listing_id", searchListingIds)
+      .eq("status", "active")
+      .gt("ends_at", new Date().toISOString());
+
+    if (searchBoostRows) {
+      for (const row of searchBoostRows) {
+        searchBoostedIds.add(row.listing_id);
+      }
+    }
+  }
 
   const items: ListingSummary[] = pageRows.map(
     (row: Record<string, unknown>) => {
@@ -316,13 +400,19 @@ search.get("/", optionalClerkMiddleware, async (c) => {
         coverUrl = (cover.url as string) || null;
       }
 
+      const trustTier = profiles ? ((profiles.trust_tier as number) ?? 0) : 0;
+      const createdAt = (row.created_at as string) || new Date().toISOString();
+      const priceAmount = row.price_amount as number;
+      const category = row.category as string;
+      const salePercentage = (row.sale_percentage as number) ?? null;
+
       return {
         id: row.id as string,
         title: row.title as string,
-        price_amount: row.price_amount as number,
+        price_amount: priceAmount,
         price_currency: row.price_currency as string,
         original_price_amount: (row.original_price_amount as number) || null,
-        category: row.category as string,
+        category,
         condition: row.condition as string,
         cover_photo_url: coverUrl,
         seller_name: profiles
@@ -331,13 +421,47 @@ search.get("/", optionalClerkMiddleware, async (c) => {
         seller_location: profiles
           ? (profiles.location as string | null)
           : null,
+        badges: computeListingBadges(
+          trustTier,
+          createdAt,
+          priceAmount,
+          category,
+          salePercentage,
+          categoryMedians
+        ),
+        seller_trust_tier: trustTier,
+        is_boosted: searchBoostedIds.has(row.id as string),
       };
     }
-  );
+  ).sort((a, b) => (a.is_boosted === b.is_boosted ? 0 : a.is_boosted ? -1 : 1));
 
   const nextCursor = hasMore
     ? (pageRows[pageRows.length - 1] as Record<string, unknown>).id as string
     : null;
+
+  // Fire-and-forget: log search query to search_queries table
+  const clerkUserId = c.get("clerkUserId") as string | undefined;
+  (async () => {
+    try {
+      let userId: string | null = null;
+      if (clerkUserId) {
+        const { data: profile } = await supabase
+          .from("profiles")
+          .select("id")
+          .eq("clerk_id", clerkUserId)
+          .single();
+        userId = profile?.id ?? null;
+      }
+      await supabase.from("search_queries").insert({
+        term: q || "",
+        user_id: userId,
+        filters: { category, condition, occasion, size, market },
+        result_count: items.length,
+      });
+    } catch {
+      // Non-blocking — search logging failure is not user-facing
+    }
+  })();
 
   return c.json({
     items,

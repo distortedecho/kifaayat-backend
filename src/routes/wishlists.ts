@@ -2,6 +2,8 @@ import { Hono } from "hono";
 import { z } from "zod";
 import { Context } from "hono";
 import { clerkMiddleware, optionalClerkMiddleware } from "../middleware/clerk.js";
+import { requireProfile } from "../middleware/requireProfile.js";
+import { getProfileByClerkId } from "../lib/profiles.js";
 import { createSupabaseAdmin } from "../lib/supabase.js";
 
 const wishlists = new Hono();
@@ -58,24 +60,6 @@ const mergeSchema = z.object({
 // ============================================================
 // Helpers
 // ============================================================
-
-/**
- * Look up the profile UUID for a given Clerk user ID.
- * Returns null if no profile exists.
- */
-async function getProfileByClerkId(
-  clerkUserId: string
-): Promise<{ id: string } | null> {
-  const supabase = createSupabaseAdmin();
-  const { data, error } = await supabase
-    .from("profiles")
-    .select("id")
-    .eq("clerk_id", clerkUserId)
-    .single();
-
-  if (error || !data) return null;
-  return data;
-}
 
 /**
  * Determines the wishlist identifier (user_id or guest_token) from the request context.
@@ -392,8 +376,8 @@ wishlists.get("/check", optionalClerkMiddleware, async (c) => {
  * POST /api/wishlists/folders
  * Create a wishlist folder.
  */
-wishlists.post("/folders", clerkMiddleware, async (c) => {
-  const clerkUserId = c.get("clerkUserId");
+wishlists.post("/folders", clerkMiddleware, requireProfile, async (c) => {
+  const profile = c.get("profile");
   const supabase = createSupabaseAdmin();
 
   // Parse body
@@ -407,12 +391,6 @@ wishlists.post("/folders", clerkMiddleware, async (c) => {
   }
 
   const { name } = parsed.data;
-
-  // Get profile
-  const profile = await getProfileByClerkId(clerkUserId);
-  if (!profile) {
-    return c.json({ error: "Profile not found" }, 404);
-  }
 
   // Insert folder
   const { data: folder, error: insertError } = await supabase
@@ -436,15 +414,9 @@ wishlists.post("/folders", clerkMiddleware, async (c) => {
  * GET /api/wishlists/folders
  * Get all folders with item counts and cover photos.
  */
-wishlists.get("/folders", clerkMiddleware, async (c) => {
-  const clerkUserId = c.get("clerkUserId");
+wishlists.get("/folders", clerkMiddleware, requireProfile, async (c) => {
+  const profile = c.get("profile");
   const supabase = createSupabaseAdmin();
-
-  // Get profile
-  const profile = await getProfileByClerkId(clerkUserId);
-  if (!profile) {
-    return c.json({ error: "Profile not found" }, 404);
-  }
 
   // Get all folders
   const { data: folders, error: foldersError } = await supabase
@@ -512,9 +484,9 @@ wishlists.get("/folders", clerkMiddleware, async (c) => {
  * PUT /api/wishlists/folders/:folderId
  * Update a folder name.
  */
-wishlists.put("/folders/:folderId", clerkMiddleware, async (c) => {
+wishlists.put("/folders/:folderId", clerkMiddleware, requireProfile, async (c) => {
   const folderId = c.req.param("folderId");
-  const clerkUserId = c.get("clerkUserId");
+  const profile = c.get("profile");
   const supabase = createSupabaseAdmin();
 
   // Validate UUID format
@@ -534,12 +506,6 @@ wishlists.put("/folders/:folderId", clerkMiddleware, async (c) => {
   }
 
   const { name } = parsed.data;
-
-  // Get profile
-  const profile = await getProfileByClerkId(clerkUserId);
-  if (!profile) {
-    return c.json({ error: "Profile not found" }, 404);
-  }
 
   // Verify ownership and update
   const { data: folder, error: updateError } = await supabase
@@ -561,21 +527,15 @@ wishlists.put("/folders/:folderId", clerkMiddleware, async (c) => {
  * DELETE /api/wishlists/folders/:folderId
  * Delete a folder. Items in folder get folder_id set to NULL (they stay in "All Saved").
  */
-wishlists.delete("/folders/:folderId", clerkMiddleware, async (c) => {
+wishlists.delete("/folders/:folderId", clerkMiddleware, requireProfile, async (c) => {
   const folderId = c.req.param("folderId");
-  const clerkUserId = c.get("clerkUserId");
+  const profile = c.get("profile");
   const supabase = createSupabaseAdmin();
 
   // Validate UUID format
   const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
   if (!uuidRegex.test(folderId)) {
     return c.json({ error: "Invalid folder ID format" }, 400);
-  }
-
-  // Get profile
-  const profile = await getProfileByClerkId(clerkUserId);
-  if (!profile) {
-    return c.json({ error: "Profile not found" }, 404);
   }
 
   // Verify ownership
@@ -686,8 +646,8 @@ wishlists.put("/:listingId/folder", optionalClerkMiddleware, async (c) => {
  * POST /api/wishlists/merge
  * Merge guest wishlist items to authenticated user on sign-up.
  */
-wishlists.post("/merge", clerkMiddleware, async (c) => {
-  const clerkUserId = c.get("clerkUserId");
+wishlists.post("/merge", clerkMiddleware, requireProfile, async (c) => {
+  const profile = c.get("profile");
   const supabase = createSupabaseAdmin();
 
   // Parse body
@@ -701,12 +661,6 @@ wishlists.post("/merge", clerkMiddleware, async (c) => {
   }
 
   const { guest_token } = parsed.data;
-
-  // Get profile
-  const profile = await getProfileByClerkId(clerkUserId);
-  if (!profile) {
-    return c.json({ error: "Profile not found" }, 404);
-  }
 
   // Get guest wishlist items
   const { data: guestItems, error: fetchError } = await supabase

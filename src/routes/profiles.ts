@@ -11,7 +11,7 @@ const updateProfileSchema = z.object({
     .string()
     .max(50, "Display name must be 50 characters or less")
     .optional(),
-  avatar_url: z.string().url("Must be a valid URL").optional(),
+  avatar_url: z.string().url("Must be a valid URL").nullable().optional(),
   location: z.enum(["AU", "US", "NZ"]).optional(),
   currency: z.enum(["AUD", "USD", "NZD"]).optional(),
   size_preferences: z
@@ -92,6 +92,38 @@ profiles.get("/me", clerkMiddleware, async (c) => {
     // Intentionally swallowed — welcome email is best-effort
   });
 
+  // Fire-and-forget referral code generation
+  (async () => {
+    try {
+      const { createClerkClient } = await import("@clerk/backend");
+      const clerk = createClerkClient({
+        secretKey: process.env.CLERK_SECRET_KEY || "",
+      });
+      const user = await clerk.users.getUser(clerkUserId);
+      let code = (user.username || user.firstName || newProfile.id.slice(0, 8))
+        .toUpperCase()
+        .replace(/[^A-Z0-9]/g, "");
+      if (!code) code = newProfile.id.slice(0, 8).toUpperCase();
+
+      const { error: codeError } = await supabase.from("referral_codes").insert({
+        user_id: newProfile.id,
+        code,
+      });
+
+      // Handle UNIQUE collision -- append random suffix
+      if (codeError?.code === "23505") {
+        const suffix = Math.floor(Math.random() * 999).toString();
+        await supabase.from("referral_codes").insert({
+          user_id: newProfile.id,
+          code: `${code}${suffix}`,
+        });
+      }
+    } catch (err) {
+      console.error("Error generating referral code:", err);
+      // Non-blocking -- profile still created successfully
+    }
+  })();
+
   return c.json({ profile: newProfile }, 201);
 });
 
@@ -135,10 +167,7 @@ profiles.put("/me", clerkMiddleware, async (c) => {
   const merged = { ...existingProfile, ...updateData };
   const profileComplete =
     !!merged.display_name &&
-    !!merged.avatar_url &&
-    !!merged.location &&
-    merged.size_preferences !== null &&
-    Object.keys(merged.size_preferences as Record<string, unknown>).length > 0;
+    !!merged.location;
 
   const { data: updatedProfile, error: updateError } = await supabase
     .from("profiles")

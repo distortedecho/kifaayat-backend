@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 import { z } from "zod";
 import { clerkMiddleware } from "../middleware/clerk.js";
+import { requireProfile } from "../middleware/requireProfile.js";
 import { createSupabaseAdmin } from "../lib/supabase.js";
 import {
   type OfferStatus,
@@ -39,20 +40,6 @@ const counterOfferSchema = z.object({
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-async function getProfileByClerkId(
-  clerkUserId: string
-): Promise<{ id: string; display_name: string | null } | null> {
-  const supabase = createSupabaseAdmin();
-  const { data, error } = await supabase
-    .from("profiles")
-    .select("id, display_name")
-    .eq("clerk_id", clerkUserId)
-    .single();
-
-  if (error || !data) return null;
-  return data;
-}
-
 /**
  * Get cover photo URL for a listing.
  */
@@ -76,14 +63,9 @@ async function getCoverPhotoUrl(listingId: string): Promise<string | null> {
  * POST /api/offers
  * Create a new offer on a listing.
  */
-offers.post("/", clerkMiddleware, async (c) => {
-  const clerkUserId = c.get("clerkUserId");
+offers.post("/", clerkMiddleware, requireProfile, async (c) => {
+  const profile = c.get("profile");
   const supabase = createSupabaseAdmin();
-
-  const profile = await getProfileByClerkId(clerkUserId);
-  if (!profile) {
-    return c.json({ error: "Profile not found" }, 404);
-  }
 
   // Parse and validate body
   const body = await c.req.json();
@@ -180,14 +162,9 @@ offers.post("/", clerkMiddleware, async (c) => {
  * GET /api/offers/mine
  * List buyer's offers with listing info.
  */
-offers.get("/mine", clerkMiddleware, async (c) => {
-  const clerkUserId = c.get("clerkUserId");
+offers.get("/mine", clerkMiddleware, requireProfile, async (c) => {
+  const profile = c.get("profile");
   const supabase = createSupabaseAdmin();
-
-  const profile = await getProfileByClerkId(clerkUserId);
-  if (!profile) {
-    return c.json({ error: "Profile not found" }, 404);
-  }
 
   const { data: offersData, error } = await supabase
     .from("offers")
@@ -244,14 +221,9 @@ offers.get("/mine", clerkMiddleware, async (c) => {
  * GET /api/offers/received
  * List seller's received offers with listing info and buyer name.
  */
-offers.get("/received", clerkMiddleware, async (c) => {
-  const clerkUserId = c.get("clerkUserId");
+offers.get("/received", clerkMiddleware, requireProfile, async (c) => {
+  const profile = c.get("profile");
   const supabase = createSupabaseAdmin();
-
-  const profile = await getProfileByClerkId(clerkUserId);
-  if (!profile) {
-    return c.json({ error: "Profile not found" }, 404);
-  }
 
   const { data: offersData, error } = await supabase
     .from("offers")
@@ -308,18 +280,13 @@ offers.get("/received", clerkMiddleware, async (c) => {
  * GET /api/offers/:id
  * Get single offer with full details.
  */
-offers.get("/:id", clerkMiddleware, async (c) => {
+offers.get("/:id", clerkMiddleware, requireProfile, async (c) => {
   const offerId = c.req.param("id");
-  const clerkUserId = c.get("clerkUserId");
+  const profile = c.get("profile");
   const supabase = createSupabaseAdmin();
 
   if (!UUID_REGEX.test(offerId)) {
     return c.json({ error: "Invalid offer ID format" }, 400);
-  }
-
-  const profile = await getProfileByClerkId(clerkUserId);
-  if (!profile) {
-    return c.json({ error: "Profile not found" }, 404);
   }
 
   const { data: offer, error } = await supabase
@@ -346,18 +313,13 @@ offers.get("/:id", clerkMiddleware, async (c) => {
  * POST /api/offers/:id/accept
  * Seller accepts an offer.
  */
-offers.post("/:id/accept", clerkMiddleware, async (c) => {
+offers.post("/:id/accept", clerkMiddleware, requireProfile, async (c) => {
   const offerId = c.req.param("id");
-  const clerkUserId = c.get("clerkUserId");
+  const profile = c.get("profile");
   const supabase = createSupabaseAdmin();
 
   if (!UUID_REGEX.test(offerId)) {
     return c.json({ error: "Invalid offer ID format" }, 400);
-  }
-
-  const profile = await getProfileByClerkId(clerkUserId);
-  if (!profile) {
-    return c.json({ error: "Profile not found" }, 404);
   }
 
   // Fetch the offer
@@ -428,18 +390,13 @@ offers.post("/:id/accept", clerkMiddleware, async (c) => {
  * POST /api/offers/:id/decline
  * Seller declines an offer.
  */
-offers.post("/:id/decline", clerkMiddleware, async (c) => {
+offers.post("/:id/decline", clerkMiddleware, requireProfile, async (c) => {
   const offerId = c.req.param("id");
-  const clerkUserId = c.get("clerkUserId");
+  const profile = c.get("profile");
   const supabase = createSupabaseAdmin();
 
   if (!UUID_REGEX.test(offerId)) {
     return c.json({ error: "Invalid offer ID format" }, 400);
-  }
-
-  const profile = await getProfileByClerkId(clerkUserId);
-  if (!profile) {
-    return c.json({ error: "Profile not found" }, 404);
   }
 
   // Fetch the offer
@@ -497,18 +454,13 @@ offers.post("/:id/decline", clerkMiddleware, async (c) => {
  * POST /api/offers/:id/counter
  * Counter an offer (seller counters buyer's offer, or buyer counters seller's counter).
  */
-offers.post("/:id/counter", clerkMiddleware, async (c) => {
+offers.post("/:id/counter", clerkMiddleware, requireProfile, async (c) => {
   const offerId = c.req.param("id");
-  const clerkUserId = c.get("clerkUserId");
+  const profile = c.get("profile");
   const supabase = createSupabaseAdmin();
 
   if (!UUID_REGEX.test(offerId)) {
     return c.json({ error: "Invalid offer ID format" }, 400);
-  }
-
-  const profile = await getProfileByClerkId(clerkUserId);
-  if (!profile) {
-    return c.json({ error: "Profile not found" }, 404);
   }
 
   // Parse body

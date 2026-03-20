@@ -1,5 +1,6 @@
 import { Hono } from "hono";
 import { clerkMiddleware } from "../middleware/clerk.js";
+import { requireProfile } from "../middleware/requireProfile.js";
 import { createSupabaseAdmin } from "../lib/supabase.js";
 
 const notifications = new Hono();
@@ -9,20 +10,6 @@ const notifications = new Hono();
 // ============================================================
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
-async function getProfileByClerkId(
-  clerkUserId: string
-): Promise<{ id: string } | null> {
-  const supabase = createSupabaseAdmin();
-  const { data, error } = await supabase
-    .from("profiles")
-    .select("id")
-    .eq("clerk_id", clerkUserId)
-    .single();
-
-  if (error || !data) return null;
-  return data;
-}
 
 // ============================================================
 // Routes
@@ -35,14 +22,9 @@ async function getProfileByClerkId(
  *   - cursor: ISO timestamp for pagination (created_at of last item)
  *   - limit: number of items (default 20, max 50)
  */
-notifications.get("/", clerkMiddleware, async (c) => {
-  const clerkUserId = c.get("clerkUserId");
+notifications.get("/", clerkMiddleware, requireProfile, async (c) => {
+  const profile = c.get("profile");
   const supabase = createSupabaseAdmin();
-
-  const profile = await getProfileByClerkId(clerkUserId);
-  if (!profile) {
-    return c.json({ error: "Profile not found" }, 404);
-  }
 
   const cursor = c.req.query("cursor");
   const limitParam = c.req.query("limit");
@@ -90,14 +72,9 @@ notifications.get("/", clerkMiddleware, async (c) => {
  * GET /api/notifications/unread-count
  * Returns just the unread count (for badge polling).
  */
-notifications.get("/unread-count", clerkMiddleware, async (c) => {
-  const clerkUserId = c.get("clerkUserId");
+notifications.get("/unread-count", clerkMiddleware, requireProfile, async (c) => {
+  const profile = c.get("profile");
   const supabase = createSupabaseAdmin();
-
-  const profile = await getProfileByClerkId(clerkUserId);
-  if (!profile) {
-    return c.json({ error: "Profile not found" }, 404);
-  }
 
   const { count, error } = await supabase
     .from("notifications")
@@ -117,18 +94,13 @@ notifications.get("/unread-count", clerkMiddleware, async (c) => {
  * PATCH /api/notifications/:id/read
  * Mark a single notification as read.
  */
-notifications.patch("/:id/read", clerkMiddleware, async (c) => {
+notifications.patch("/:id/read", clerkMiddleware, requireProfile, async (c) => {
   const notificationId = c.req.param("id");
-  const clerkUserId = c.get("clerkUserId");
+  const profile = c.get("profile");
   const supabase = createSupabaseAdmin();
 
   if (!UUID_REGEX.test(notificationId)) {
     return c.json({ error: "Invalid notification ID format" }, 400);
-  }
-
-  const profile = await getProfileByClerkId(clerkUserId);
-  if (!profile) {
-    return c.json({ error: "Profile not found" }, 404);
   }
 
   const { data: notification, error: updateError } = await supabase
@@ -150,14 +122,9 @@ notifications.patch("/:id/read", clerkMiddleware, async (c) => {
  * PATCH /api/notifications/read-all
  * Mark all user's notifications as read.
  */
-notifications.patch("/read-all", clerkMiddleware, async (c) => {
-  const clerkUserId = c.get("clerkUserId");
+notifications.patch("/read-all", clerkMiddleware, requireProfile, async (c) => {
+  const profile = c.get("profile");
   const supabase = createSupabaseAdmin();
-
-  const profile = await getProfileByClerkId(clerkUserId);
-  if (!profile) {
-    return c.json({ error: "Profile not found" }, 404);
-  }
 
   const { error: updateError } = await supabase
     .from("notifications")
@@ -171,6 +138,102 @@ notifications.patch("/read-all", clerkMiddleware, async (c) => {
   }
 
   return c.json({ success: true });
+});
+
+// ============================================================
+// Notification Preferences
+// ============================================================
+
+const VALID_CATEGORIES = ["transaction", "engagement", "seller", "marketing"] as const;
+type PreferenceCategory = (typeof VALID_CATEGORIES)[number];
+
+/**
+ * GET /api/notifications/preferences
+ * Returns user's notification preferences per category.
+ * Missing categories should use client-side defaults:
+ *   transaction = always on, engagement = on, seller = on, marketing = off
+ */
+notifications.get("/preferences", clerkMiddleware, requireProfile, async (c) => {
+  const profile = c.get("profile");
+  const supabase = createSupabaseAdmin();
+
+  const { data: preferences, error } = await supabase
+    .from("notification_preferences")
+    .select("category, push_enabled, email_enabled")
+    .eq("user_id", profile.id);
+
+  if (error) {
+    console.error("Error fetching notification preferences:", error);
+    return c.json({ error: "Failed to fetch preferences" }, 500);
+  }
+
+  return c.json({
+    preferences: preferences || [],
+  });
+});
+
+/**
+ * PUT /api/notifications/preferences
+ * Upsert a notification preference for a specific category.
+ * Body: { category: string, push_enabled: boolean, email_enabled: boolean }
+ * Transaction category cannot be modified (always on).
+ */
+notifications.put("/preferences", clerkMiddleware, requireProfile, async (c) => {
+  const profile = c.get("profile");
+  const supabase = createSupabaseAdmin();
+
+  let body: { category?: string; push_enabled?: boolean; email_enabled?: boolean };
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({ error: "Invalid JSON body" }, 400);
+  }
+
+  const { category, push_enabled, email_enabled } = body;
+
+  // Validate category
+  if (!category || !VALID_CATEGORIES.includes(category as PreferenceCategory)) {
+    return c.json({
+      error: `Invalid category. Must be one of: ${VALID_CATEGORIES.join(", ")}`,
+    }, 400);
+  }
+
+  // Transaction category cannot be modified
+  if (category === "transaction") {
+    return c.json({
+      error: "Transaction notifications cannot be disabled",
+    }, 400);
+  }
+
+  // Validate boolean fields
+  if (typeof push_enabled !== "boolean" || typeof email_enabled !== "boolean") {
+    return c.json({
+      error: "push_enabled and email_enabled must be boolean values",
+    }, 400);
+  }
+
+  // Upsert preference
+  const { data: preference, error } = await supabase
+    .from("notification_preferences")
+    .upsert(
+      {
+        user_id: profile.id,
+        category,
+        push_enabled,
+        email_enabled,
+        updated_at: new Date().toISOString(),
+      },
+      { onConflict: "user_id,category" }
+    )
+    .select("category, push_enabled, email_enabled, updated_at")
+    .single();
+
+  if (error) {
+    console.error("Error upserting notification preference:", error);
+    return c.json({ error: "Failed to update preference" }, 500);
+  }
+
+  return c.json({ preference });
 });
 
 export default notifications;
