@@ -40,6 +40,7 @@ export const clerkMiddleware: MiddlewareHandler = async (c, next) => {
   try {
     const payload = await verifyToken(token, {
       secretKey,
+      clockSkewInMs: 15000, // 15s tolerance for clock differences with Clerk servers
     });
 
     if (!payload.sub) {
@@ -48,8 +49,11 @@ export const clerkMiddleware: MiddlewareHandler = async (c, next) => {
 
     c.set("clerkUserId", payload.sub);
     await next();
-  } catch (error) {
-    console.error("Clerk token verification failed:", error);
+  } catch (error: any) {
+    // Only log non-expired token errors to reduce noise
+    if (error?.reason !== "token-expired") {
+      console.error("Clerk token verification failed:", error);
+    }
     return c.json({ error: "Invalid or expired token" }, 401);
   }
 };
@@ -78,6 +82,7 @@ export const optionalClerkMiddleware: MiddlewareHandler = async (c, next) => {
   try {
     const payload = await verifyToken(token, {
       secretKey,
+      clockSkewInMs: 15000,
     });
 
     if (payload.sub) {

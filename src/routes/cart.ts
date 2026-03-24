@@ -472,6 +472,11 @@ cart.post("/checkout", clerkMiddleware, requireProfile, async (c) => {
     );
   }
 
+  // Early check: Stripe must be configured for checkout
+  if (!process.env.STRIPE_SECRET_KEY) {
+    return c.json({ error: "Payments are not configured. Please try again later." }, 503);
+  }
+
   // Validate all sellers have completed Stripe onboarding
   const unverifiedSellers: string[] = [];
   const seenSellers = new Set<string>();

@@ -23,6 +23,27 @@ const ai = new Hono();
 const MAX_PHOTO_SIZE = 4 * 1024 * 1024;
 
 /**
+ * Detect MIME type from base64-encoded image data by inspecting magic bytes.
+ * Falls back to "image/jpeg" if the format is unrecognized.
+ */
+function detectMimeType(base64Data: string): string {
+  // Check magic bytes at the start of the base64 string
+  // PNG: iVBOR (base64 of \x89PNG)
+  if (base64Data.startsWith("iVBOR")) return "image/png";
+  // JPEG: /9j/ (base64 of \xFF\xD8\xFF)
+  if (base64Data.startsWith("/9j/")) return "image/jpeg";
+  // WebP: UklGR (base64 of RIFF)
+  if (base64Data.startsWith("UklGR")) return "image/webp";
+  // GIF: R0lGOD (base64 of GIF8)
+  if (base64Data.startsWith("R0lGOD")) return "image/gif";
+  // HEIC/HEIF: starts with various ftyp box signatures
+  // Base64 of \x00\x00\x00 ftyp patterns — check for "AAAA" prefix (common ftyp box start)
+  if (base64Data.startsWith("AAAAH") || base64Data.startsWith("AAAAI")) return "image/heic";
+  // Default fallback
+  return "image/jpeg";
+}
+
+/**
  * POST /api/ai/analyze
  *
  * Accepts base64-encoded photos, sends them to Gemini for multimodal analysis,
@@ -32,16 +53,22 @@ const MAX_PHOTO_SIZE = 4 * 1024 * 1024;
  * Retries once on Gemini failure. Returns fallback error on double failure.
  */
 ai.post("/analyze", clerkMiddleware, async (c) => {
+  const requestStart = Date.now();
+  const clerkUserId = c.get("clerkUserId") ?? "unknown";
+  console.log(`[AI Analyze] Request received from user=${clerkUserId}`);
+
   // Parse request body
   let body: { photos?: string[] };
   try {
     body = await c.req.json();
   } catch {
+    console.warn(`[AI Analyze] Invalid JSON body from user=${clerkUserId}`);
     return c.json({ error: "Invalid JSON body" }, 400);
   }
 
   // Validate photos array
   if (!body.photos || !Array.isArray(body.photos) || body.photos.length === 0) {
+    console.warn(`[AI Analyze] No photos provided by user=${clerkUserId}`);
     return c.json({ error: "At least one photo is required" }, 400);
   }
 
@@ -51,12 +78,14 @@ ai.post("/analyze", clerkMiddleware, async (c) => {
       return c.json({ error: "Photos must be base64 strings" }, 400);
     }
     if (photo.length > MAX_PHOTO_SIZE) {
+      console.warn(`[AI Analyze] Photo exceeds 4MB limit, size=${photo.length} user=${clerkUserId}`);
       return c.json({ error: "Photo exceeds 4MB size limit" }, 413);
     }
   }
 
   // Limit to first 3 photos to keep token count reasonable
   const photos = body.photos.slice(0, 3);
+  console.log(`[AI Analyze] Processing ${photos.length} photos for user=${clerkUserId}`);
 
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
@@ -66,13 +95,17 @@ ai.post("/analyze", clerkMiddleware, async (c) => {
 
   const genAI = new GoogleGenAI({ apiKey });
 
-  // Build multimodal prompt with inline image data
-  const imageParts = photos.map((photo) => ({
-    inlineData: {
-      mimeType: "image/jpeg" as const,
-      data: photo,
-    },
-  }));
+  // Build multimodal prompt with inline image data, detecting MIME type per photo
+  const imageParts = photos.map((photo, idx) => {
+    const mimeType = detectMimeType(photo);
+    console.log(`[AI Analyze] Photo ${idx}: mimeType=${mimeType}, size=${photo.length} chars`);
+    return {
+      inlineData: {
+        mimeType,
+        data: photo,
+      },
+    };
+  });
 
   const prompt = `Analyze these photos of a South Asian fashion item for a preloved marketplace listing.
 Return a JSON object with these fields:
@@ -123,17 +156,22 @@ Return valid JSON only, no markdown formatting.`;
 
       // Map and validate response
       const response = mapGeminiResponse(parsed);
+      const elapsed = Date.now() - requestStart;
+      console.log(`[AI Analyze] Success for user=${clerkUserId} in ${elapsed}ms (attempt ${attempt + 1})`);
       return c.json(response, 200);
     } catch (error) {
       lastError = error;
+      console.warn(`[AI Analyze] Attempt ${attempt + 1} failed for user=${clerkUserId}:`, error);
       // Continue to retry
     }
   }
 
   // Both attempts failed
-  console.error("AI analysis failed after retry:", lastError);
+  const elapsed = Date.now() - requestStart;
+  const errMsg = lastError instanceof Error ? lastError.message : String(lastError);
+  console.error(`[AI Analyze] Failed after 2 attempts for user=${clerkUserId} in ${elapsed}ms: ${errMsg}`);
   return c.json(
-    { error: "AI analysis failed", fallback: true } satisfies AIErrorResponse,
+    { error: `AI analysis failed: ${errMsg}`, fallback: true } satisfies AIErrorResponse,
     503
   );
 });

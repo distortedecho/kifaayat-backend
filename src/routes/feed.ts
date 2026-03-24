@@ -185,7 +185,9 @@ function filterByMarket(
 ): Record<string, unknown>[] {
   return rows.filter((row) => {
     const profiles = row.profiles as Record<string, unknown> | null;
-    return profiles && profiles.location === market;
+    if (!profiles) return false;
+    // Include sellers whose location matches OR who haven't set a location yet
+    return profiles.location === market || !profiles.location;
   });
 }
 
