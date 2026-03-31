@@ -12,8 +12,8 @@ const updateProfileSchema = z.object({
     .max(50, "Display name must be 50 characters or less")
     .optional(),
   avatar_url: z.string().url("Must be a valid URL").nullable().optional(),
-  location: z.enum(["AU", "US", "NZ"]).optional(),
-  currency: z.enum(["AUD", "USD", "NZD"]).optional(),
+  location: z.enum(["AU", "US", "NZ", "CA", "UK"]).optional(),
+  currency: z.enum(["AUD", "USD", "NZD", "CAD", "GBP"]).optional(),
   size_preferences: z
     .object({
       bust: z.string().optional(),
@@ -38,7 +38,7 @@ const updateProfileSchema = z.object({
     )
     .optional(),
   onesignal_player_id: z.string().optional(),
-  user_intents: z.array(z.enum(["buy", "sell", "rent", "browse"])).optional(),
+  user_intents: z.array(z.enum(["buy", "sell"])).optional(),
 });
 
 /**

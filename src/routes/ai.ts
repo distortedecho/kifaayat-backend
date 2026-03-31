@@ -22,6 +22,26 @@ const ai = new Hono();
 // Maximum base64 photo size: 4MB
 const MAX_PHOTO_SIZE = 4 * 1024 * 1024;
 
+function truncateAtWordBoundary(text: string, maxLen: number): string {
+  if (text.length <= maxLen) return text;
+  const truncated = text.slice(0, maxLen);
+  const lastSpace = truncated.lastIndexOf(" ");
+  return lastSpace > maxLen * 0.6 ? truncated.slice(0, lastSpace) : truncated;
+}
+
+function truncateAtSentenceBoundary(text: string, maxLen: number): string {
+  if (text.length <= maxLen) return text;
+  const truncated = text.slice(0, maxLen);
+  const lastSentenceEnd = Math.max(
+    truncated.lastIndexOf(". "),
+    truncated.lastIndexOf(".\n"),
+    truncated.lastIndexOf(". ")
+  );
+  if (lastSentenceEnd > maxLen * 0.5) return truncated.slice(0, lastSentenceEnd + 1);
+  const lastSpace = truncated.lastIndexOf(" ");
+  return lastSpace > maxLen * 0.6 ? truncated.slice(0, lastSpace) : truncated;
+}
+
 /**
  * Detect MIME type from base64-encoded image data by inspecting magic bytes.
  * Falls back to "image/jpeg" if the format is unrecognized.
@@ -262,11 +282,11 @@ function mapGeminiResponse(raw: Record<string, unknown>): AIAnalysisResponse {
       confidence: categoryValid ? toConfidence(raw.category_confidence) : 0,
     },
     title: {
-      value: String(raw.title || "").slice(0, 200),
+      value: truncateAtWordBoundary(String(raw.title || ""), 100),
       confidence: toConfidence(raw.title_confidence),
     },
     description: {
-      value: String(raw.description || "").slice(0, 500),
+      value: truncateAtSentenceBoundary(String(raw.description || ""), 500),
       confidence: toConfidence(raw.description_confidence),
     },
     suggested_price: {
