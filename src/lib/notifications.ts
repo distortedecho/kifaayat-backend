@@ -79,6 +79,8 @@ export const NOTIFICATION_CATEGORY_MAP: Record<string, NotificationCategory> = {
   weekly_digest: 'marketing',
   referral_nudge: 'marketing',
   re_engagement: 'marketing',
+  // Seller follow (engagement)
+  followed_seller_new_listing: 'engagement',
 };
 
 /** Default push_enabled value for categories without an explicit user preference */
@@ -668,5 +670,15 @@ export function reEngagementNotification(): NotificationTemplate {
   return {
     title: "We miss you!",
     body: "New arrivals are waiting for you. Come take a look.",
+  };
+}
+
+export function followedSellerNewListingNotification(
+  sellerName: string,
+  listingTitle: string
+): NotificationTemplate {
+  return {
+    title: `${sellerName} listed something new`,
+    body: `Check out "${listingTitle}"`,
   };
 }

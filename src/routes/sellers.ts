@@ -1,9 +1,13 @@
 import { Hono } from "hono";
 import { optionalClerkMiddleware, clerkMiddleware } from "../middleware/clerk.js";
 import { requireProfile } from "../middleware/requireProfile.js";
+import { getProfileByClerkId } from "../lib/profiles.js";
 import { createSupabaseAdmin } from "../lib/supabase.js";
 
 const sellers = new Hono();
+
+const UUID_REGEX =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
  * GET /api/sellers/dashboard
@@ -85,25 +89,139 @@ sellers.get("/dashboard", clerkMiddleware, requireProfile, async (c) => {
 });
 
 /**
- * GET /api/sellers/:id
- * Public seller profile endpoint.
- * Returns seller info with listing/sold counts and active listings.
+ * POST /api/sellers/:id/follow
+ * Follow a seller. Requires authentication.
  */
-sellers.get("/:id", optionalClerkMiddleware, async (c) => {
+sellers.post("/:id/follow", clerkMiddleware, async (c) => {
+  const sellerId = c.req.param("id");
+  const clerkUserId = c.get("clerkUserId");
+  const supabase = createSupabaseAdmin();
+
+  if (!UUID_REGEX.test(sellerId)) {
+    return c.json({ error: "Invalid seller ID format" }, 400);
+  }
+
+  const profile = await getProfileByClerkId(clerkUserId);
+  if (!profile) return c.json({ error: "Profile not found" }, 404);
+
+  if (profile.id === sellerId) {
+    return c.json({ error: "Cannot follow yourself" }, 400);
+  }
+
+  const { error } = await supabase.from("seller_follows").upsert(
+    { follower_id: profile.id, seller_id: sellerId },
+    { onConflict: "follower_id,seller_id" }
+  );
+
+  if (error) {
+    console.error("Error following seller:", error);
+    return c.json({ error: "Failed to follow seller" }, 500);
+  }
+
+  return c.json({ following: true });
+});
+
+/**
+ * DELETE /api/sellers/:id/follow
+ * Unfollow a seller. Requires authentication.
+ */
+sellers.delete("/:id/follow", clerkMiddleware, async (c) => {
+  const sellerId = c.req.param("id");
+  const clerkUserId = c.get("clerkUserId");
+  const supabase = createSupabaseAdmin();
+
+  if (!UUID_REGEX.test(sellerId)) {
+    return c.json({ error: "Invalid seller ID format" }, 400);
+  }
+
+  const profile = await getProfileByClerkId(clerkUserId);
+  if (!profile) return c.json({ error: "Profile not found" }, 404);
+
+  await supabase
+    .from("seller_follows")
+    .delete()
+    .eq("follower_id", profile.id)
+    .eq("seller_id", sellerId);
+
+  return c.json({ following: false });
+});
+
+/**
+ * GET /api/sellers/:id/wishlist
+ * Public wishlist for a seller (only if they have wishlist_public enabled).
+ */
+sellers.get("/:id/wishlist", optionalClerkMiddleware, async (c) => {
   const sellerId = c.req.param("id");
   const supabase = createSupabaseAdmin();
 
-  // Validate UUID format
-  const uuidRegex =
-    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-  if (!uuidRegex.test(sellerId)) {
+  if (!UUID_REGEX.test(sellerId)) {
+    return c.json({ error: "Invalid seller ID format" }, 400);
+  }
+
+  // Check if seller has public wishlist enabled
+  const { data: sellerProfile } = await supabase
+    .from("profiles")
+    .select("wishlist_public")
+    .eq("id", sellerId)
+    .single();
+
+  if (!sellerProfile || !sellerProfile.wishlist_public) {
+    return c.json({ items: [], public: false });
+  }
+
+  // Fetch their wishlisted items
+  const { data: wishlistRows } = await supabase
+    .from("wishlists")
+    .select(
+      "listing_id, created_at, listings!wishlists_listing_id_fkey(id, title, price_amount, price_currency, original_price_amount, category, condition, seller_id, listing_photos(url, position), profiles!listings_seller_id_fkey(display_name, location))"
+    )
+    .eq("user_id", sellerId)
+    .order("created_at", { ascending: false })
+    .limit(20);
+
+  const items = (wishlistRows || [])
+    .filter((row) => row.listings != null)
+    .map((row) => {
+      const l = row.listings as Record<string, unknown>;
+      const photos = l.listing_photos as Array<Record<string, unknown>> | null;
+      const cover = photos?.find((p) => p.position === 0) || photos?.[0];
+      const sellerProf = l.profiles as Record<string, unknown> | null;
+
+      return {
+        id: l.id as string,
+        title: l.title as string,
+        price_amount: l.price_amount as number,
+        price_currency: l.price_currency as string,
+        original_price_amount: l.original_price_amount as number | null,
+        category: l.category as string,
+        condition: l.condition as string,
+        cover_photo_url: (cover?.url as string) || null,
+        seller_name: sellerProf?.display_name as string | null,
+        seller_location: sellerProf?.location as string | null,
+      };
+    });
+
+  return c.json({ items, public: true });
+});
+
+/**
+ * GET /api/sellers/:id
+ * Public seller profile endpoint.
+ * Returns seller info with listing/sold counts, active listings, follow state, and follower count.
+ */
+sellers.get("/:id", optionalClerkMiddleware, async (c) => {
+  const sellerId = c.req.param("id");
+  const clerkUserId = c.get("clerkUserId") as string | undefined;
+  const supabase = createSupabaseAdmin();
+
+  if (!UUID_REGEX.test(sellerId)) {
     return c.json({ error: "Invalid seller ID format" }, 400);
   }
 
   // Fetch seller profile
   const { data: profile, error: profileError } = await supabase
     .from("profiles")
-    .select("id, display_name, avatar_url, location, created_at, trust_tier")
+    .select("id, display_name, avatar_url, location, created_at, trust_tier, wishlist_public")
     .eq("id", sellerId)
     .single();
 
@@ -111,38 +229,70 @@ sellers.get("/:id", optionalClerkMiddleware, async (c) => {
     return c.json({ error: "Seller not found" }, 404);
   }
 
-  // Count active listings
-  const { count: listingCount } = await supabase
-    .from("listings")
-    .select("id", { count: "exact", head: true })
-    .eq("seller_id", sellerId)
-    .eq("status", "active");
+  // Parallelize all counts and data fetches
+  const [
+    listingCountResult,
+    soldCountResult,
+    listingsResult,
+    ratingResult,
+    followerCountResult,
+    isFollowingResult,
+  ] = await Promise.all([
+    supabase
+      .from("listings")
+      .select("id", { count: "exact", head: true })
+      .eq("seller_id", sellerId)
+      .eq("status", "active"),
 
-  // Count sold listings
-  const { count: soldCount } = await supabase
-    .from("listings")
-    .select("id", { count: "exact", head: true })
-    .eq("seller_id", sellerId)
-    .eq("status", "sold");
+    supabase
+      .from("listings")
+      .select("id", { count: "exact", head: true })
+      .eq("seller_id", sellerId)
+      .eq("status", "sold"),
 
-  // Fetch up to 20 active listings with cover photo
-  const { data: listingsData, error: listingsError } = await supabase
-    .from("listings")
-    .select(
-      "id, title, price_amount, price_currency, original_price_amount, category, condition"
-    )
-    .eq("seller_id", sellerId)
-    .eq("status", "active")
-    .order("created_at", { ascending: false })
-    .limit(20);
+    supabase
+      .from("listings")
+      .select("id, title, price_amount, price_currency, original_price_amount, category, condition")
+      .eq("seller_id", sellerId)
+      .eq("status", "active")
+      .order("created_at", { ascending: false })
+      .limit(20),
 
-  if (listingsError) {
-    console.error("Error fetching seller listings:", listingsError);
+    supabase
+      .from("reviews")
+      .select("rating")
+      .eq("reviewee_id", sellerId)
+      .eq("reviewer_role", "buyer")
+      .not("revealed_at", "is", null),
+
+    supabase
+      .from("seller_follows")
+      .select("id", { count: "exact", head: true })
+      .eq("seller_id", sellerId),
+
+    // Check if current user follows this seller
+    clerkUserId
+      ? (async () => {
+          const viewer = await getProfileByClerkId(clerkUserId);
+          if (!viewer) return { count: 0 };
+          const { count } = await supabase
+            .from("seller_follows")
+            .select("id", { count: "exact", head: true })
+            .eq("follower_id", viewer.id)
+            .eq("seller_id", sellerId);
+          return { count: count || 0 };
+        })()
+      : Promise.resolve({ count: 0 }),
+  ]);
+
+  if (listingsResult.error) {
+    console.error("Error fetching seller listings:", listingsResult.error);
     return c.json({ error: "Failed to fetch seller listings" }, 500);
   }
 
   // Fetch cover photos for each listing (position 0)
-  const listingIds = (listingsData || []).map((l) => l.id);
+  const listingsData = listingsResult.data || [];
+  const listingIds = listingsData.map((l) => l.id);
   let coverPhotos: Record<string, string> = {};
 
   if (listingIds.length > 0) {
@@ -159,14 +309,7 @@ sellers.get("/:id", optionalClerkMiddleware, async (c) => {
     }
   }
 
-  // Compute avg_rating and review_count from revealed buyer-to-seller reviews
-  const { data: ratingData } = await supabase
-    .from("reviews")
-    .select("rating")
-    .eq("reviewee_id", sellerId)
-    .eq("reviewer_role", "buyer")
-    .not("revealed_at", "is", null);
-
+  const ratingData = ratingResult.data;
   const reviewCount = ratingData?.length || 0;
   const avgRating =
     reviewCount > 0
@@ -178,8 +321,7 @@ sellers.get("/:id", optionalClerkMiddleware, async (c) => {
         )
       : null;
 
-  // Build listings response with cover_photo_url
-  const listings = (listingsData || []).map((listing) => ({
+  const listings = listingsData.map((listing) => ({
     id: listing.id,
     title: listing.title,
     price_amount: listing.price_amount,
@@ -197,11 +339,14 @@ sellers.get("/:id", optionalClerkMiddleware, async (c) => {
       avatar_url: profile.avatar_url,
       location: profile.location,
       member_since: profile.created_at,
-      listing_count: listingCount || 0,
-      sold_count: soldCount || 0,
+      listing_count: listingCountResult.count || 0,
+      sold_count: soldCountResult.count || 0,
       avg_rating: avgRating,
       review_count: reviewCount,
       trust_tier: profile.trust_tier ?? 0,
+      follower_count: followerCountResult.count || 0,
+      is_following: (isFollowingResult.count || 0) > 0,
+      wishlist_public: profile.wishlist_public ?? false,
     },
     listings,
   });

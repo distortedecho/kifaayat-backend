@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import Stripe from "stripe";
 import { z } from "zod";
 import { adminAuthMiddleware } from "../middleware/adminAuth.js";
 import { createSupabaseAdmin } from "../lib/supabase.js";
@@ -14,6 +15,7 @@ import {
   listingRejectedNotification,
   tierUpgradeNotification,
   tierDowngradeNotification,
+  followedSellerNewListingNotification,
 } from "../lib/notifications.js";
 import { calculateTrustTier, computeCategoryMedians } from "../lib/trust-tiers.js";
 import {
@@ -117,6 +119,7 @@ admin.use("/moderation/*", adminAuthMiddleware);
 admin.use("/config/*", adminAuthMiddleware);
 admin.use("/notification-toggles", adminAuthMiddleware);
 admin.use("/notification-toggles/*", adminAuthMiddleware);
+admin.use("/sellers/*", adminAuthMiddleware);
 
 // ============================================================
 // Helpers
@@ -355,6 +358,32 @@ admin.post("/listings/:id/approve", async (c) => {
       listingId,
       approved: true,
     }).catch((err) => console.error("[admin] Email error:", err));
+
+    // Notify followers of this seller about the new listing
+    (async () => {
+      try {
+        const { data: followers } = await supabase
+          .from("seller_follows")
+          .select("follower_id")
+          .eq("seller_id", seller.id);
+
+        if (followers && followers.length > 0) {
+          const sellerName = seller.display_name || "A seller you follow";
+          const template = followedSellerNewListingNotification(sellerName, listing.title);
+          for (const f of followers) {
+            createNotification({
+              user_id: f.follower_id,
+              type: "followed_seller_new_listing",
+              title: template.title,
+              body: template.body,
+              data: { listing_id: listingId, seller_id: seller.id },
+            }).catch(() => {});
+          }
+        }
+      } catch (err) {
+        console.error("[admin] Follower notification error:", err);
+      }
+    })();
   }
 
   return c.json({ listing: updated });
@@ -529,6 +558,32 @@ admin.post("/listings/batch", async (c) => {
           approved: action === "approve",
           rejectionReason: reason,
         }).catch((err) => console.error("[admin] Batch email error:", err));
+
+        if (action === "approve") {
+          // Notify followers
+          supabase
+            .from("seller_follows")
+            .select("follower_id")
+            .eq("seller_id", seller.id)
+            .then(({ data: followers }) => {
+              if (followers && followers.length > 0) {
+                const tmpl = followedSellerNewListingNotification(
+                  seller.display_name || "A seller you follow",
+                  listing.title
+                );
+                for (const f of followers) {
+                  createNotification({
+                    user_id: f.follower_id,
+                    type: "followed_seller_new_listing",
+                    title: tmpl.title,
+                    body: tmpl.body,
+                    data: { listing_id: id, seller_id: seller.id },
+                  }).catch(() => {});
+                }
+              }
+            })
+            .catch(() => {});
+        }
       }
     } catch {
       results.push({ id, success: false, error: "Unexpected error" });
@@ -2810,6 +2865,63 @@ admin.put("/notification-toggles", async (c) => {
   return c.json({
     toggles: (updated?.notification_toggles || {}) as Record<string, boolean>,
   });
+});
+
+// ============================================================
+// Stripe Status Refresh
+// ============================================================
+
+let _stripe: Stripe | null = null;
+function getStripeAdmin(): Stripe {
+  if (!_stripe) {
+    const key = process.env.STRIPE_SECRET_KEY;
+    if (!key) throw new Error("STRIPE_SECRET_KEY not set");
+    _stripe = new Stripe(key, { apiVersion: "2026-02-25.clover" });
+  }
+  return _stripe;
+}
+
+admin.post("/sellers/:id/refresh-stripe", async (c) => {
+  const sellerId = c.req.param("id");
+  const supabase = createSupabaseAdmin();
+
+  const { data: profile, error: fetchError } = await supabase
+    .from("profiles")
+    .select("id, stripe_account_id, stripe_onboarding_complete")
+    .eq("id", sellerId)
+    .single();
+
+  if (fetchError || !profile) {
+    return c.json({ error: "Seller profile not found" }, 404);
+  }
+
+  if (!profile.stripe_account_id) {
+    return c.json({ error: "Seller has no Stripe account linked" }, 400);
+  }
+
+  try {
+    const account = await getStripeAdmin().accounts.retrieve(profile.stripe_account_id);
+    const isComplete = (account.charges_enabled ?? false) && (account.payouts_enabled ?? false);
+
+    const { error: updateError } = await supabase
+      .from("profiles")
+      .update({ stripe_onboarding_complete: isComplete })
+      .eq("id", sellerId);
+
+    if (updateError) {
+      console.error("Error updating stripe status:", updateError);
+      return c.json({ error: "Failed to update profile" }, 500);
+    }
+
+    return c.json({
+      stripe_onboarding_complete: isComplete,
+      charges_enabled: account.charges_enabled,
+      payouts_enabled: account.payouts_enabled,
+    });
+  } catch (err) {
+    console.error("Error retrieving Stripe account:", err);
+    return c.json({ error: "Failed to retrieve Stripe account status" }, 500);
+  }
 });
 
 export default admin;

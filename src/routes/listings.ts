@@ -20,6 +20,14 @@ import {
 const listings = new Hono();
 
 // ============================================================
+// Zod Schemas — Comments
+// ============================================================
+
+const createCommentSchema = z.object({
+  content: z.string().min(1, "Comment cannot be empty").max(1000, "Comment must be 1000 characters or less"),
+});
+
+// ============================================================
 // Zod Schemas
 // ============================================================
 
@@ -312,7 +320,8 @@ listings.post("/", clerkMiddleware, requireProfile, async (c) => {
 
   // Check profile completeness
   if (!profile.profile_complete) {
-    return c.json({ error: "Profile must be complete before creating listings." }, 403);
+    console.error(`[POST /api/listings] Profile incomplete for profile_id=${profile.id}, display_name=${profile.display_name}`);
+    return c.json({ error: "Profile must be complete before creating listings. Please set your display name and location in profile settings." }, 403);
   }
 
   // Parse and validate body
@@ -1195,6 +1204,227 @@ listings.put("/:id/photos/reorder", clerkMiddleware, requireProfile, async (c) =
   }
 
   return c.json({ photos: updatedPhotos });
+});
+
+// ============================================================
+// Listing Comments (public forum-style)
+// ============================================================
+
+/**
+ * GET /api/listings/:id/comments
+ * Fetch public comments for a listing. Guest-accessible.
+ */
+listings.get("/:id/comments", optionalClerkMiddleware, async (c) => {
+  const listingId = c.req.param("id");
+  const supabase = createSupabaseAdmin();
+
+  const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  if (!uuidRegex.test(listingId)) {
+    return c.json({ error: "Invalid listing ID format" }, 400);
+  }
+
+  const cursor = c.req.query("cursor");
+  const limitStr = c.req.query("limit");
+  const limit = Math.min(Math.max(parseInt(limitStr || "30", 10) || 30, 1), 100);
+
+  let query = supabase
+    .from("listing_comments")
+    .select(
+      "id, listing_id, author_id, content, created_at, profiles!listing_comments_author_id_fkey(id, display_name, avatar_url)"
+    )
+    .eq("listing_id", listingId)
+    .order("created_at", { ascending: true })
+    .limit(limit + 1);
+
+  if (cursor) {
+    query = query.gt("created_at", cursor);
+  }
+
+  const { data: rows, error } = await query;
+
+  if (error) {
+    console.error("Error fetching listing comments:", error);
+    return c.json({ error: "Failed to fetch comments" }, 500);
+  }
+
+  const rawList = rows || [];
+  const hasMore = rawList.length > limit;
+  const page = hasMore ? rawList.slice(0, limit) : rawList;
+
+  const comments = (page as Record<string, unknown>[]).map((row) => {
+    const author = row.profiles as Record<string, unknown> | null;
+    return {
+      id: row.id,
+      listing_id: row.listing_id,
+      author_id: row.author_id,
+      content: row.content,
+      created_at: row.created_at,
+      author_name: author ? (author.display_name as string | null) : null,
+      author_avatar: author ? (author.avatar_url as string | null) : null,
+    };
+  });
+
+  const nextCursor = hasMore
+    ? (page[page.length - 1] as Record<string, unknown>).created_at as string
+    : null;
+
+  return c.json({ comments, next_cursor: nextCursor });
+});
+
+/**
+ * GET /api/listings/:id/comments/count
+ * Return the comment count for a listing. Guest-accessible.
+ */
+listings.get("/:id/comments/count", async (c) => {
+  const listingId = c.req.param("id");
+  const supabase = createSupabaseAdmin();
+
+  const { count, error } = await supabase
+    .from("listing_comments")
+    .select("id", { count: "exact", head: true })
+    .eq("listing_id", listingId);
+
+  if (error) {
+    return c.json({ count: 0 });
+  }
+
+  return c.json({ count: count || 0 });
+});
+
+/**
+ * POST /api/listings/:id/comments
+ * Add a public comment to a listing. Auth required.
+ */
+listings.post("/:id/comments", clerkMiddleware, requireProfile, async (c) => {
+  const listingId = c.req.param("id");
+  const profile = c.get("profile");
+  const supabase = createSupabaseAdmin();
+
+  const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  if (!uuidRegex.test(listingId)) {
+    return c.json({ error: "Invalid listing ID format" }, 400);
+  }
+
+  const body = await c.req.json();
+  const parsed = createCommentSchema.safeParse(body);
+  if (!parsed.success) {
+    return c.json(
+      { error: "Validation failed", details: parsed.error.flatten().fieldErrors },
+      400
+    );
+  }
+
+  const { content } = parsed.data;
+
+  // Validate listing exists and is active
+  const { data: listing, error: listingError } = await supabase
+    .from("listings")
+    .select("id, seller_id, status, title")
+    .eq("id", listingId)
+    .single();
+
+  if (listingError || !listing) {
+    return c.json({ error: "Listing not found" }, 404);
+  }
+
+  if (listing.status !== "active" && listing.status !== "reserved") {
+    return c.json({ error: "Cannot comment on a listing that is not active" }, 400);
+  }
+
+  const { data: comment, error: insertError } = await supabase
+    .from("listing_comments")
+    .insert({
+      listing_id: listingId,
+      author_id: profile.id,
+      content,
+    })
+    .select()
+    .single();
+
+  if (insertError) {
+    console.error("Error creating listing comment:", insertError);
+    return c.json({ error: "Failed to create comment" }, 500);
+  }
+
+  // Fire-and-forget: notify seller of new comment (skip if author is the seller)
+  if (listing.seller_id !== profile.id) {
+    (async () => {
+      try {
+        const { createNotification } = await import("../lib/notifications.js");
+        await createNotification({
+          user_id: listing.seller_id,
+          type: "listing_comment" as any,
+          title: "New comment on your listing",
+          body: `${profile.display_name || "Someone"} commented on "${listing.title}"`,
+          data: { listing_id: listingId, comment_id: comment.id },
+        });
+      } catch (err) {
+        console.error("Error sending listing comment notification:", err);
+      }
+    })();
+  }
+
+  return c.json({
+    comment: {
+      ...comment,
+      author_name: profile.display_name,
+      author_avatar: profile.avatar_url,
+    },
+  }, 201);
+});
+
+/**
+ * DELETE /api/listings/:id/comments/:commentId
+ * Delete own comment or seller can delete any comment on their listing.
+ */
+listings.delete("/:id/comments/:commentId", clerkMiddleware, requireProfile, async (c) => {
+  const listingId = c.req.param("id");
+  const commentId = c.req.param("commentId");
+  const profile = c.get("profile");
+  const supabase = createSupabaseAdmin();
+
+  const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  if (!uuidRegex.test(listingId) || !uuidRegex.test(commentId)) {
+    return c.json({ error: "Invalid ID format" }, 400);
+  }
+
+  // Fetch comment
+  const { data: comment, error: commentError } = await supabase
+    .from("listing_comments")
+    .select("id, listing_id, author_id")
+    .eq("id", commentId)
+    .eq("listing_id", listingId)
+    .single();
+
+  if (commentError || !comment) {
+    return c.json({ error: "Comment not found" }, 404);
+  }
+
+  // Allow deletion by comment author OR the listing seller
+  const { data: listing } = await supabase
+    .from("listings")
+    .select("seller_id")
+    .eq("id", listingId)
+    .single();
+
+  const isCommentAuthor = comment.author_id === profile.id;
+  const isListingSeller = listing?.seller_id === profile.id;
+
+  if (!isCommentAuthor && !isListingSeller) {
+    return c.json({ error: "Not authorized to delete this comment" }, 403);
+  }
+
+  const { error: deleteError } = await supabase
+    .from("listing_comments")
+    .delete()
+    .eq("id", commentId);
+
+  if (deleteError) {
+    console.error("Error deleting listing comment:", deleteError);
+    return c.json({ error: "Failed to delete comment" }, 500);
+  }
+
+  return c.body(null, 204);
 });
 
 export default listings;

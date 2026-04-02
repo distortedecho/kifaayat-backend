@@ -68,6 +68,7 @@ export const NOTIFICATION_TYPES = [
   "referral_nudge",
   "re_engagement",
   "account_suspended",
+  "followed_seller_new_listing",
 ] as const;
 export type NotificationType = (typeof NOTIFICATION_TYPES)[number];
 

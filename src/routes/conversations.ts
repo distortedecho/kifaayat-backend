@@ -183,6 +183,24 @@ conversations.post("/", clerkMiddleware, async (c) => {
     );
   }
 
+  // DMs are restricted to post-purchase: buyer must have an order for this listing
+  // or listing must be sold/reserved to this buyer
+  const { count: orderCount } = await supabase
+    .from("orders")
+    .select("id", { count: "exact", head: true })
+    .eq("listing_id", listing_id)
+    .eq("buyer_id", profileId);
+
+  if (!orderCount || orderCount === 0) {
+    return c.json(
+      {
+        error: "Direct messages are only available after purchasing. Use public comments to ask the seller questions.",
+        code: "DM_REQUIRES_PURCHASE",
+      },
+      403
+    );
+  }
+
   // UPSERT: insert or update if conversation already exists for this triple
   const { data: conversation, error: upsertError } = await supabase
     .from("conversations")

@@ -39,6 +39,7 @@ const updateProfileSchema = z.object({
     .optional(),
   onesignal_player_id: z.string().optional(),
   user_intents: z.array(z.enum(["buy", "sell"])).optional(),
+  wishlist_public: z.boolean().optional(),
 });
 
 /**

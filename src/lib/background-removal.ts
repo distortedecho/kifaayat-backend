@@ -26,7 +26,11 @@ export async function removeBackground(base64Photo: string): Promise<string> {
   const height = metadata.height!;
 
   // 3. Run background removal - returns a Blob with transparent background
-  const blob = await removeBg(inputBuffer, {
+  //    Pass as Blob with explicit MIME type so the library doesn't need to auto-detect format
+  //    (auto-detection breaks due to conflicting sharp/libvips versions)
+  const mimeType = `image/${metadata.format || "jpeg"}`;
+  const inputBlob = new Blob([inputBuffer], { type: mimeType });
+  const blob = await removeBg(inputBlob, {
     output: { format: "image/png", quality: 0.9 },
   });
   const foregroundBuffer = Buffer.from(await blob.arrayBuffer());

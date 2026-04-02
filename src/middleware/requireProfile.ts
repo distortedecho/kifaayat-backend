@@ -17,7 +17,8 @@ export const requireProfile: MiddlewareHandler = async (c, next) => {
   const clerkUserId = c.get("clerkUserId");
   const profile = await getProfileByClerkId(clerkUserId);
   if (!profile) {
-    return c.json({ error: "Profile not found" }, 403);
+    console.error(`[requireProfile] No profile found for clerk_id=${clerkUserId}`);
+    return c.json({ error: "Profile not found. Please complete your profile setup first." }, 403);
   }
   c.set("profile", profile);
   await next();
