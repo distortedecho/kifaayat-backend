@@ -129,7 +129,7 @@ ai.post("/analyze", clerkMiddleware, async (c) => {
 
   const prompt = `Analyze these photos of a South Asian fashion item for a preloved marketplace listing.
 Return a JSON object with these fields:
-- category: one of [Lehenga, Saree, Suit/Salwar, Anarkali, Indowestern, Sharara, Jewellery, Dupatta, Blouse, Menswear, Kidswear, Other]
+- category: one of [Lehenga, Saree, Suit/Salwar, Anarkali, Indowestern, Sharara, Jewellery, Dupatta, Blouse, Menswear, Kidswear, Footwear, Other]
 - category_confidence: confidence score 0-100
 - title: a descriptive marketplace title (max 200 chars)
 - title_confidence: confidence score 0-100
@@ -137,11 +137,11 @@ Return a JSON object with these fields:
 - description_confidence: confidence score 0-100
 - suggested_price: price in AUD cents (integer), based on typical preloved prices for this category and apparent condition
 - suggested_price_confidence: confidence score 0-100
-- condition: one of [New, Like New, Good, Fair]
+- condition: one of [Pre-loved, New without tags, New with tags, New with defects]
 - condition_confidence: confidence score 0-100
-- colors: array of 1-4 dominant colors (lowercase)
+- colors: array of 1-4 dominant colors from [Black, Grey, White, Brown, Tan, Cream, Yellow, Red, Burgundy, Orange, Pink, Purple, Blue, Navy, Green, Khaki, Multi, Silver, Gold, Other]
 - colors_confidence: confidence score 0-100
-- occasion_tags: array from [Wedding, Mehendi, Sangeet, Festive, Party, Formal, Casual]
+- occasion_tags: array from [Bridal, Casual, Festive, Groom, Pre-wedding event (bride/groom), Pre-wedding event (guest), Wedding party, Wedding guest]
 - occasion_tags_confidence: confidence score 0-100
 - photo_quality: array of objects for each photo, each with:
   - index: photo index (0-based)

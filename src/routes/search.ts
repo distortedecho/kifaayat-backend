@@ -26,19 +26,23 @@ interface ListingSummary {
   is_boosted: boolean;
 }
 
-// Size filter maps to bust measurement ranges (in inches)
-const SIZE_RANGES: Record<string, { min: number; max: number } | null> = {
-  XS: { min: 0, max: 32 },
-  S: { min: 32, max: 34 },
-  M: { min: 34, max: 36 },
-  L: { min: 36, max: 38 },
-  XL: { min: 38, max: 40 },
-  XXL: { min: 40, max: 100 },
-  Free: null, // no measurement filter
-};
-
-// Categories that don't have bust measurements
-const NO_BUST_CATEGORIES = ["Saree", "Dupatta", "Jewellery"];
+// Valid size values for search filter validation (all size charts merged)
+const VALID_SIZES = [
+  // Women's sizes
+  "UK4 / US0 / AU4", "UK6 / US2 / AU6", "UK8 / US4 / AU8",
+  "UK10 / US6 / AU10", "UK12 / US8 / AU12", "UK14 / US10 / AU14",
+  "UK16 / US12 / AU16", "UK18 / US14 / AU18", "UK20 / US16 / AU20",
+  "UK22 / US18 / AU22", "UK24 / US20 / AU24", "UK26 / US22 / AU26",
+  "UK28 / US24 / AU28", "Free Size",
+  // Menswear/Kidswear sizes
+  "XXS", "XS", "S", "M", "L", "XL", "XXL", "3XL", "4XL", "Free size",
+  // Footwear sizes
+  "AU4 / UK2 / US5 / EU35", "AU5 / UK3 / US6 / EU36", "AU6 / UK4 / US7 / EU37",
+  "AU7 / UK5 / US8 / EU38", "AU8 / UK6 / US9 / EU39", "AU9 / UK7 / US10 / EU40",
+  "AU10 / UK8 / US11 / EU41", "AU11 / UK9 / US12 / EU42",
+  "AU12 / UK10 / US14 / EU43", "AU13 / UK11 / US15 / EU44",
+  "AU14 / UK12 / US16 / EU45",
+];
 
 // ============================================================
 // Helpers
@@ -152,13 +156,13 @@ search.get("/", optionalClerkMiddleware, async (c) => {
   ) {
     return c.json({ error: "Invalid condition filter" }, 400);
   }
-  if (location && !["AU", "US", "NZ"].includes(location)) {
+  if (location && !["AU", "US", "NZ", "CA", "UK"].includes(location)) {
     return c.json({ error: "Invalid location filter" }, 400);
   }
-  if (market && !["AU", "US", "NZ"].includes(market)) {
+  if (market && !["AU", "US", "NZ", "CA", "UK"].includes(market)) {
     return c.json({ error: "Invalid market filter" }, 400);
   }
-  if (size && !Object.keys(SIZE_RANGES).includes(size)) {
+  if (size && !VALID_SIZES.includes(size)) {
     return c.json({ error: "Invalid size filter" }, 400);
   }
   if (!["newest", "price_asc", "price_desc", "relevance"].includes(sort)) {
@@ -255,28 +259,9 @@ search.get("/", optionalClerkMiddleware, async (c) => {
     query = query.lte("price_amount", priceMax);
   }
 
-  // Size filter: maps to bust measurement ranges
-  // For categories without bust (Saree, Dupatta, Jewellery), size filter is ignored
-  if (size && size !== "Free" && SIZE_RANGES[size]) {
-    const range = SIZE_RANGES[size]!;
-    // Exclude categories that don't have bust measurements
-    if (category && NO_BUST_CATEGORIES.includes(category)) {
-      // Size filter ignored for this category — do nothing
-    } else if (!category) {
-      // No category filter: exclude non-bust categories from size filtering
-      // Apply size filter but only on categories that have bust measurements
-      query = query
-        .not("category", "in", `(${NO_BUST_CATEGORIES.join(",")})`)
-        .not("measurements->bust", "is", "null")
-        .gte("measurements->bust", String(range.min))
-        .lte("measurements->bust", String(range.max));
-    } else {
-      // Category that has bust measurements
-      query = query
-        .not("measurements->bust", "is", "null")
-        .gte("measurements->bust", String(range.min))
-        .lte("measurements->bust", String(range.max));
-    }
+  // Size filter: uses the standardized estimated_size column
+  if (size && size !== "Free Size" && size !== "Free size") {
+    query = query.eq("estimated_size", size);
   }
 
   // Location filter: join with profiles

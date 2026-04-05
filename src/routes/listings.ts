@@ -13,6 +13,7 @@ import {
   FABRIC_TYPES,
   WORK_TYPES,
   DRY_CLEANING_STATUSES,
+  COUNTRIES_OF_ORIGIN,
   type ListingCategory,
   type Measurements,
 } from "../types/listings.js";
@@ -58,6 +59,10 @@ const createListingSchema = z.object({
   shipping_info: z.string().max(500).optional(),
   status: z.enum(["draft", "active"]).optional().default("draft"),
 
+  // Standardized size (live app field)
+  estimated_size: z.string().max(50).optional(),
+  size_type: z.enum(["womens", "menswear_kidswear", "footwear", "free_size"]).optional(),
+
   // v2 fields — required for new listings
   fabric_types: z.array(z.string()).min(1, "At least one fabric type is required"),
   items_included: z.array(z.string()).min(1, "At least one item is required"),
@@ -67,7 +72,7 @@ const createListingSchema = z.object({
   designer_name: z.string().max(200).optional(),
   is_known_designer: z.boolean().optional(),
   designer_verification_url: z.string().url().optional(),
-  country_of_origin: z.string().max(100).optional(),
+  country_of_origin: z.enum(COUNTRIES_OF_ORIGIN as unknown as [string, ...string[]]).optional(),
   dry_cleaning_status: z.enum(DRY_CLEANING_STATUSES as unknown as [string, ...string[]]).optional(),
   alteration_room: z.string().max(500).optional(),
   fit_tips: z.string().max(1000).optional(),
@@ -120,6 +125,10 @@ const updateListingSchema = z.object({
   // Status restricted — cannot set to 'reserved' or 'sold' via update
   status: z.enum(["draft", "pending_review", "active", "deactivated"]).optional(),
 
+  // Standardized size (live app field)
+  estimated_size: z.string().max(50).nullable().optional(),
+  size_type: z.enum(["womens", "menswear_kidswear", "footwear", "free_size"]).nullable().optional(),
+
   // v2 fields — all optional on updates
   fabric_types: z.array(z.string()).min(1).optional(),
   items_included: z.array(z.string()).min(1).optional(),
@@ -127,7 +136,7 @@ const updateListingSchema = z.object({
   designer_name: z.string().max(200).nullable().optional(),
   is_known_designer: z.boolean().optional(),
   designer_verification_url: z.string().url().nullable().optional(),
-  country_of_origin: z.string().max(100).nullable().optional(),
+  country_of_origin: z.enum(COUNTRIES_OF_ORIGIN as unknown as [string, ...string[]]).nullable().optional(),
   dry_cleaning_status: z.enum(DRY_CLEANING_STATUSES as unknown as [string, ...string[]]).nullable().optional(),
   alteration_room: z.string().max(500).nullable().optional(),
   fit_tips: z.string().max(1000).nullable().optional(),
@@ -371,6 +380,10 @@ listings.post("/", clerkMiddleware, requireProfile, async (c) => {
       status: input.status,
       shipping_info: input.shipping_info || null,
 
+      // Standardized size
+      estimated_size: input.estimated_size || null,
+      size_type: input.size_type || null,
+
       // v2 fields
       fabric_types: input.fabric_types,
       items_included: input.items_included,
@@ -551,6 +564,10 @@ listings.put("/:id", clerkMiddleware, requireProfile, async (c) => {
   if (input.negotiable !== undefined) updateData.negotiable = input.negotiable;
   if (input.shipping_info !== undefined) updateData.shipping_info = input.shipping_info;
   if (input.status !== undefined) updateData.status = input.status;
+
+  // Standardized size
+  if (input.estimated_size !== undefined) updateData.estimated_size = input.estimated_size;
+  if (input.size_type !== undefined) updateData.size_type = input.size_type;
 
   // v2 fields
   if (input.fabric_types !== undefined) updateData.fabric_types = input.fabric_types;

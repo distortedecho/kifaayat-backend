@@ -561,10 +561,12 @@ admin.post("/listings/batch", async (c) => {
 
         if (action === "approve") {
           // Notify followers
-          supabase
-            .from("seller_follows")
-            .select("follower_id")
-            .eq("seller_id", seller.id)
+          Promise.resolve(
+            supabase
+              .from("seller_follows")
+              .select("follower_id")
+              .eq("seller_id", seller.id)
+          )
             .then(({ data: followers }) => {
               if (followers && followers.length > 0) {
                 const tmpl = followedSellerNewListingNotification(
@@ -1070,6 +1072,28 @@ admin.post("/users/:id/ban", async (c) => {
     .update({ status: "deactivated" })
     .eq("seller_id", userId)
     .eq("status", "active");
+
+  return c.json({ user });
+});
+
+admin.post("/users/:id/unban", async (c) => {
+  const userId = c.req.param("id");
+  const supabase = createSupabaseAdmin();
+
+  const { data: user, error } = await supabase
+    .from("profiles")
+    .update({
+      banned_at: null,
+      ban_reason: null,
+    })
+    .eq("id", userId)
+    .select()
+    .single();
+
+  if (error) {
+    console.error("Error unbanning user:", error);
+    return c.json({ error: "Failed to unban user" }, 500);
+  }
 
   return c.json({ user });
 });

@@ -1,5 +1,6 @@
 import { Hono } from "hono";
 import { z } from "zod";
+import crypto from "node:crypto";
 import { clerkMiddleware, optionalClerkMiddleware } from "../middleware/clerk.js";
 import { createSupabaseAdmin } from "../lib/supabase.js";
 
@@ -219,6 +220,80 @@ profiles.get("/:id", optionalClerkMiddleware, async (c) => {
   }
 
   return c.json({ profile });
+});
+
+/**
+ * POST /api/profiles/me/avatar
+ * Uploads a profile avatar image to Supabase Storage and updates avatar_url.
+ */
+profiles.post("/me/avatar", clerkMiddleware, async (c) => {
+  const clerkUserId = c.get("clerkUserId");
+  const supabase = createSupabaseAdmin();
+
+  const { data: profile } = await supabase
+    .from("profiles")
+    .select("id, avatar_url")
+    .eq("clerk_id", clerkUserId)
+    .single();
+
+  if (!profile) {
+    return c.json({ error: "Profile not found" }, 404);
+  }
+
+  const body = await c.req.parseBody();
+  const photo = body["photo"];
+
+  if (!photo || !(photo instanceof File)) {
+    return c.json({ error: "No photo file provided" }, 400);
+  }
+
+  const maxSize = 5 * 1024 * 1024;
+  if (photo.size > maxSize) {
+    return c.json({ error: "File too large. Maximum 5MB" }, 400);
+  }
+
+  const ext = photo.name.split(".").pop() || "jpg";
+  const fileId = crypto.randomUUID();
+  const storagePath = `avatars/${profile.id}/${fileId}.${ext}`;
+
+  const fileBuffer = await photo.arrayBuffer();
+  const { error: uploadError } = await supabase.storage
+    .from("listing-photos")
+    .upload(storagePath, fileBuffer, {
+      contentType: photo.type,
+      upsert: false,
+    });
+
+  if (uploadError) {
+    console.error("Error uploading avatar:", uploadError);
+    return c.json({ error: "Failed to upload avatar" }, 500);
+  }
+
+  const { data: urlData } = supabase.storage
+    .from("listing-photos")
+    .getPublicUrl(storagePath);
+
+  // Delete old avatar from storage if it was in our bucket
+  if (profile.avatar_url?.includes("/listing-photos/avatars/")) {
+    const oldPath = profile.avatar_url.split("/listing-photos/").pop();
+    if (oldPath) {
+      await supabase.storage.from("listing-photos").remove([oldPath]).catch(() => {});
+    }
+  }
+
+  const { data: updatedProfile, error: updateError } = await supabase
+    .from("profiles")
+    .update({ avatar_url: urlData.publicUrl })
+    .eq("clerk_id", clerkUserId)
+    .select()
+    .single();
+
+  if (updateError) {
+    console.error("Error updating avatar_url:", updateError);
+    return c.json({ error: "Failed to update profile" }, 500);
+  }
+
+  return c.json({ avatar_url: updatedProfile.avatar_url });
 });
 
 export default profiles;

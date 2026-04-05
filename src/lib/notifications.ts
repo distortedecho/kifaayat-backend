@@ -238,7 +238,7 @@ export async function createNotification(
 function formatPrice(amountCents: number, currency: string): string {
   const symbols: Record<string, string> = {
     AUD: "A$",
-    USD: "$",
+    USD: "US$",
     NZD: "NZ$",
   };
   const symbol = symbols[currency] || `${currency} `;

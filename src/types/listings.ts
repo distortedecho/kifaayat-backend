@@ -1,4 +1,7 @@
-// Category enum matching database CHECK constraint
+// ============================================================
+// Categories — matching live Play Store app + Footwear
+// ============================================================
+
 export const LISTING_CATEGORIES = [
   "Lehenga",
   "Saree",
@@ -11,20 +14,24 @@ export const LISTING_CATEGORIES = [
   "Blouse",
   "Menswear",
   "Kidswear",
+  "Footwear",
   "Other",
 ] as const;
 export type ListingCategory = (typeof LISTING_CATEGORIES)[number];
 
-// Condition enum
+// ============================================================
+// Conditions — matching live Play Store app
+// ============================================================
+
 export const LISTING_CONDITIONS = [
-  "New",
-  "Like New",
-  "Good",
-  "Fair",
+  "Pre-loved",
+  "New without tags",
+  "New with tags",
+  "New with defects",
 ] as const;
 export type ListingCondition = (typeof LISTING_CONDITIONS)[number];
 
-// Status enum (Phase 3: added pending_review between draft and active for admin moderation)
+// Status enum
 export const LISTING_STATUSES = [
   "draft",
   "pending_review",
@@ -35,47 +42,53 @@ export const LISTING_STATUSES = [
 ] as const;
 export type ListingStatus = (typeof LISTING_STATUSES)[number];
 
-// Occasion tags
+// ============================================================
+// Occasion tags — matching live Play Store app
+// ============================================================
+
 export const OCCASION_TAGS = [
-  "Wedding",
-  "Mehendi",
-  "Sangeet",
-  "Festive",
-  "Party",
-  "Formal",
+  "Bridal",
   "Casual",
-  "Eid",
-  "Diwali",
-  "Haldi",
+  "Festive",
+  "Groom",
+  "Pre-wedding event (bride/groom)",
+  "Pre-wedding event (guest)",
+  "Wedding party",
+  "Wedding guest",
 ] as const;
 export type OccasionTag = (typeof OCCASION_TAGS)[number];
 
 // ============================================================
-// v2 Predefined Lists
+// Predefined Lists — aligned with live app
 // ============================================================
 
-// Fabric types for multi-select chips
+// Fabric types — merged live app + new app values
 export const FABRIC_TYPES = [
-  "Silk",
-  "Georgette",
+  "Art silk",
   "Chiffon",
-  "Velvet",
+  "Chinon",
   "Cotton",
+  "Crepe",
+  "Georgette",
+  "Lawn",
+  "Linen",
   "Net",
   "Organza",
-  "Crepe",
+  "Pure silk",
+  "Raw silk",
   "Satin",
+  "Sequin",
+  "Velvet",
   "Brocade",
   "Banarasi",
   "Jacquard",
   "Lycra",
-  "Linen",
   "Rayon",
   "Other",
 ] as const;
 export type FabricType = (typeof FABRIC_TYPES)[number];
 
-// Work/embroidery types for multi-select chips
+// Work/embroidery types
 export const WORK_TYPES = [
   "Zardozi",
   "Thread",
@@ -97,14 +110,17 @@ export const WORK_TYPES = [
 ] as const;
 export type WorkType = (typeof WORK_TYPES)[number];
 
-// Items included options per category (dynamic checkboxes)
+// ============================================================
+// Items included — matching live Play Store app labels
+// ============================================================
+
 export const ITEMS_INCLUDED_OPTIONS: Record<string, string[]> = {
-  Lehenga: ["Skirt", "Blouse", "Dupatta", "Cancan/Petticoat", "Belt/Kamar Patti"],
-  Saree: ["Saree", "Blouse Piece", "Petticoat", "Fall & Pico Done"],
-  "Suit/Salwar": ["Kurta", "Bottom (Salwar/Churidar/Palazzo)", "Dupatta"],
+  Lehenga: ["Lehenga skirt", "Lehenga top/blouse", "Dupatta", "Matching potli bag/purse"],
+  Saree: ["Stitched Blouse", "Blouse piece (material)", "Petticoat/Underskirt"],
+  "Suit/Salwar": ["Kurta/Kurti", "Dupatta", "Bottoms (e.g. Pant, Salwar, Shalwar, Sharara)"],
   Anarkali: ["Anarkali Kurta", "Bottom (Churidar/Legging)", "Dupatta"],
   Sharara: ["Top/Kurta", "Sharara", "Dupatta"],
-  Menswear: ["Kurta", "Pajama/Churidar", "Dupatta/Stole", "Jacket/Waistcoat"],
+  Menswear: ["Kurta/Kurti", "Dupatta", "Bottoms (e.g. Pant, Salwar, Shalwar, Sharara)"],
   Kidswear: ["Top/Kurta", "Bottom", "Dupatta/Stole", "Accessories"],
   Jewellery: [
     "Necklace",
@@ -118,41 +134,195 @@ export const ITEMS_INCLUDED_OPTIONS: Record<string, string[]> = {
   Dupatta: ["Dupatta"],
   Blouse: ["Blouse"],
   Indowestern: ["Top/Blouse", "Bottom/Skirt", "Dupatta/Stole", "Jacket/Cape"],
+  Footwear: ["Shoes", "Juttis/Mojris", "Sandals", "Heels"],
   Other: [],
 };
 
-// Popular South Asian designers for autocomplete
+// ============================================================
+// Designers — live app list (31 designers, incl. Pakistani)
+// ============================================================
+
 export const POPULAR_DESIGNERS = [
-  "Sabyasachi Mukherjee",
-  "Anita Dongre",
-  "Manish Malhotra",
-  "Tarun Tahiliani",
-  "Abu Jani Sandeep Khosla",
-  "Ritu Kumar",
-  "Rohit Bal",
-  "JJ Valaya",
+  "Abhinav Mishra",
+  "Abu Jani & Sandeep Khosla",
   "Anamika Khanna",
-  "Masaba Gupta",
-  "Papa Don't Preach by Shubhika",
-  "Ridhi Mehra",
+  "Anita Dongre",
+  "Anushree Reddy",
+  "Asim Jofa",
+  "Dolly J",
+  "Faiza Saqlain",
   "Falguni Shane Peacock",
+  "Faraz Manan",
   "Gaurav Gupta",
-  "Varun Bahl",
-  "Shyamal & Bhumika",
+  "Hussain Rehar",
+  "Jade by Monica & Karishma",
+  "Mahima Mahajan",
+  "Manish Malhotra",
+  "Maria B",
+  "Masaba Gupta (House of Masaba)",
+  "Mohsin Naveed Ranjha",
+  "Nikita Gujral",
+  "Papa Don't Preach by Shubhika",
   "Payal Singhal",
-  "Raw Mango",
+  "Ritu Kumar",
+  "Sabyasachi Mukherjee",
+  "Sana Safinaz",
+  "Sania Maskatiya",
   "Seema Gujral",
-  "Jade by Monica and Karishma",
+  "Sobia Nazir",
+  "Suffuse by Sana Yasir",
+  "Tarun Tahiliani",
+  "Vvani by Vani Vats",
+  "Other",
 ] as const;
 
-// Dry cleaning status options
+// Dry cleaning status — matching live Play Store app
 export const DRY_CLEANING_STATUSES = [
-  "required",
-  "recommended",
-  "not_needed",
-  "already_cleaned",
+  "Dry-cleaned less than 1 month ago",
+  "Dry-cleaned over 1 month ago",
+  "Pre-loved and not dry cleaned",
+  "New, therefore not dry cleaned",
 ] as const;
 export type DryCleaningStatus = (typeof DRY_CLEANING_STATUSES)[number];
+
+// ============================================================
+// Primary colours — matching live Play Store app (20 colours)
+// ============================================================
+
+export const PRIMARY_COLOURS = [
+  "Black",
+  "Grey",
+  "White",
+  "Brown",
+  "Tan",
+  "Cream",
+  "Yellow",
+  "Red",
+  "Burgundy",
+  "Orange",
+  "Pink",
+  "Purple",
+  "Blue",
+  "Navy",
+  "Green",
+  "Khaki",
+  "Multi",
+  "Silver",
+  "Gold",
+  "Other",
+] as const;
+export type PrimaryColour = (typeof PRIMARY_COLOURS)[number];
+
+// ============================================================
+// Countries (seller location) — matching live app
+// ============================================================
+
+export const SELLER_COUNTRIES = [
+  "Australia",
+  "New Zealand",
+  "United States",
+  "Canada",
+  "United Kingdom",
+] as const;
+
+// Country codes used in profiles.location
+export const COUNTRY_CODES = ["AU", "NZ", "US", "CA", "UK"] as const;
+
+// ============================================================
+// Country of origin — matching live Play Store app
+// ============================================================
+
+export const COUNTRIES_OF_ORIGIN = [
+  "India",
+  "Indian - Designer",
+  "Pakistan",
+  "Pakistani - Designer",
+  "Nepal",
+  "Bangladesh",
+  "Sri Lanka",
+  "Maldives",
+  "Afghanistan",
+  "Bhutan",
+  "Other",
+  "Other - Designer",
+] as const;
+export type CountryOfOrigin = (typeof COUNTRIES_OF_ORIGIN)[number];
+
+// ============================================================
+// Standardized sizes — matching live Play Store app
+// ============================================================
+
+export const WOMENS_SIZES = [
+  "UK4 / US0 / AU4",
+  "UK6 / US2 / AU6",
+  "UK8 / US4 / AU8",
+  "UK10 / US6 / AU10",
+  "UK12 / US8 / AU12",
+  "UK14 / US10 / AU14",
+  "UK16 / US12 / AU16",
+  "UK18 / US14 / AU18",
+  "UK20 / US16 / AU20",
+  "UK22 / US18 / AU22",
+  "UK24 / US20 / AU24",
+  "UK26 / US22 / AU26",
+  "UK28 / US24 / AU28",
+  "Free Size",
+] as const;
+
+export const MENSWEAR_KIDSWEAR_SIZES = [
+  "XXS",
+  "XS",
+  "S",
+  "M",
+  "L",
+  "XL",
+  "XXL",
+  "3XL",
+  "4XL",
+  "Free size",
+] as const;
+
+export const FOOTWEAR_SIZES = [
+  "AU4 / UK2 / US5 / EU35",
+  "AU5 / UK3 / US6 / EU36",
+  "AU6 / UK4 / US7 / EU37",
+  "AU7 / UK5 / US8 / EU38",
+  "AU8 / UK6 / US9 / EU39",
+  "AU9 / UK7 / US10 / EU40",
+  "AU10 / UK8 / US11 / EU41",
+  "AU11 / UK9 / US12 / EU42",
+  "AU12 / UK10 / US14 / EU43",
+  "AU13 / UK11 / US15 / EU44",
+  "AU14 / UK12 / US16 / EU45",
+] as const;
+
+export type SizeType = "womens" | "menswear_kidswear" | "footwear" | "free_size";
+
+// Which size chart a category uses
+export const CATEGORY_SIZE_TYPE: Record<ListingCategory, SizeType | null> = {
+  Lehenga: "womens",
+  Saree: null,
+  "Suit/Salwar": "womens",
+  Anarkali: "womens",
+  Indowestern: "womens",
+  Sharara: "womens",
+  Jewellery: null,
+  Dupatta: null,
+  Blouse: "womens",
+  Menswear: "menswear_kidswear",
+  Kidswear: "menswear_kidswear",
+  Footwear: "footwear",
+  Other: null,
+};
+
+// Admin curation tag options
+export const CURATION_TAGS = [
+  "Bridal Edit",
+  "Designer Edit",
+  "Top Picks",
+  "Popular Brands",
+] as const;
+export type CurationTag = (typeof CURATION_TAGS)[number];
 
 // ============================================================
 // Measurement fields vary by category
@@ -184,6 +354,7 @@ export const REQUIRED_MEASUREMENTS: Record<
   Jewellery: [],
   Dupatta: [],
   Indowestern: [],
+  Footwear: [],
   Other: [],
 };
 
@@ -211,6 +382,13 @@ export interface Listing {
   shipping_info: string | null;
   created_at: string;
   updated_at: string;
+
+  // Standardized size (live app field)
+  estimated_size: string | null;
+  size_type: SizeType | null;
+
+  // Admin curation
+  curation_tags: CurationTag[];
 
   // v2 fields (all nullable/defaulted in database)
   fabric_types: string[];
@@ -267,7 +445,11 @@ export interface CreateListingInput {
   original_price_amount?: number;
   negotiable?: boolean;
   shipping_info?: string;
-  status?: "draft" | "active"; // can only create as draft or active
+  status?: "draft" | "active";
+
+  // Standardized size
+  estimated_size?: string;
+  size_type?: SizeType;
 
   // v2 fields
   fabric_types?: string[];
