@@ -82,8 +82,6 @@ sellers.get("/dashboard", clerkMiddleware, requireProfile, async (c) => {
     activity_tabs: {
       selling: (sellerListingCount || 0) > 0,
       buying: (buyerOrderCount || 0) > 0,
-      renting_out: false,
-      renting: false,
     },
   });
 });

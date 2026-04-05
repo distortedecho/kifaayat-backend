@@ -22,7 +22,6 @@ import reviews from "./routes/reviews.js";
 import admin from "./routes/admin.js";
 import cart from "./routes/cart.js";
 import referrals from "./routes/referrals.js";
-import rentals from "./routes/rentals.js";
 import iso from "./routes/iso.js";
 import sitemap from "./routes/sitemap.js";
 import { initCronJobs } from "./lib/cron.js";
@@ -80,7 +79,6 @@ app.route("/api/email-hooks", emailHooks);
 app.route("/api/admin", admin);
 app.route("/api/cart", cart);
 app.route("/api/referrals", referrals);
-app.route("/api/rentals", rentals);
 app.route("/api/iso", iso);
 
 // Root route

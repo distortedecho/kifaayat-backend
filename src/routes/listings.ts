@@ -77,14 +77,6 @@ const createListingSchema = z.object({
   alteration_room: z.string().max(500).optional(),
   fit_tips: z.string().max(1000).optional(),
 
-  // Rental fields
-  is_rentable: z.boolean().optional(),
-  rental_daily_rate: z.number().int().positive().optional(),
-  rental_4to7_rate: z.number().int().positive().optional(),
-  rental_8to14_rate: z.number().int().positive().optional(),
-  rental_cleaning_fee: z.number().int().nonnegative().optional(),
-  rental_security_deposit: z.number().int().nonnegative().optional(),
-
   // Shipping v2
   shipping_cost_amount: z.number().int().nonnegative().optional(),
   free_shipping: z.boolean().optional(),
@@ -92,10 +84,7 @@ const createListingSchema = z.object({
   // Video
   video_url: z.string().url().optional(),
   video_storage_path: z.string().optional(),
-}).refine(
-  (data) => !data.is_rentable || (data.rental_daily_rate !== undefined && data.rental_daily_rate > 0),
-  { message: "rental_daily_rate is required when is_rentable is true", path: ["rental_daily_rate"] }
-);
+});
 
 const updateListingSchema = z.object({
   title: z.string().min(1).max(200).optional(),
@@ -141,14 +130,6 @@ const updateListingSchema = z.object({
   alteration_room: z.string().max(500).nullable().optional(),
   fit_tips: z.string().max(1000).nullable().optional(),
 
-  // Rental fields
-  is_rentable: z.boolean().optional(),
-  rental_daily_rate: z.number().int().positive().nullable().optional(),
-  rental_4to7_rate: z.number().int().positive().nullable().optional(),
-  rental_8to14_rate: z.number().int().positive().nullable().optional(),
-  rental_cleaning_fee: z.number().int().nonnegative().nullable().optional(),
-  rental_security_deposit: z.number().int().nonnegative().nullable().optional(),
-
   // Shipping v2
   shipping_cost_amount: z.number().int().nonnegative().nullable().optional(),
   free_shipping: z.boolean().optional(),
@@ -156,10 +137,7 @@ const updateListingSchema = z.object({
   // Video
   video_url: z.string().url().nullable().optional(),
   video_storage_path: z.string().nullable().optional(),
-}).refine(
-  (data) => !data.is_rentable || (data.rental_daily_rate !== undefined && data.rental_daily_rate !== null && data.rental_daily_rate > 0),
-  { message: "rental_daily_rate is required when is_rentable is true", path: ["rental_daily_rate"] }
-);
+});
 
 const statusUpdateSchema = z.object({
   status: z.enum(["draft", "active", "pending_review", "deactivated", "reserved", "sold"]),
@@ -396,14 +374,6 @@ listings.post("/", clerkMiddleware, requireProfile, async (c) => {
       alteration_room: input.alteration_room || null,
       fit_tips: input.fit_tips || null,
 
-      // Rental fields
-      is_rentable: input.is_rentable || false,
-      rental_daily_rate: input.rental_daily_rate || null,
-      rental_4to7_rate: input.rental_4to7_rate || null,
-      rental_8to14_rate: input.rental_8to14_rate || null,
-      rental_cleaning_fee: input.rental_cleaning_fee || null,
-      rental_security_deposit: input.rental_security_deposit || null,
-
       // Shipping v2
       shipping_cost_amount: input.shipping_cost_amount || null,
       free_shipping: input.free_shipping || false,
@@ -580,14 +550,6 @@ listings.put("/:id", clerkMiddleware, requireProfile, async (c) => {
   if (input.dry_cleaning_status !== undefined) updateData.dry_cleaning_status = input.dry_cleaning_status;
   if (input.alteration_room !== undefined) updateData.alteration_room = input.alteration_room;
   if (input.fit_tips !== undefined) updateData.fit_tips = input.fit_tips;
-
-  // Rental fields
-  if (input.is_rentable !== undefined) updateData.is_rentable = input.is_rentable;
-  if (input.rental_daily_rate !== undefined) updateData.rental_daily_rate = input.rental_daily_rate;
-  if (input.rental_4to7_rate !== undefined) updateData.rental_4to7_rate = input.rental_4to7_rate;
-  if (input.rental_8to14_rate !== undefined) updateData.rental_8to14_rate = input.rental_8to14_rate;
-  if (input.rental_cleaning_fee !== undefined) updateData.rental_cleaning_fee = input.rental_cleaning_fee;
-  if (input.rental_security_deposit !== undefined) updateData.rental_security_deposit = input.rental_security_deposit;
 
   // Shipping v2
   if (input.shipping_cost_amount !== undefined) updateData.shipping_cost_amount = input.shipping_cost_amount;

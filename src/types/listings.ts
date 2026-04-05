@@ -402,14 +402,6 @@ export interface Listing {
   alteration_room: string | null;
   fit_tips: string | null;
 
-  // Rental fields
-  is_rentable: boolean;
-  rental_daily_rate: number | null;
-  rental_4to7_rate: number | null;
-  rental_8to14_rate: number | null;
-  rental_cleaning_fee: number | null;
-  rental_security_deposit: number | null;
-
   // Shipping v2
   shipping_cost_amount: number | null;
   free_shipping: boolean;
@@ -461,14 +453,6 @@ export interface CreateListingInput {
   dry_cleaning_status?: DryCleaningStatus;
   alteration_room?: string;
   fit_tips?: string;
-
-  // Rental fields
-  is_rentable?: boolean;
-  rental_daily_rate?: number;
-  rental_4to7_rate?: number;
-  rental_8to14_rate?: number;
-  rental_cleaning_fee?: number;
-  rental_security_deposit?: number;
 
   // Shipping v2
   shipping_cost_amount?: number;

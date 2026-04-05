@@ -44,18 +44,6 @@ export const NOTIFICATION_TYPES = [
   "boost_expiring",
   "sale_applied",
   "referral_credit_earned",
-  "rental_request",
-  "rental_confirmed",
-  "rental_declined",
-  "rental_shipped",
-  "rental_in_use",
-  "rental_return_due",
-  "rental_returned",
-  "rental_inspected",
-  "rental_complete",
-  "rental_deposit_released",
-  "rental_damage_claim",
-  "rental_auto_declined",
   "iso_match",
   "iso_response",
   "new_message",
@@ -199,55 +187,6 @@ export interface Review {
 }
 
 // ============================================================
-// Rental types
-// ============================================================
-
-export const RENTAL_STATUSES = [
-  'pending_confirmation', 'confirmed', 'shipped', 'in_use',
-  'return_due', 'returned', 'inspected', 'complete',
-  'declined', 'cancelled',
-] as const;
-export type RentalStatus = (typeof RENTAL_STATUSES)[number];
-
-export const VALID_RENTAL_TRANSITIONS: Record<RentalStatus, RentalStatus[]> = {
-  pending_confirmation: ['confirmed', 'declined', 'cancelled'],
-  confirmed: ['shipped', 'cancelled'],
-  shipped: ['in_use'],
-  in_use: ['return_due'],
-  return_due: ['returned'],
-  returned: ['inspected'],
-  inspected: ['complete'],
-  complete: [],
-  declined: [],
-  cancelled: [],
-};
-
-export interface RentalBooking {
-  id: string;
-  listing_id: string;
-  renter_id: string;
-  lender_id: string;
-  start_date: string;
-  end_date: string;
-  daily_rate: number;
-  total_rental_amount: number;
-  cleaning_fee: number;
-  security_deposit: number;
-  status: RentalStatus;
-  stripe_setup_intent_id: string | null;
-  stripe_payment_method_id: string | null;
-  stripe_payment_intent_id: string | null;
-  stripe_deposit_payment_intent_id: string | null;
-  deposit_released: boolean;
-  shipping_tracking_number: string | null;
-  return_tracking_number: string | null;
-  damage_claim_description: string | null;
-  damage_claim_photos: string[] | null;
-  created_at: string;
-  updated_at: string;
-}
-
-// ============================================================
 // Constants
 // ============================================================
 
@@ -274,13 +213,6 @@ export const REVIEW_REMINDER_HOURS = 48;
 
 /** Days after reveal before seller reply window closes */
 export const SELLER_REPLY_WINDOW_DAYS = 14;
-
-// Rental constants
-export const RENTAL_AUTO_DECLINE_HOURS = 24;
-export const RENTAL_DEPOSIT_AUTO_RELEASE_HOURS = 48;
-export const RENTAL_RETURN_REMINDER_DAYS = 2;
-export const RENTAL_MAX_DURATION_DAYS = 14;
-export const RENTAL_COMMISSION_RATE = 12; // % on rental amount only (not cleaning fee or deposit)
 
 // ============================================================
 // Helper functions

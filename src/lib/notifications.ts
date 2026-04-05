@@ -42,18 +42,6 @@ export const NOTIFICATION_CATEGORY_MAP: Record<string, NotificationCategory> = {
   order_shipped: 'transaction',
   order_delivered: 'transaction',
   order_complete: 'transaction',
-  rental_request: 'transaction',
-  rental_confirmed: 'transaction',
-  rental_declined: 'transaction',
-  rental_shipped: 'transaction',
-  rental_in_use: 'transaction',
-  rental_return_due: 'transaction',
-  rental_returned: 'transaction',
-  rental_inspected: 'transaction',
-  rental_complete: 'transaction',
-  rental_deposit_released: 'transaction',
-  rental_damage_claim: 'transaction',
-  rental_auto_declined: 'transaction',
   account_suspended: 'transaction',
   // Engagement (default on)
   new_message: 'engagement',
@@ -428,109 +416,6 @@ export function referralCreditEarnedNotification(
   return {
     title: "You earned $10!",
     body: `${referredName} made their first purchase. $10 credit added to your account!`,
-  };
-}
-
-// ============================================================
-// Rental Notification Templates
-// ============================================================
-
-export function rentalRequestNotification(
-  renterName: string,
-  listingTitle: string,
-  startDate: string,
-  endDate: string
-): NotificationTemplate {
-  return {
-    title: "New Rental Request",
-    body: `${renterName} wants to rent "${listingTitle}" from ${startDate} to ${endDate}`,
-  };
-}
-
-export function rentalConfirmedNotification(
-  listingTitle: string,
-  startDate: string,
-  endDate: string
-): NotificationTemplate {
-  return {
-    title: "Rental Confirmed!",
-    body: `Your rental of "${listingTitle}" from ${startDate} to ${endDate} has been confirmed. Payment has been processed.`,
-  };
-}
-
-export function rentalDeclinedNotification(
-  listingTitle: string
-): NotificationTemplate {
-  return {
-    title: "Rental Request Declined",
-    body: `Your rental request for "${listingTitle}" was declined by the lender.`,
-  };
-}
-
-export function rentalShippedNotification(
-  listingTitle: string,
-  trackingNumber: string
-): NotificationTemplate {
-  return {
-    title: "Your Rental Has Shipped",
-    body: `"${listingTitle}" is on its way! Tracking: ${trackingNumber}`,
-  };
-}
-
-export function rentalReturnDueNotification(
-  listingTitle: string,
-  dueDate: string,
-  daysRemaining: number
-): NotificationTemplate {
-  return {
-    title: "Return Due Soon",
-    body: `"${listingTitle}" is due back by ${dueDate} (${daysRemaining} day${daysRemaining === 1 ? "" : "s"} remaining)`,
-  };
-}
-
-export function rentalReturnedNotification(
-  listingTitle: string
-): NotificationTemplate {
-  return {
-    title: "Rental Item Returned",
-    body: `"${listingTitle}" has been returned. Please inspect the item.`,
-  };
-}
-
-export function rentalDepositReleasedNotification(
-  depositAmount: number,
-  currency: string
-): NotificationTemplate {
-  return {
-    title: "Deposit Released!",
-    body: `Your security deposit of ${formatPrice(depositAmount, currency)} has been released.`,
-  };
-}
-
-export function rentalCompleteNotification(
-  listingTitle: string
-): NotificationTemplate {
-  return {
-    title: "Rental Complete",
-    body: `Your rental of "${listingTitle}" is now complete. Thank you!`,
-  };
-}
-
-export function rentalDamageClaimNotification(
-  listingTitle: string
-): NotificationTemplate {
-  return {
-    title: "Damage Claim Filed",
-    body: `A damage claim has been filed for "${listingTitle}". An admin will review and reach out.`,
-  };
-}
-
-export function rentalAutoDeclinedNotification(
-  listingTitle: string
-): NotificationTemplate {
-  return {
-    title: "Rental Request Auto-Declined",
-    body: `The rental request for "${listingTitle}" was automatically declined after 24 hours without a response.`,
   };
 }
 
