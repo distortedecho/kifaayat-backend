@@ -27,7 +27,7 @@ const offers = new Hono();
 const createOfferSchema = z.object({
   listing_id: z.string().uuid("listing_id must be a valid UUID"),
   amount: z.number().int().positive("Amount must be a positive integer (in cents)"),
-  currency: z.enum(["AUD", "USD", "NZD"]),
+  currency: z.enum(["AUD", "USD", "NZD", "CAD", "GBP"]),
 });
 
 const counterOfferSchema = z.object({
@@ -338,9 +338,22 @@ offers.post("/:id/accept", clerkMiddleware, requireProfile, async (c) => {
     return c.json({ error: "Offer is not pending" }, 400);
   }
 
-  // User must be the seller
-  if (offer.seller_id !== profile.id) {
-    return c.json({ error: "Only the seller can accept this offer" }, 403);
+  // The "recipient" of the offer can accept it:
+  // Odd rounds (1, 3): buyer initiated → seller is recipient → seller can accept
+  // Even rounds (2): seller countered → buyer is recipient → buyer can accept
+  const isSeller = offer.seller_id === profile.id;
+  const isBuyer = offer.buyer_id === profile.id;
+
+  if (!isSeller && !isBuyer) {
+    return c.json({ error: "Not authorized" }, 403);
+  }
+
+  const isOddRound = offer.round % 2 === 1;
+  const recipientIsSeller = isOddRound;
+  const userIsRecipient = recipientIsSeller ? isSeller : isBuyer;
+
+  if (!userIsRecipient) {
+    return c.json({ error: "Only the offer recipient can accept" }, 403);
   }
 
   // Set payment deadline (24 hours from now)
@@ -370,14 +383,15 @@ offers.post("/:id/accept", clerkMiddleware, requireProfile, async (c) => {
     .update({ status: "reserved" })
     .eq("id", listing.id as string);
 
-  // Create notification for buyer
+  // Notify the counterparty (the person who made the offer that was accepted)
+  const notifyUserId = isSeller ? offer.buyer_id : offer.seller_id;
   const acceptTemplate = offerAcceptedNotification(
     listing.title as string,
     offer.amount,
     offer.currency
   );
   await createNotification({
-    user_id: offer.buyer_id,
+    user_id: notifyUserId,
     type: "offer_accepted",
     ...acceptTemplate,
     data: { listing_id: offer.listing_id, offer_id: offerId },
@@ -415,9 +429,20 @@ offers.post("/:id/decline", clerkMiddleware, requireProfile, async (c) => {
     return c.json({ error: "Offer is not pending" }, 400);
   }
 
-  // User must be the seller
-  if (offer.seller_id !== profile.id) {
-    return c.json({ error: "Only the seller can decline this offer" }, 403);
+  // The recipient can decline (same logic as accept)
+  const isSeller = offer.seller_id === profile.id;
+  const isBuyer = offer.buyer_id === profile.id;
+
+  if (!isSeller && !isBuyer) {
+    return c.json({ error: "Not authorized" }, 403);
+  }
+
+  const isOddRound = offer.round % 2 === 1;
+  const recipientIsSeller = isOddRound;
+  const userIsRecipient = recipientIsSeller ? isSeller : isBuyer;
+
+  if (!userIsRecipient) {
+    return c.json({ error: "Only the offer recipient can decline" }, 403);
   }
 
   // Update offer
@@ -433,15 +458,16 @@ offers.post("/:id/decline", clerkMiddleware, requireProfile, async (c) => {
     return c.json({ error: "Failed to decline offer" }, 500);
   }
 
-  // Create notification for buyer
+  // Notify the counterparty (the person who made the offer that was declined)
   const listing = offer.listings as Record<string, unknown>;
+  const notifyUserId = isSeller ? offer.buyer_id : offer.seller_id;
   const declineTemplate = offerDeclinedNotification(
     listing.title as string,
     offer.amount,
     offer.currency
   );
   await createNotification({
-    user_id: offer.buyer_id,
+    user_id: notifyUserId,
     type: "offer_declined",
     ...declineTemplate,
     data: { listing_id: offer.listing_id, offer_id: offerId },

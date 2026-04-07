@@ -11,7 +11,7 @@ const feed = new Hono();
 // Types
 // ============================================================
 
-const VALID_MARKETS = ["AU", "US", "NZ"] as const;
+const VALID_MARKETS = ["AU", "US", "NZ", "CA", "UK"] as const;
 
 interface ListingSummary {
   id: string;

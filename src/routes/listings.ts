@@ -63,9 +63,9 @@ const createListingSchema = z.object({
   estimated_size: z.string().max(50).optional(),
   size_type: z.enum(["womens", "menswear_kidswear", "footwear", "free_size"]).optional(),
 
-  // v2 fields — required for new listings
-  fabric_types: z.array(z.string()).min(1, "At least one fabric type is required"),
-  items_included: z.array(z.string()).min(1, "At least one item is required"),
+  // v2 fields — enforced at completeness check, optional at creation for drafts
+  fabric_types: z.array(z.string()).default([]),
+  items_included: z.array(z.string()).default([]),
 
   // v2 fields — optional
   work_types: z.array(z.string()).optional(),
