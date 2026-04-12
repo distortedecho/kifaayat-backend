@@ -644,6 +644,7 @@ cart.post("/checkout", clerkMiddleware, requireProfile, async (c) => {
             commission_rate: group.commission_rate,
             commission_amount: group.commission_amount,
             seller_payout: group.seller_payout,
+            buyer_email: "",
             stripe_payment_intent_id: null,
             status: "paid" as OrderStatus,
           })
@@ -733,6 +734,7 @@ cart.post("/checkout", clerkMiddleware, requireProfile, async (c) => {
         checkout_type: "cart",
         cart_checkout_id: cartCheckoutId,
         buyer_profile_id: profile.id,
+        buyer_email: "",
         credit_applied: creditApplied.toString(),
         seller_groups: JSON.stringify(
           sellerGroups.map((g) => ({

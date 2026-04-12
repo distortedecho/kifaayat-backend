@@ -464,8 +464,9 @@ CREATE POLICY "Admins can update all listings"
 -- ============================================================
 -- Supabase Storage Bucket (Manual Setup)
 -- ============================================================
--- MANUAL SETUP REQUIRED: Create storage bucket in Supabase Dashboard
+-- MANUAL SETUP REQUIRED: Create storage buckets in Supabase Dashboard
 -- Dashboard -> Storage -> New bucket -> Name: "listing-photos", Public: true
+-- Dashboard -> Storage -> New bucket -> Name: "listing-videos", Public: true
 -- Policy: Authenticated users can upload (INSERT), anyone can read (SELECT)
 
 -- ============================================================

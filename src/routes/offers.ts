@@ -2,21 +2,20 @@ import { Hono } from "hono";
 import { z } from "zod";
 import { clerkMiddleware } from "../middleware/clerk.js";
 import { requireProfile } from "../middleware/requireProfile.js";
+import { idempotencyMiddleware } from "../middleware/idempotency.js";
 import { createSupabaseAdmin } from "../lib/supabase.js";
 import {
   type OfferStatus,
   type OfferWithListing,
   MAX_OFFER_ROUNDS,
   OFFER_EXPIRY_HOURS,
-  ACCEPTED_OFFER_PAYMENT_HOURS,
 } from "../types/transactions.js";
 import {
   createNotification,
-  offerReceivedNotification,
-  offerAcceptedNotification,
-  offerDeclinedNotification,
   offerCounteredNotification,
 } from "../lib/notifications.js";
+import { emit } from "../lib/events.js";
+import { acceptOffer, declineOffer, OfferServiceError } from "../services/offerService.js";
 
 const offers = new Hono();
 
@@ -63,7 +62,7 @@ async function getCoverPhotoUrl(listingId: string): Promise<string | null> {
  * POST /api/offers
  * Create a new offer on a listing.
  */
-offers.post("/", clerkMiddleware, requireProfile, async (c) => {
+offers.post("/", idempotencyMiddleware, clerkMiddleware, requireProfile, async (c) => {
   const profile = c.get("profile");
   const supabase = createSupabaseAdmin();
 
@@ -141,18 +140,16 @@ offers.post("/", clerkMiddleware, requireProfile, async (c) => {
     return c.json({ error: "Failed to create offer" }, 500);
   }
 
-  // Create notification for seller
-  const notifTemplate = offerReceivedNotification(
-    profile.display_name || "A buyer",
-    listing.title,
+  // Emit event; the notifications listener dispatches the seller alert.
+  emit("offer:received", {
+    offerId: offer.id as string,
+    sellerId: listing.seller_id as string,
+    buyerId: profile.id as string,
+    buyerName: profile.display_name || "A buyer",
+    listingId: listing_id,
+    listingTitle: listing.title,
     amount,
-    currency
-  );
-  await createNotification({
-    user_id: listing.seller_id,
-    type: "offer_received",
-    ...notifTemplate,
-    data: { listing_id, offer_id: offer.id },
+    currency,
   });
 
   return c.json({ offer }, 201);
@@ -160,19 +157,34 @@ offers.post("/", clerkMiddleware, requireProfile, async (c) => {
 
 /**
  * GET /api/offers/mine
- * List buyer's offers with listing info.
+ * List buyer's offers with listing info. Cursor-paginated on created_at
+ * (default limit 20). Query params: ?cursor=<ISO>&limit=<n>
  */
 offers.get("/mine", clerkMiddleware, requireProfile, async (c) => {
   const profile = c.get("profile");
   const supabase = createSupabaseAdmin();
 
-  const { data: offersData, error } = await supabase
+  const cursor = c.req.query("cursor");
+  const limitParam = c.req.query("limit");
+  const limit = Math.min(
+    Math.max(parseInt(limitParam || "20", 10) || 20, 1),
+    100
+  );
+
+  let query = supabase
     .from("offers")
     .select(
       "*, listings!offers_listing_id_fkey(id, title, price_amount, listing_photos(url, position)), profiles!offers_seller_id_fkey(display_name)"
     )
     .eq("buyer_id", profile.id)
-    .order("created_at", { ascending: false });
+    .order("created_at", { ascending: false })
+    .limit(limit);
+
+  if (cursor) {
+    query = query.lt("created_at", cursor);
+  }
+
+  const { data: offersData, error } = await query;
 
   if (error) {
     console.error("Error fetching buyer offers:", error);
@@ -214,24 +226,43 @@ offers.get("/mine", clerkMiddleware, requireProfile, async (c) => {
     };
   });
 
-  return c.json({ offers: items });
+  const nextCursor =
+    items.length === limit ? items[items.length - 1].created_at : null;
+
+  return c.json({ items, offers: items, next_cursor: nextCursor });
 });
 
 /**
  * GET /api/offers/received
  * List seller's received offers with listing info and buyer name.
+ * Cursor-paginated on created_at (default limit 20).
+ * Query params: ?cursor=<ISO>&limit=<n>
  */
 offers.get("/received", clerkMiddleware, requireProfile, async (c) => {
   const profile = c.get("profile");
   const supabase = createSupabaseAdmin();
 
-  const { data: offersData, error } = await supabase
+  const cursor = c.req.query("cursor");
+  const limitParam = c.req.query("limit");
+  const limit = Math.min(
+    Math.max(parseInt(limitParam || "20", 10) || 20, 1),
+    100
+  );
+
+  let query = supabase
     .from("offers")
     .select(
       "*, listings!offers_listing_id_fkey(id, title, price_amount, listing_photos(url, position)), profiles!offers_buyer_id_fkey(display_name)"
     )
     .eq("seller_id", profile.id)
-    .order("created_at", { ascending: false });
+    .order("created_at", { ascending: false })
+    .limit(limit);
+
+  if (cursor) {
+    query = query.lt("created_at", cursor);
+  }
+
+  const { data: offersData, error } = await query;
 
   if (error) {
     console.error("Error fetching seller offers:", error);
@@ -273,7 +304,10 @@ offers.get("/received", clerkMiddleware, requireProfile, async (c) => {
     };
   });
 
-  return c.json({ offers: items });
+  const nextCursor =
+    items.length === limit ? items[items.length - 1].created_at : null;
+
+  return c.json({ items, offers: items, next_cursor: nextCursor });
 });
 
 /**
@@ -316,88 +350,21 @@ offers.get("/:id", clerkMiddleware, requireProfile, async (c) => {
 offers.post("/:id/accept", clerkMiddleware, requireProfile, async (c) => {
   const offerId = c.req.param("id");
   const profile = c.get("profile");
-  const supabase = createSupabaseAdmin();
 
   if (!UUID_REGEX.test(offerId)) {
     return c.json({ error: "Invalid offer ID format" }, 400);
   }
 
-  // Fetch the offer
-  const { data: offer, error: fetchError } = await supabase
-    .from("offers")
-    .select("*, listings!offers_listing_id_fkey(id, title, seller_id)")
-    .eq("id", offerId)
-    .single();
-
-  if (fetchError || !offer) {
-    return c.json({ error: "Offer not found" }, 404);
-  }
-
-  // Must be pending
-  if (offer.status !== "pending") {
-    return c.json({ error: "Offer is not pending" }, 400);
-  }
-
-  // The "recipient" of the offer can accept it:
-  // Odd rounds (1, 3): buyer initiated → seller is recipient → seller can accept
-  // Even rounds (2): seller countered → buyer is recipient → buyer can accept
-  const isSeller = offer.seller_id === profile.id;
-  const isBuyer = offer.buyer_id === profile.id;
-
-  if (!isSeller && !isBuyer) {
-    return c.json({ error: "Not authorized" }, 403);
-  }
-
-  const isOddRound = offer.round % 2 === 1;
-  const recipientIsSeller = isOddRound;
-  const userIsRecipient = recipientIsSeller ? isSeller : isBuyer;
-
-  if (!userIsRecipient) {
-    return c.json({ error: "Only the offer recipient can accept" }, 403);
-  }
-
-  // Set payment deadline (24 hours from now)
-  const paymentDeadline = new Date();
-  paymentDeadline.setHours(paymentDeadline.getHours() + ACCEPTED_OFFER_PAYMENT_HOURS);
-
-  // Update offer
-  const { data: updatedOffer, error: updateError } = await supabase
-    .from("offers")
-    .update({
-      status: "accepted" as OfferStatus,
-      expires_at: paymentDeadline.toISOString(),
-    })
-    .eq("id", offerId)
-    .select()
-    .single();
-
-  if (updateError) {
-    console.error("Error accepting offer:", updateError);
+  try {
+    const updatedOffer = await acceptOffer(offerId, { profileId: profile.id });
+    return c.json({ offer: updatedOffer });
+  } catch (err) {
+    if (err instanceof OfferServiceError) {
+      return c.json({ error: err.message }, err.status as 400 | 403 | 404 | 500);
+    }
+    console.error("Unexpected error in accept offer:", err);
     return c.json({ error: "Failed to accept offer" }, 500);
   }
-
-  // Transition listing to reserved
-  const listing = offer.listings as Record<string, unknown>;
-  await supabase
-    .from("listings")
-    .update({ status: "reserved" })
-    .eq("id", listing.id as string);
-
-  // Notify the counterparty (the person who made the offer that was accepted)
-  const notifyUserId = isSeller ? offer.buyer_id : offer.seller_id;
-  const acceptTemplate = offerAcceptedNotification(
-    listing.title as string,
-    offer.amount,
-    offer.currency
-  );
-  await createNotification({
-    user_id: notifyUserId,
-    type: "offer_accepted",
-    ...acceptTemplate,
-    data: { listing_id: offer.listing_id, offer_id: offerId },
-  });
-
-  return c.json({ offer: updatedOffer });
 });
 
 /**
@@ -407,73 +374,21 @@ offers.post("/:id/accept", clerkMiddleware, requireProfile, async (c) => {
 offers.post("/:id/decline", clerkMiddleware, requireProfile, async (c) => {
   const offerId = c.req.param("id");
   const profile = c.get("profile");
-  const supabase = createSupabaseAdmin();
 
   if (!UUID_REGEX.test(offerId)) {
     return c.json({ error: "Invalid offer ID format" }, 400);
   }
 
-  // Fetch the offer
-  const { data: offer, error: fetchError } = await supabase
-    .from("offers")
-    .select("*, listings!offers_listing_id_fkey(title)")
-    .eq("id", offerId)
-    .single();
-
-  if (fetchError || !offer) {
-    return c.json({ error: "Offer not found" }, 404);
-  }
-
-  // Must be pending
-  if (offer.status !== "pending") {
-    return c.json({ error: "Offer is not pending" }, 400);
-  }
-
-  // The recipient can decline (same logic as accept)
-  const isSeller = offer.seller_id === profile.id;
-  const isBuyer = offer.buyer_id === profile.id;
-
-  if (!isSeller && !isBuyer) {
-    return c.json({ error: "Not authorized" }, 403);
-  }
-
-  const isOddRound = offer.round % 2 === 1;
-  const recipientIsSeller = isOddRound;
-  const userIsRecipient = recipientIsSeller ? isSeller : isBuyer;
-
-  if (!userIsRecipient) {
-    return c.json({ error: "Only the offer recipient can decline" }, 403);
-  }
-
-  // Update offer
-  const { data: updatedOffer, error: updateError } = await supabase
-    .from("offers")
-    .update({ status: "declined" as OfferStatus })
-    .eq("id", offerId)
-    .select()
-    .single();
-
-  if (updateError) {
-    console.error("Error declining offer:", updateError);
+  try {
+    const updatedOffer = await declineOffer(offerId, { profileId: profile.id });
+    return c.json({ offer: updatedOffer });
+  } catch (err) {
+    if (err instanceof OfferServiceError) {
+      return c.json({ error: err.message }, err.status as 400 | 403 | 404 | 500);
+    }
+    console.error("Unexpected error in decline offer:", err);
     return c.json({ error: "Failed to decline offer" }, 500);
   }
-
-  // Notify the counterparty (the person who made the offer that was declined)
-  const listing = offer.listings as Record<string, unknown>;
-  const notifyUserId = isSeller ? offer.buyer_id : offer.seller_id;
-  const declineTemplate = offerDeclinedNotification(
-    listing.title as string,
-    offer.amount,
-    offer.currency
-  );
-  await createNotification({
-    user_id: notifyUserId,
-    type: "offer_declined",
-    ...declineTemplate,
-    data: { listing_id: offer.listing_id, offer_id: offerId },
-  });
-
-  return c.json({ offer: updatedOffer });
 });
 
 /**

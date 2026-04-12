@@ -1,5 +1,7 @@
 import { Hono } from "hono";
 import { GoogleGenAI } from "@google/genai";
+import PQueue from "p-queue";
+import crypto from "crypto";
 import { clerkMiddleware } from "../middleware/clerk.js";
 import { removeBackground } from "../lib/background-removal.js";
 import { createSupabaseAdmin } from "../lib/supabase.js";
@@ -21,6 +23,98 @@ const ai = new Hono();
 
 // Maximum base64 photo size: 4MB
 const MAX_PHOTO_SIZE = 4 * 1024 * 1024;
+
+// ============================================================
+// Gemini Request Queues (Phase 2.3)
+//
+// We have a single Gemini API key that must serve up to 20k
+// users plus a background cron worker. Two separate queues
+// keep user-facing traffic from being starved by cron bursts.
+// ============================================================
+
+/**
+ * User-facing queue: moderate throughput, higher priority.
+ * Allows 5 parallel requests, up to 25 per minute.
+ */
+export const userGeminiQueue = new PQueue({
+  concurrency: 5,
+  intervalCap: 25,
+  interval: 60_000,
+});
+
+/**
+ * Cron/background queue: strictly throttled so a bulk refresh
+ * cannot saturate the Gemini key and block real users.
+ * Allows 1 in-flight request, up to 5 per minute.
+ */
+export const cronGeminiQueue = new PQueue({
+  concurrency: 1,
+  intervalCap: 5,
+  interval: 60_000,
+});
+
+// ============================================================
+// Per-user AI rate limit (Phase 2.3)
+//
+// In-memory sliding-window limit: max 5 Gemini-backed calls
+// per Clerk user per hour. This sits on top of the existing
+// IP-based aiLimiter in middleware/rateLimiter.ts.
+// ============================================================
+
+const USER_AI_LIMIT_WINDOW_MS = 60 * 60 * 1000;
+const USER_AI_LIMIT_MAX = 5;
+const userAICalls = new Map<string, number[]>();
+
+/**
+ * Returns true if the user is within their hourly AI call budget
+ * and records the call. Returns false if they are over budget.
+ */
+function checkUserAILimit(userId: string): boolean {
+  const now = Date.now();
+  const existing = userAICalls.get(userId) || [];
+  const calls = existing.filter((t) => now - t < USER_AI_LIMIT_WINDOW_MS);
+  if (calls.length >= USER_AI_LIMIT_MAX) {
+    userAICalls.set(userId, calls);
+    return false;
+  }
+  calls.push(now);
+  userAICalls.set(userId, calls);
+  return true;
+}
+
+// ============================================================
+// AI analysis result cache (Phase 2.3)
+//
+// Keyed by SHA256 of the first 1000 chars of each photo joined.
+// Prevents duplicate Gemini spend when users re-enter the listing
+// flow with the same photos. TTL 1 hour.
+// ============================================================
+
+const AI_CACHE_TTL_MS = 60 * 60 * 1000;
+const aiCache = new Map<string, { result: AIAnalysisResponse; expiry: number }>();
+
+function getCacheKey(photos: string[]): string {
+  const hash = crypto.createHash("sha256");
+  for (const p of photos) {
+    hash.update(p.slice(0, 1000));
+    hash.update("|");
+  }
+  return hash.digest("hex");
+}
+
+function getCachedAnalysis(key: string): AIAnalysisResponse | null {
+  const entry = aiCache.get(key);
+  if (!entry) return null;
+  if (Date.now() > entry.expiry) {
+    aiCache.delete(key);
+    return null;
+  }
+  return entry.result;
+}
+
+function setCachedAnalysis(key: string, result: AIAnalysisResponse): void {
+  aiCache.set(key, { result, expiry: Date.now() + AI_CACHE_TTL_MS });
+}
 
 function truncateAtWordBoundary(text: string, maxLen: number): string {
   if (text.length <= maxLen) return text;
@@ -107,6 +201,25 @@ ai.post("/analyze", clerkMiddleware, async (c) => {
   const photos = body.photos.slice(0, 3);
   console.log(`[AI Analyze] Processing ${photos.length} photos for user=${clerkUserId}`);
 
+  // Cache lookup — return instantly if we've seen these exact photos recently.
+  // We check cache BEFORE the per-user rate limit so cache hits don't burn quota.
+  const cacheKey = getCacheKey(photos);
+  const cached = getCachedAnalysis(cacheKey);
+  if (cached) {
+    const elapsed = Date.now() - requestStart;
+    console.log(`[AI Analyze] Cache hit for user=${clerkUserId} in ${elapsed}ms`);
+    return c.json(cached, 200);
+  }
+
+  // Per-user hourly rate limit (max 5 Gemini calls/hour/user).
+  if (!checkUserAILimit(clerkUserId)) {
+    console.warn(`[AI Analyze] Per-user rate limit exceeded for user=${clerkUserId}`);
+    return c.json(
+      { error: "AI analysis rate limit reached. Please try again later.", fallback: true } satisfies AIErrorResponse,
+      429
+    );
+  }
+
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
     console.error("GEMINI_API_KEY is not set");
@@ -159,23 +272,27 @@ Return a JSON object with these fields:
 For each field, also provide a confidence score (0-100).
 Return valid JSON only, no markdown formatting.`;
 
-  // Attempt with one retry on failure
+  // Attempt with one retry on failure. Every Gemini call is queued
+  // through userGeminiQueue so we never exceed the single-key budget.
   let lastError: unknown;
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      const result = await genAI.models.generateContent({
-        model: "gemini-2.5-flash",
-        contents: [prompt, ...imageParts],
-        config: {
-          responseMimeType: "application/json",
-          temperature: 0.2,
-        },
+      const responseText = await userGeminiQueue.add(async () => {
+        const result = await genAI.models.generateContent({
+          model: "gemini-2.5-flash",
+          contents: [prompt, ...imageParts],
+          config: {
+            responseMimeType: "application/json",
+            temperature: 0.2,
+          },
+        });
+        return result.text ?? "";
       });
-      const responseText = result.text ?? "";
-      const parsed = JSON.parse(responseText);
+      const parsed = JSON.parse(responseText ?? "");
 
       // Map and validate response
       const response = mapGeminiResponse(parsed);
+      setCachedAnalysis(cacheKey, response);
       const elapsed = Date.now() - requestStart;
       console.log(`[AI Analyze] Success for user=${clerkUserId} in ${elapsed}ms (attempt ${attempt + 1})`);
       return c.json(response, 200);
@@ -423,19 +540,28 @@ ai.post("/conversations/:id/summary", clerkMiddleware, async (c) => {
 
   const genAI = new GoogleGenAI({ apiKey });
 
-  try {
-    const result = await genAI.models.generateContent({
-      model: "gemini-2.0-flash",
-      contents: [
-        `Summarize this conversation between a buyer and seller about a fashion listing in 2-3 concise sentences. Focus on what was discussed, any agreements, and pending items:\n\n${messagesText}`,
-      ],
-      config: {
-        temperature: 0.3,
-      },
-    });
+  // Per-user rate limit for the summary endpoint.
+  if (!checkUserAILimit(clerkUserId!)) {
+    return c.json(
+      { error: "AI rate limit reached. Please try again later." },
+      429
+    );
+  }
 
-    const summary = result.text ?? "";
-    return c.json({ summary });
+  try {
+    const summary = await userGeminiQueue.add(async () => {
+      const result = await genAI.models.generateContent({
+        model: "gemini-2.0-flash",
+        contents: [
+          `Summarize this conversation between a buyer and seller about a fashion listing in 2-3 concise sentences. Focus on what was discussed, any agreements, and pending items:\n\n${messagesText}`,
+        ],
+        config: {
+          temperature: 0.3,
+        },
+      });
+      return result.text ?? "";
+    });
+    return c.json({ summary: summary ?? "" });
   } catch (error) {
     console.error("AI conversation summary failed:", error);
     return c.json({ error: "Failed to generate summary" }, 500);
@@ -587,16 +713,20 @@ Return valid JSON only, no markdown formatting. If fewer than 3 match well, retu
   let ranked: Array<{ listing_id: string; score: number; reasons: string[] }> = [];
 
   try {
-    const result = await genAI.models.generateContent({
-      model: "gemini-2.5-flash",
-      contents: [prompt],
-      config: {
-        responseMimeType: "application/json",
-        temperature: 0.2,
-      },
+    // ISO matching runs from the cron path, so route it through
+    // the throttled background queue to avoid starving users.
+    const responseText = await cronGeminiQueue.add(async () => {
+      const result = await genAI.models.generateContent({
+        model: "gemini-2.5-flash",
+        contents: [prompt],
+        config: {
+          responseMimeType: "application/json",
+          temperature: 0.2,
+        },
+      });
+      return result.text ?? "";
     });
-    const responseText = result.text ?? "";
-    const parsed = JSON.parse(responseText);
+    const parsed = JSON.parse(responseText ?? "");
 
     if (Array.isArray(parsed)) {
       ranked = parsed;

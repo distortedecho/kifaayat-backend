@@ -2,11 +2,10 @@ import { Hono } from "hono";
 import { z } from "zod";
 import { clerkMiddleware, optionalClerkMiddleware } from "../middleware/clerk.js";
 import { requireProfile } from "../middleware/requireProfile.js";
-import { getProfileByClerkId } from "../lib/profiles.js";
+import { idempotencyMiddleware } from "../middleware/idempotency.js";
 import { createSupabaseAdmin } from "../lib/supabase.js";
 import {
   createNotification,
-  orderPaidNotification,
   orderShippedNotification,
   orderDeliveredNotification,
   orderCompleteNotification,
@@ -17,10 +16,9 @@ import {
   type OrderWithListing,
   VALID_ORDER_TRANSITIONS,
   AUTO_COMPLETE_DAYS,
-  generateOrderNumber,
 } from "../types/transactions.js";
-import { getCommissionRate } from "../lib/commission.js";
 import { isFirstCompletedOrder, awardReferralCredits } from "../lib/referrals.js";
+import { createOrder, OrderServiceError } from "../services/orderService.js";
 
 const orders = new Hono();
 
@@ -58,9 +56,8 @@ const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12
  * Create an order from successful Stripe payment.
  * Uses optionalClerkMiddleware to support guest checkout.
  */
-orders.post("/", optionalClerkMiddleware, async (c) => {
+orders.post("/", idempotencyMiddleware, optionalClerkMiddleware, async (c) => {
   const clerkUserId = c.get("clerkUserId");
-  const supabase = createSupabaseAdmin();
 
   // Parse and validate body
   const body = await c.req.json();
@@ -72,112 +69,53 @@ orders.post("/", optionalClerkMiddleware, async (c) => {
     );
   }
 
-  const {
-    listing_id,
-    buyer_email,
-    amount,
-    currency,
-    offer_id,
-    stripe_payment_intent_id,
-    stripe_checkout_session_id,
-  } = parsed.data;
-
-  // Get buyer profile if authenticated
-  let buyerId: string | null = null;
-  if (clerkUserId) {
-    const profile = await getProfileByClerkId(clerkUserId);
-    if (profile) {
-      buyerId = profile.id;
+  // Delegate to the order service -- it verifies Stripe, computes
+  // commission, writes atomically, and emits "order:created".
+  try {
+    const order = await createOrder({
+      ...parsed.data,
+      clerkUserId: clerkUserId || null,
+    });
+    return c.json({ order }, 201);
+  } catch (err) {
+    if (err instanceof OrderServiceError) {
+      return c.json({ error: err.message }, err.status as 400 | 404 | 500);
     }
-  }
-
-  // Validate listing exists
-  const { data: listing, error: listingError } = await supabase
-    .from("listings")
-    .select("id, seller_id, title, status")
-    .eq("id", listing_id)
-    .single();
-
-  if (listingError || !listing) {
-    return c.json({ error: "Listing not found" }, 404);
-  }
-
-  // Calculate commission
-  const commissionRate = await getCommissionRate();
-  const commissionAmount = Math.round(amount * (commissionRate / 100));
-  const sellerPayout = amount - commissionAmount;
-
-  // Generate order number
-  const orderNumber = generateOrderNumber();
-
-  // Create order
-  const { data: order, error: insertError } = await supabase
-    .from("orders")
-    .insert({
-      order_number: orderNumber,
-      listing_id,
-      buyer_id: buyerId,
-      seller_id: listing.seller_id,
-      buyer_email,
-      offer_id: offer_id || null,
-      amount,
-      currency,
-      commission_rate: commissionRate,
-      commission_amount: commissionAmount,
-      seller_payout: sellerPayout,
-      stripe_payment_intent_id,
-      stripe_checkout_session_id: stripe_checkout_session_id || null,
-      status: "paid" as OrderStatus,
-    })
-    .select()
-    .single();
-
-  if (insertError) {
-    console.error("Error creating order:", insertError);
+    console.error("Unexpected error in POST /orders:", err);
     return c.json({ error: "Failed to create order" }, 500);
   }
-
-  // Transition listing to 'sold'
-  await supabase
-    .from("listings")
-    .update({ status: "sold" })
-    .eq("id", listing_id);
-
-  // If offer_id provided, mark offer as completed
-  if (offer_id) {
-    await supabase
-      .from("offers")
-      .update({ status: "completed" })
-      .eq("id", offer_id);
-  }
-
-  // Create notification for seller
-  const paidTemplate = orderPaidNotification(listing.title, amount, currency, sellerPayout);
-  await createNotification({
-    user_id: listing.seller_id,
-    type: "order_paid",
-    ...paidTemplate,
-    data: { listing_id, order_id: order.id },
-  });
-
-  return c.json({ order }, 201);
 });
 
 /**
  * GET /api/orders/mine
- * Buyer's order history.
+ * Buyer's order history. Cursor-paginated on created_at (default limit 20).
+ * Query params: ?cursor=<ISO>&limit=<n>
  */
 orders.get("/mine", clerkMiddleware, requireProfile, async (c) => {
   const profile = c.get("profile");
   const supabase = createSupabaseAdmin();
 
-  const { data: ordersData, error } = await supabase
+  const cursor = c.req.query("cursor");
+  const limitParam = c.req.query("limit");
+  const limit = Math.min(
+    Math.max(parseInt(limitParam || "20", 10) || 20, 1),
+    100
+  );
+
+  let query = supabase
     .from("orders")
     .select(
       "*, listings!orders_listing_id_fkey(id, title, category, listing_photos(url, position)), seller:profiles!orders_seller_id_fkey(display_name)"
     )
     .eq("buyer_id", profile.id)
-    .order("created_at", { ascending: false });
+    .order("created_at", { ascending: false })
+    .limit(limit);
+
+  if (cursor) {
+    query = query.lt("created_at", cursor);
+  }
+
+  const { data: ordersData, error } = await query;
 
   if (error) {
     console.error("Error fetching buyer orders:", error);
@@ -230,24 +168,42 @@ orders.get("/mine", clerkMiddleware, requireProfile, async (c) => {
     };
   });
 
-  return c.json({ orders: items });
+  const nextCursor =
+    items.length === limit ? items[items.length - 1].created_at : null;
+
+  return c.json({ items, orders: items, next_cursor: nextCursor });
 });
 
 /**
  * GET /api/orders/sales
- * Seller's incoming orders.
+ * Seller's incoming orders. Cursor-paginated on created_at (default limit 20).
+ * Query params: ?cursor=<ISO>&limit=<n>
  */
 orders.get("/sales", clerkMiddleware, requireProfile, async (c) => {
   const profile = c.get("profile");
   const supabase = createSupabaseAdmin();
 
-  const { data: ordersData, error } = await supabase
+  const cursor = c.req.query("cursor");
+  const limitParam = c.req.query("limit");
+  const limit = Math.min(
+    Math.max(parseInt(limitParam || "20", 10) || 20, 1),
+    100
+  );
+
+  let query = supabase
     .from("orders")
     .select(
       "*, listings!orders_listing_id_fkey(id, title, category, listing_photos(url, position)), buyer:profiles!orders_buyer_id_fkey(display_name)"
     )
     .eq("seller_id", profile.id)
-    .order("created_at", { ascending: false });
+    .order("created_at", { ascending: false })
+    .limit(limit);
+
+  if (cursor) {
+    query = query.lt("created_at", cursor);
+  }
+
+  const { data: ordersData, error } = await query;
 
   if (error) {
     console.error("Error fetching seller orders:", error);
@@ -300,7 +256,10 @@ orders.get("/sales", clerkMiddleware, requireProfile, async (c) => {
     };
   });
 
-  return c.json({ orders: items });
+  const nextCursor =
+    items.length === limit ? items[items.length - 1].created_at : null;
+
+  return c.json({ items, orders: items, next_cursor: nextCursor });
 });
 
 /**

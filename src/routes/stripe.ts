@@ -263,10 +263,10 @@ stripeRoutes.post("/payment-intent", optionalClerkMiddleware, async (c) => {
     paymentAmount = offer.amount;
   }
 
-  // Look up seller's Stripe account
+  // Look up seller's Stripe account and payout method
   const { data: sellerProfile } = await supabase
     .from("profiles")
-    .select("stripe_account_id, stripe_onboarding_complete")
+    .select("stripe_account_id, stripe_onboarding_complete, payout_method")
     .eq("id", listing.seller_id)
     .single();
 
@@ -295,14 +295,21 @@ stripeRoutes.post("/payment-intent", optionalClerkMiddleware, async (c) => {
     intentParams.receipt_email = buyer_email;
   }
 
-  // Use Destination Charges if seller has a connected, verified Stripe account
+  // Determine payout routing based on seller's chosen method
+  const sellerPayoutMethod: string | null = sellerProfile?.payout_method ?? null;
+
   if (sellerStripeAccountId && sellerOnboardingComplete) {
+    // Direct Stripe payouts via destination charges
     intentParams.application_fee_amount = commission;
     intentParams.transfer_data = {
       destination: sellerStripeAccountId,
     };
-  }
-  if (!sellerStripeAccountId || !sellerOnboardingComplete) {
+  } else if (sellerPayoutMethod === "kifaayat_wallet") {
+    // Platform-managed: payment goes to Kifaayat's account, tracked for later payout
+    intentParams.metadata!.payout_method = "kifaayat_wallet";
+    intentParams.metadata!.seller_id = listing.seller_id;
+    intentParams.metadata!.commission_amount = String(commission);
+  } else {
     return c.json({ error: "This seller has not completed payment setup. Please contact the seller." }, 400);
   }
 
@@ -437,13 +444,16 @@ h1{color:#d97706;font-size:1.5rem}p{color:#6b7280;margin-top:0.5rem}</style></he
  */
 stripeRoutes.get("/account-status", clerkMiddleware, requireProfile, async (c) => {
   const profile = c.get("profile");
+  const payoutMethod: string | null = profile.payout_method ?? null;
 
   if (!profile.stripe_account_id) {
-    const response: StripeStatusResponse = {
-      status: "not_connected",
+    const response = {
+      status: "not_connected" as const,
       account_id: null,
       charges_enabled: false,
       payouts_enabled: false,
+      payout_method: payoutMethod,
+      payout_ready: payoutMethod === "kifaayat_wallet",
     };
     return c.json(response);
   }
@@ -454,12 +464,15 @@ stripeRoutes.get("/account-status", clerkMiddleware, requireProfile, async (c) =
     );
 
     const status = mapAccountToStatus(account);
+    const stripeVerified = status === "verified";
 
-    const response: StripeStatusResponse = {
+    const response = {
       status,
       account_id: profile.stripe_account_id,
       charges_enabled: account.charges_enabled ?? false,
       payouts_enabled: account.payouts_enabled ?? false,
+      payout_method: payoutMethod,
+      payout_ready: stripeVerified || payoutMethod === "kifaayat_wallet",
     };
 
     return c.json(response);
@@ -630,6 +643,7 @@ stripeRoutes.post("/webhook", async (c) => {
             commission_rate: group.commission_rate,
             commission_amount: group.commission_amount,
             seller_payout: group.seller_payout,
+            buyer_email: metadata.buyer_email || "",
             stripe_payment_intent_id: paymentIntent.id,
             status: "paid" as OrderStatus,
           })

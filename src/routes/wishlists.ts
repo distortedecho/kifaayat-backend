@@ -224,11 +224,21 @@ wishlists.delete("/:listingId", optionalClerkMiddleware, async (c) => {
 
 /**
  * GET /api/wishlists
- * Get all wishlist items with optional folder filter.
+ * Get wishlist items with optional folder filter. Page-paginated.
+ * Query params: ?page=<n>&limit=<n>&folder_id=<uuid> (default page=1, limit=50)
  */
 wishlists.get("/", optionalClerkMiddleware, async (c) => {
   const supabase = createSupabaseAdmin();
   const folderId = c.req.query("folder_id");
+
+  const pageParam = c.req.query("page");
+  const limitParam = c.req.query("limit");
+  const page = Math.max(parseInt(pageParam || "1", 10) || 1, 1);
+  const limit = Math.min(
+    Math.max(parseInt(limitParam || "50", 10) || 50, 1),
+    100
+  );
+  const offset = (page - 1) * limit;
 
   // Get identifier
   const result = await getWishlistIdentifier(c);
@@ -241,9 +251,11 @@ wishlists.get("/", optionalClerkMiddleware, async (c) => {
   let query = supabase
     .from("wishlists")
     .select(
-      "id, listing_id, folder_id, created_at, listings!wishlists_listing_id_fkey(id, title, price_amount, price_currency, original_price_amount, category, condition, status, listing_photos(url, position), profiles!listings_seller_id_fkey(display_name, location))"
+      "id, listing_id, folder_id, created_at, listings!wishlists_listing_id_fkey(id, title, price_amount, price_currency, original_price_amount, category, condition, status, listing_photos(url, position), profiles!listings_seller_id_fkey(display_name, location))",
+      { count: "exact" }
     )
-    .order("created_at", { ascending: false });
+    .order("created_at", { ascending: false })
+    .range(offset, offset + limit - 1);
 
   // Apply identifier filter
   if (identifier.user_id) {
@@ -257,7 +269,7 @@ wishlists.get("/", optionalClerkMiddleware, async (c) => {
     query = query.eq("folder_id", folderId);
   }
 
-  const { data: wishlistRows, error } = await query;
+  const { data: wishlistRows, error, count: totalCount } = await query;
 
   if (error) {
     console.error("Error fetching wishlist:", error);
@@ -297,7 +309,13 @@ wishlists.get("/", optionalClerkMiddleware, async (c) => {
       };
     });
 
-  return c.json({ items, count: items.length });
+  return c.json({
+    items,
+    count: items.length,
+    page,
+    limit,
+    total: totalCount || 0,
+  });
 });
 
 /**

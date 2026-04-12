@@ -544,6 +544,12 @@ reviews.post("/:id/reply", clerkMiddleware, async (c) => {
 /**
  * GET /api/reviews/seller/:sellerId
  * Public: Get revealed buyer-to-seller reviews for a seller profile.
+ * Cursor-paginated on created_at (default limit 10).
+ * Query params: ?cursor=<ISO>&limit=<n>
+ *
+ * NOTE: avg_rating / review_count are aggregated over the CURRENT PAGE only
+ * for backwards compatibility. Callers that need total aggregates should
+ * query a dedicated stats endpoint in a follow-up.
  */
 reviews.get("/seller/:sellerId", optionalClerkMiddleware, async (c) => {
   const sellerId = c.req.param("sellerId");
@@ -553,14 +559,28 @@ reviews.get("/seller/:sellerId", optionalClerkMiddleware, async (c) => {
     return c.json({ error: "Invalid seller ID format" }, 400);
   }
 
+  const cursor = c.req.query("cursor");
+  const limitParam = c.req.query("limit");
+  const limit = Math.min(
+    Math.max(parseInt(limitParam || "10", 10) || 10, 1),
+    100
+  );
+
   // Fetch revealed buyer-to-seller reviews with reviewer profile
-  const { data: reviewRows, error: reviewError } = await supabase
+  let query = supabase
     .from("reviews")
     .select("id, order_id, reviewer_id, rating, comment, seller_reply, seller_reply_at, created_at, profiles!reviews_reviewer_id_fkey(display_name, avatar_url)")
     .eq("reviewee_id", sellerId)
     .eq("reviewer_role", "buyer")
     .not("revealed_at", "is", null)
-    .order("created_at", { ascending: false });
+    .order("created_at", { ascending: false })
+    .limit(limit);
+
+  if (cursor) {
+    query = query.lt("created_at", cursor);
+  }
+
+  const { data: reviewRows, error: reviewError } = await query;
 
   if (reviewError) {
     console.error("Error fetching seller reviews:", reviewError);
@@ -597,8 +617,15 @@ reviews.get("/seller/:sellerId", optionalClerkMiddleware, async (c) => {
         )
       : null;
 
+  const nextCursor =
+    reviewList.length === limit
+      ? (reviewList[reviewList.length - 1].created_at as string)
+      : null;
+
   return c.json({
+    items: reviewList,
     reviews: reviewList,
+    next_cursor: nextCursor,
     avg_rating: avgRating,
     review_count: reviewCount,
   });

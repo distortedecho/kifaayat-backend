@@ -1,5 +1,6 @@
 import { Context, MiddlewareHandler } from "hono";
 import { verifyToken } from "@clerk/backend";
+import { logger } from "../lib/logger.js";
 
 // Extend Hono's context variables to include clerkUserId
 declare module "hono" {
@@ -33,7 +34,7 @@ export const clerkMiddleware: MiddlewareHandler = async (c, next) => {
 
   const secretKey = process.env.CLERK_SECRET_KEY;
   if (!secretKey) {
-    console.error("CLERK_SECRET_KEY is not set");
+    logger.error("clerk.missing_secret_key");
     return c.json({ error: "Server configuration error" }, 500);
   }
 
@@ -52,7 +53,10 @@ export const clerkMiddleware: MiddlewareHandler = async (c, next) => {
   } catch (error: any) {
     // Only log non-expired token errors to reduce noise
     if (error?.reason !== "token-expired") {
-      console.error("Clerk token verification failed:", error);
+      logger.warn("clerk.verify_failed", {
+        reason: error?.reason,
+        message: error instanceof Error ? error.message : String(error),
+      });
     }
     return c.json({ error: "Invalid or expired token" }, 401);
   }

@@ -17,6 +17,12 @@ import {
   tierDowngradeNotification,
   followedSellerNewListingNotification,
 } from "../lib/notifications.js";
+import {
+  getDashboardMetrics,
+  approveListing as approveListingService,
+  rejectListing as rejectListingService,
+  AdminServiceError,
+} from "../services/adminService.js";
 import { calculateTrustTier, computeCategoryMedians } from "../lib/trust-tiers.js";
 import {
   TIER_LABELS,
@@ -260,6 +266,15 @@ admin.get("/listings/pending", async (c) => {
   const supabase = createSupabaseAdmin();
   const sort = c.req.query("sort") || "oldest_first";
 
+  const pageParam = c.req.query("page");
+  const limitParam = c.req.query("limit");
+  const page = Math.max(parseInt(pageParam || "1", 10) || 1, 1);
+  const limit = Math.min(
+    Math.max(parseInt(limitParam || "50", 10) || 50, 1),
+    100
+  );
+  const offset = (page - 1) * limit;
+
   let orderCol = "created_at";
   let ascending = true;
 
@@ -277,7 +292,8 @@ admin.get("/listings/pending", async (c) => {
       { count: "exact" }
     )
     .eq("status", "pending_review")
-    .order(orderCol, { ascending });
+    .order(orderCol, { ascending })
+    .range(offset, offset + limit - 1);
 
   if (error) {
     console.error("Error fetching pending listings:", error);
@@ -294,89 +310,67 @@ admin.get("/listings/pending", async (c) => {
     profiles: undefined,
   }));
 
-  return c.json({ listings: result, total: count || 0 });
+  return c.json({
+    items: result,
+    listings: result,
+    total: count || 0,
+    page,
+    limit,
+  });
 });
 
 admin.post("/listings/:id/approve", async (c) => {
   const listingId = c.req.param("id");
-  const supabase = createSupabaseAdmin();
 
-  const { data: listing, error: fetchError } = await supabase
-    .from("listings")
-    .select("*, profiles!listings_seller_id_fkey(id, clerk_id, display_name, avatar_url, stripe_account_id, stripe_onboarding_complete)")
-    .eq("id", listingId)
-    .single();
-
-  if (fetchError || !listing) {
-    return c.json({ error: "Listing not found" }, 404);
-  }
-
-  if (listing.status !== "pending_review") {
-    return c.json({ error: `Cannot approve listing with status '${listing.status}'` }, 400);
-  }
-
-  const seller = listing.profiles as { id: string; clerk_id: string; display_name: string; avatar_url: string; stripe_account_id: string | null; stripe_onboarding_complete: boolean } | null;
-  if (!seller?.stripe_onboarding_complete) {
-    return c.json({ error: "Cannot approve: seller has not completed Stripe onboarding" }, 400);
-  }
-
-  const { data: updated, error: updateError } = await supabase
-    .from("listings")
-    .update({ status: "active", rejection_reason: null })
-    .eq("id", listingId)
-    .select()
-    .single();
-
-  if (updateError) {
-    console.error("Error approving listing:", updateError);
+  let result;
+  try {
+    result = await approveListingService(listingId);
+  } catch (err) {
+    if (err instanceof AdminServiceError) {
+      return c.json({ error: err.message }, err.status as 400 | 404 | 500);
+    }
+    console.error("Unexpected error approving listing:", err);
     return c.json({ error: "Failed to approve listing" }, 500);
   }
 
-  if (seller) {
-    const template = listingApprovedNotification(listing.title);
-    createNotification({
-      user_id: seller.id,
-      type: "listing_approved",
-      title: template.title,
-      body: template.body,
-      data: { listing_id: listingId },
-    }).catch((err) => console.error("[admin] Notification error:", err));
-
-    const { data: coverPhoto } = await supabase
-      .from("listing_photos")
-      .select("url")
-      .eq("listing_id", listingId)
-      .order("position", { ascending: true })
-      .limit(1)
-      .single();
-
+  // Send "listing approved" email via Resend. The service already
+  // emitted `listing:approved` for notification dispatch.
+  if (result.sellerClerkId) {
     sendListingReviewEmail({
-      sellerClerkId: seller.clerk_id,
-      sellerName: seller.display_name || "Seller",
-      listingTitle: listing.title,
-      listingPhotoUrl: coverPhoto?.url || "",
+      sellerClerkId: result.sellerClerkId,
+      sellerName: result.sellerName || "Seller",
+      listingTitle: (result.listing as Record<string, unknown>).title as string,
+      listingPhotoUrl: result.coverPhotoUrl || "",
       listingId,
       approved: true,
     }).catch((err) => console.error("[admin] Email error:", err));
+  }
 
-    // Notify followers of this seller about the new listing
+  // Notify followers of this seller about the new listing.
+  const listingRow = result.listing as Record<string, unknown>;
+  const sellerId = listingRow.seller_id as string | undefined;
+  if (sellerId) {
     (async () => {
       try {
+        const supabase = createSupabaseAdmin();
         const { data: followers } = await supabase
           .from("seller_follows")
           .select("follower_id")
-          .eq("seller_id", seller.id);
+          .eq("seller_id", sellerId);
 
         if (followers && followers.length > 0) {
-          const sellerName = seller.display_name || "A seller you follow";
-          const template = followedSellerNewListingNotification(sellerName, listing.title);
+          const sellerName = result.sellerName || "A seller you follow";
+          const template = followedSellerNewListingNotification(
+            sellerName,
+            listingRow.title as string
+          );
           for (const f of followers) {
             createNotification({
               user_id: f.follower_id,
               type: "followed_seller_new_listing",
               title: template.title,
               body: template.body,
-              data: { listing_id: listingId, seller_id: seller.id },
+              data: { listing_id: listingId, seller_id: sellerId },
             }).catch(() => {});
           }
         }
@@ -386,82 +380,50 @@ admin.post("/listings/:id/approve", async (c) => {
     })();
   }
 
-  return c.json({ listing: updated });
+  return c.json({ listing: result.listing });
 });
 
 admin.post("/listings/:id/reject", async (c) => {
   const listingId = c.req.param("id");
-  const supabase = createSupabaseAdmin();
 
   const bodySchema = z.object({
     reason: z.string().min(1, "Rejection reason is required"),
   });
   const body = await c.req.json();
   const parsed = bodySchema.safeParse(body);
-
   if (!parsed.success) {
-    return c.json({ error: "Validation failed", details: parsed.error.flatten().fieldErrors }, 400);
+    return c.json(
+      { error: "Validation failed", details: parsed.error.flatten().fieldErrors },
+      400
+    );
   }
 
   const { reason } = parsed.data;
 
-  const { data: listing, error: fetchError } = await supabase
-    .from("listings")
-    .select("*, profiles!listings_seller_id_fkey(id, clerk_id, display_name, avatar_url)")
-    .eq("id", listingId)
-    .single();
-
-  if (fetchError || !listing) {
-    return c.json({ error: "Listing not found" }, 404);
-  }
-
-  if (listing.status !== "pending_review") {
-    return c.json({ error: `Cannot reject listing with status '${listing.status}'` }, 400);
-  }
-
-  const { data: updated, error: updateError } = await supabase
-    .from("listings")
-    .update({ status: "draft", rejection_reason: reason })
-    .eq("id", listingId)
-    .select()
-    .single();
-
-  if (updateError) {
-    console.error("Error rejecting listing:", updateError);
+  let result;
+  try {
+    result = await rejectListingService(listingId, reason);
+  } catch (err) {
+    if (err instanceof AdminServiceError) {
+      return c.json({ error: err.message }, err.status as 400 | 404 | 500);
+    }
+    console.error("Unexpected error rejecting listing:", err);
     return c.json({ error: "Failed to reject listing" }, 500);
   }
 
-  const seller = listing.profiles as { id: string; clerk_id: string; display_name: string; avatar_url: string } | null;
-  if (seller) {
-    const template = listingRejectedNotification(listing.title, reason);
-    createNotification({
-      user_id: seller.id,
-      type: "listing_rejected",
-      title: template.title,
-      body: template.body,
-      data: { listing_id: listingId },
-    }).catch((err) => console.error("[admin] Notification error:", err));
-
-    const { data: coverPhoto } = await supabase
-      .from("listing_photos")
-      .select("url")
-      .eq("listing_id", listingId)
-      .order("position", { ascending: true })
-      .limit(1)
-      .single();
-
+  if (result.sellerClerkId) {
     sendListingReviewEmail({
-      sellerClerkId: seller.clerk_id,
-      sellerName: seller.display_name || "Seller",
-      listingTitle: listing.title,
-      listingPhotoUrl: coverPhoto?.url || "",
+      sellerClerkId: result.sellerClerkId,
+      sellerName: result.sellerName || "Seller",
+      listingTitle: (result.listing as Record<string, unknown>).title as string,
+      listingPhotoUrl: result.coverPhotoUrl || "",
       listingId,
       approved: false,
       rejectionReason: reason,
     }).catch((err) => console.error("[admin] Email error:", err));
   }
 
-  return c.json({ listing: updated });
+  return c.json({ listing: result.listing });
 });
 
 admin.post("/listings/batch", async (c) => {
@@ -958,30 +920,47 @@ admin.get("/users", async (c) => {
     return c.json({ error: "Failed to fetch users" }, 500);
   }
 
-  const users = await Promise.all(
-    (profiles || []).map(async (profile) => {
-      const [listingCount, orderData] = await Promise.all([
-        supabase
-          .from("listings")
-          .select("id", { count: "exact", head: true })
-          .eq("seller_id", profile.id),
-        supabase
-          .from("orders")
-          .select("amount")
-          .eq("seller_id", profile.id),
-      ]);
+  const userIds = (profiles || []).map((p) => p.id as string);
 
-      const orders = orderData.data || [];
-      return {
-        ...profile,
-        listing_count: listingCount.count || 0,
-        order_count: orders.length,
-        total_sales_amount: orders.reduce((sum, o) => sum + (o.amount || 0), 0),
-      };
-    })
-  );
+  // Batched queries: avoid N+1 by fetching all listings and orders for the
+  // current page in two calls and grouping in JS.
+  const listingCountMap = new Map<string, number>();
+  const orderCountMap = new Map<string, number>();
+  const orderTotalMap = new Map<string, number>();
 
-  return c.json({ users, total: count || 0, page, limit });
+  if (userIds.length > 0) {
+    const [allListings, allOrders] = await Promise.all([
+      supabase
+        .from("listings")
+        .select("seller_id")
+        .in("seller_id", userIds),
+      supabase
+        .from("orders")
+        .select("seller_id, amount")
+        .in("seller_id", userIds),
+    ]);
+
+    for (const row of allListings.data || []) {
+      const sid = row.seller_id as string;
+      listingCountMap.set(sid, (listingCountMap.get(sid) || 0) + 1);
+    }
+
+    for (const row of allOrders.data || []) {
+      const sid = row.seller_id as string;
+      const amt = (row.amount as number) || 0;
+      orderCountMap.set(sid, (orderCountMap.get(sid) || 0) + 1);
+      orderTotalMap.set(sid, (orderTotalMap.get(sid) || 0) + amt);
+    }
+  }
+
+  const users = (profiles || []).map((profile) => ({
+    ...profile,
+    listing_count: listingCountMap.get(profile.id as string) || 0,
+    order_count: orderCountMap.get(profile.id as string) || 0,
+    total_sales_amount: orderTotalMap.get(profile.id as string) || 0,
+  }));
+
+  return c.json({ items: users, users, total: count || 0, page, limit });
 });
 
 admin.post("/users/:id/suspend", async (c) => {
@@ -1103,44 +1082,9 @@ admin.post("/users/:id/unban", async (c) => {
 // ============================================================
 
 admin.get("/dashboard", async (c) => {
-  const supabase = createSupabaseAdmin();
   const rangeDate = parseRange(c.req.query("range"));
-
-  let ordersQuery = supabase.from("orders").select("amount, commission_amount");
-  let listingsCreatedQuery = supabase.from("listings").select("id", { count: "exact", head: true });
-
-  if (rangeDate) {
-    const rangeISO = rangeDate.toISOString();
-    ordersQuery = ordersQuery.gte("created_at", rangeISO);
-    listingsCreatedQuery = listingsCreatedQuery.gte("created_at", rangeISO);
-  }
-
-  const [ordersResult, listingsCreatedResult, activeListingsResult, pendingResult, usersResult] =
-    await Promise.all([
-      ordersQuery,
-      listingsCreatedQuery,
-      supabase.from("listings").select("id", { count: "exact", head: true }).eq("status", "active"),
-      supabase.from("listings").select("id", { count: "exact", head: true }).eq("status", "pending_review"),
-      supabase.from("profiles").select("id", { count: "exact", head: true }),
-    ]);
-
-  const orders = ordersResult.data || [];
-  const totalGmv = orders.reduce((sum, o) => sum + (o.amount || 0), 0);
-  const platformRevenue = orders.reduce((sum, o) => sum + (o.commission_amount || 0), 0);
-  const listingsCreated = listingsCreatedResult.count || 0;
-  const orderCount = orders.length;
-  const conversionRate = listingsCreated > 0 ? Math.round((orderCount / listingsCreated) * 1000) / 10 : 0;
-
-  return c.json({
-    metrics: {
-      total_gmv: totalGmv,
-      platform_revenue: platformRevenue,
-      active_listings: activeListingsResult.count || 0,
-      conversion_rate: conversionRate,
-      pending_review_count: pendingResult.count || 0,
-      total_users: usersResult.count || 0,
-    },
-  });
+  const metrics = await getDashboardMetrics(rangeDate);
+  return c.json({ metrics });
 });
 
 admin.get("/dashboard/timeseries", async (c) => {
@@ -1906,13 +1850,27 @@ admin.get("/analytics/sellers", async (c) => {
 admin.get("/moderation/flagged", async (c) => {
   const supabase = createSupabaseAdmin();
 
-  // Get pending message flags
-  const { data: flags, error } = await supabase
+  const pageParam = c.req.query("page");
+  const limitParam = c.req.query("limit");
+  const page = Math.max(parseInt(pageParam || "1", 10) || 1, 1);
+  const limit = Math.min(
+    Math.max(parseInt(limitParam || "50", 10) || 50, 1),
+    100
+  );
+  const offset = (page - 1) * limit;
+
+  // Fetch a bounded window of pending message flags.
+  // We range over flags (not conversations); the handler still groups to
+  // unique conversations, so the returned count may be <= limit per page.
+  const { data: flags, error, count } = await supabase
     .from("fraud_flags")
-    .select("id, entity_id, flag_type, details, created_at")
+    .select("id, entity_id, flag_type, details, created_at", {
+      count: "exact",
+    })
     .eq("entity_type", "message")
     .eq("status", "pending")
-    .order("created_at", { ascending: false });
+    .order("created_at", { ascending: false })
+    .range(offset, offset + limit - 1);
 
   if (error) {
     console.error("Error fetching flagged messages:", error);
@@ -1920,7 +1878,13 @@ admin.get("/moderation/flagged", async (c) => {
   }
 
   if (!flags || flags.length === 0) {
-    return c.json({ conversations: [] });
+    return c.json({
+      items: [],
+      conversations: [],
+      page,
+      limit,
+      total: count || 0,
+    });
   }
 
   // Get message details for each flag
@@ -2007,7 +1971,13 @@ admin.get("/moderation/flagged", async (c) => {
     })
     .sort((a, b) => b.latest_flag_at.localeCompare(a.latest_flag_at));
 
-  return c.json({ conversations: result });
+  return c.json({
+    items: result,
+    conversations: result,
+    page,
+    limit,
+    total: count || 0,
+  });
 });
 
 admin.get("/moderation/conversation/:id", async (c) => {
@@ -2783,9 +2753,63 @@ admin.put("/listings/:id/tags", async (c) => {
 admin.get("/listings/tags-summary", async (c) => {
   const supabase = createSupabaseAdmin();
 
-  const { data: tagAssignments, error } = await supabase
+  // Two modes:
+  //  1. ?listing_ids=uuid,uuid,uuid — only return tags for these listings
+  //     (preferred when admin UI already has a page of listings in memory).
+  //  2. ?page=<n>&limit=<n> — paginate over the listing_editorial_tags table
+  //     itself (default page=1, limit=50, max 100).
+  const listingIdsParam = c.req.query("listing_ids");
+
+  if (listingIdsParam) {
+    const listingIds = listingIdsParam
+      .split(",")
+      .map((id) => id.trim())
+      .filter(Boolean);
+
+    if (listingIds.length === 0) {
+      return c.json({ tags_summary: {} });
+    }
+
+    if (listingIds.length > 200) {
+      return c.json({ error: "Maximum 200 listing IDs per request" }, 400);
+    }
+
+    const { data: tagAssignments, error } = await supabase
+      .from("listing_editorial_tags")
+      .select("listing_id, editorial_tags(name)")
+      .in("listing_id", listingIds);
+
+    if (error) {
+      console.error("Error fetching tag summary:", error);
+      return c.json({ error: "Failed to fetch tag summary" }, 500);
+    }
+
+    const summary: Record<string, string[]> = {};
+    for (const row of tagAssignments || []) {
+      const lid = row.listing_id as string;
+      const tagName = (row.editorial_tags as unknown as { name: string })?.name;
+      if (!tagName) continue;
+      if (!summary[lid]) summary[lid] = [];
+      summary[lid].push(tagName);
+    }
+
+    return c.json({ tags_summary: summary });
+  }
+
+  const pageParam = c.req.query("page");
+  const limitParam = c.req.query("limit");
+  const page = Math.max(parseInt(pageParam || "1", 10) || 1, 1);
+  const limit = Math.min(
+    Math.max(parseInt(limitParam || "50", 10) || 50, 1),
+    100
+  );
+  const offset = (page - 1) * limit;
+
+  const { data: tagAssignments, error, count } = await supabase
     .from("listing_editorial_tags")
-    .select("listing_id, editorial_tags(name)");
+    .select("listing_id, editorial_tags(name)", { count: "exact" })
+    .order("listing_id", { ascending: true })
+    .range(offset, offset + limit - 1);
 
   if (error) {
     console.error("Error fetching tag summary:", error);
@@ -2794,14 +2818,19 @@ admin.get("/listings/tags-summary", async (c) => {
 
   const summary: Record<string, string[]> = {};
   for (const row of tagAssignments || []) {
-    const listingId = row.listing_id;
+    const listingId = row.listing_id as string;
     const tagName = (row.editorial_tags as unknown as { name: string })?.name;
     if (!tagName) continue;
     if (!summary[listingId]) summary[listingId] = [];
     summary[listingId].push(tagName);
   }
 
-  return c.json({ tags_summary: summary });
+  return c.json({
+    tags_summary: summary,
+    page,
+    limit,
+    total: count || 0,
+  });
 });
 
 // ============================================================

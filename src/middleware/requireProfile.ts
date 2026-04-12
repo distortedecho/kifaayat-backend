@@ -1,5 +1,6 @@
 import type { MiddlewareHandler } from "hono";
 import { getProfileByClerkId, type ProfileBase } from "../lib/profiles.js";
+import { logger } from "../lib/logger.js";
 
 // Extend Hono's context variables to include the resolved profile
 declare module "hono" {
@@ -17,7 +18,7 @@ export const requireProfile: MiddlewareHandler = async (c, next) => {
   const clerkUserId = c.get("clerkUserId");
   const profile = await getProfileByClerkId(clerkUserId);
   if (!profile) {
-    console.error(`[requireProfile] No profile found for clerk_id=${clerkUserId}`);
+    logger.warn("requireProfile.missing", { clerk_id: clerkUserId });
     return c.json({ error: "Profile not found. Please complete your profile setup first." }, 403);
   }
   c.set("profile", profile);

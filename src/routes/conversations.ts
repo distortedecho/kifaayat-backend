@@ -1,8 +1,8 @@
 import { Hono } from "hono";
 import { z } from "zod";
 import { clerkMiddleware } from "../middleware/clerk.js";
+import { idempotencyMiddleware } from "../middleware/idempotency.js";
 import { createSupabaseAdmin } from "../lib/supabase.js";
-import { scanMessageContent } from "../lib/content-scanner.js";
 import type {
   Conversation,
   Message,
@@ -12,7 +12,10 @@ import type {
   ConversationListResponse,
   UnreadCountResponse,
 } from "../types/messaging.js";
-import { createNotification } from "../lib/notifications.js";
+import {
+  sendMessage as sendMessageService,
+  ConversationServiceError,
+} from "../services/conversationService.js";
 
 const conversations = new Hono();
 
@@ -59,14 +62,6 @@ async function getProfileId(
   return data.id;
 }
 
-/**
- * Truncate a string to a given max length, appending "..." if truncated.
- */
-function truncate(text: string, maxLength: number): string {
-  if (text.length <= maxLength) return text;
-  return text.slice(0, maxLength - 3) + "...";
-}
-
 // ============================================================
 // Routes
 // ============================================================
@@ -91,7 +86,7 @@ conversations.get("/unread-count", clerkMiddleware, async (c) => {
     p_profile_id: profileId,
   } as never);
 
-  // Fallback: if RPC not available, do it via queries
+  // Fallback: if RPC not available, do it via batched queries (no N+1).
   if (error) {
     // Get all conversation IDs where user is a participant
     const { data: convos, error: convosError } = await supabase
@@ -104,24 +99,31 @@ conversations.get("/unread-count", clerkMiddleware, async (c) => {
       return c.json(response);
     }
 
-    const convoIds = convos.map((conv) => conv.id);
+    const convoIds = convos.map((conv) => conv.id as string);
 
-    // Count conversations that have at least one unread message from the other party
-    let unreadCount = 0;
-    for (const convoId of convoIds) {
-      const { count } = await supabase
-        .from("messages")
-        .select("id", { count: "exact", head: true })
-        .eq("conversation_id", convoId)
-        .neq("sender_id", profileId)
-        .is("read_at", null);
+    // Single batch query for all unread messages across the user's
+    // conversations. Count distinct conversation_ids client-side.
+    const { data: unreadMsgs, error: unreadError } = await supabase
+      .from("messages")
+      .select("conversation_id")
+      .in("conversation_id", convoIds)
+      .neq("sender_id", profileId)
+      .is("read_at", null);
 
-      if (count && count > 0) {
-        unreadCount++;
-      }
+    if (unreadError) {
+      console.error("Error fetching unread messages:", unreadError);
+      const response: UnreadCountResponse = { total_unread: 0 };
+      return c.json(response);
     }
 
-    const response: UnreadCountResponse = { total_unread: unreadCount };
+    const unreadConvSet = new Set<string>();
+    for (const m of unreadMsgs || []) {
+      unreadConvSet.add(m.conversation_id as string);
+    }
+
+    const response: UnreadCountResponse = {
+      total_unread: unreadConvSet.size,
+    };
     return c.json(response);
   }
 
@@ -283,9 +285,35 @@ conversations.get("/", clerkMiddleware, async (c) => {
   const hasMore = rawList.length > limit;
   const page = hasMore ? rawList.slice(0, limit) : rawList;
 
-  // Enrich each conversation with unread count and other user info
-  const items: ConversationListItem[] = await Promise.all(
-    page.map(async (row: Record<string, unknown>) => {
+  // Batch-fetch unread counts for all conversations on this page in one
+  // query, then group in JS. Replaces the old per-conversation N+1 loop.
+  const pageConvIds = page.map((row) => row.id as string);
+  const unreadCountMap = new Map<string, number>();
+
+  if (pageConvIds.length > 0) {
+    const { data: unreadMsgs, error: unreadError } = await supabase
+      .from("messages")
+      .select("conversation_id")
+      .in("conversation_id", pageConvIds)
+      .neq("sender_id", profileId)
+      .is("read_at", null);
+
+    if (unreadError) {
+      console.error(
+        "Error fetching batched unread counts:",
+        unreadError
+      );
+    } else {
+      for (const m of unreadMsgs || []) {
+        const cid = m.conversation_id as string;
+        unreadCountMap.set(cid, (unreadCountMap.get(cid) || 0) + 1);
+      }
+    }
+  }
+
+  // Enrich each conversation with unread count (from batch map) and other user info
+  const items: ConversationListItem[] = page.map(
+    (row: Record<string, unknown>) => {
       const listing = row.listings as Record<string, unknown> | null;
       const buyer = row.buyer as Record<string, unknown> | null;
       const seller = row.seller as Record<string, unknown> | null;
@@ -308,14 +336,6 @@ conversations.get("/", clerkMiddleware, async (c) => {
         }
       }
 
-      // Count unread messages (from the other party)
-      const { count: unreadCount } = await supabase
-        .from("messages")
-        .select("id", { count: "exact", head: true })
-        .eq("conversation_id", row.id as string)
-        .neq("sender_id", profileId)
-        .is("read_at", null);
-
       return {
         id: row.id as string,
         listing_id: row.listing_id as string,
@@ -336,10 +356,10 @@ conversations.get("/", clerkMiddleware, async (c) => {
         role,
         last_message_at: row.last_message_at as string,
         last_message_preview: row.last_message_preview as string | null,
-        unread_count: unreadCount || 0,
+        unread_count: unreadCountMap.get(row.id as string) || 0,
         created_at: row.created_at as string,
       };
-    })
+    }
   );
 
   const nextCursor = hasMore
@@ -437,10 +457,9 @@ conversations.get("/:id/messages", clerkMiddleware, async (c) => {
  * POST /api/conversations/:id/messages
  * Send a message in a conversation.
  */
-conversations.post("/:id/messages", clerkMiddleware, async (c) => {
+conversations.post("/:id/messages", idempotencyMiddleware, clerkMiddleware, async (c) => {
   const conversationId = c.req.param("id");
   const clerkUserId = c.get("clerkUserId");
-  const supabase = createSupabaseAdmin();
 
   if (!UUID_REGEX.test(conversationId)) {
     return c.json({ error: "Invalid conversation ID format" }, 400);
@@ -449,42 +468,6 @@ conversations.post("/:id/messages", clerkMiddleware, async (c) => {
   const profileId = await getProfileId(clerkUserId);
   if (!profileId) {
     return c.json({ error: "Profile not found" }, 404);
-  }
-
-  // Verify user is a participant
-  const { data: conversation, error: convError } = await supabase
-    .from("conversations")
-    .select("id, buyer_id, seller_id, listing_id")
-    .eq("id", conversationId)
-    .single();
-
-  if (convError || !conversation) {
-    return c.json({ error: "Conversation not found" }, 404);
-  }
-
-  if (
-    conversation.buyer_id !== profileId &&
-    conversation.seller_id !== profileId
-  ) {
-    return c.json({ error: "Not authorized to send messages in this conversation" }, 403);
-  }
-
-  // Verify listing is still active (not sold or deactivated)
-  const { data: listing, error: listingError } = await supabase
-    .from("listings")
-    .select("id, status")
-    .eq("id", conversation.listing_id)
-    .single();
-
-  if (listingError || !listing) {
-    return c.json({ error: "Listing not found" }, 404);
-  }
-
-  if (listing.status === "sold" || listing.status === "deactivated") {
-    return c.json(
-      { error: "This listing is no longer available" },
-      403
-    );
   }
 
   // Parse and validate body
@@ -497,104 +480,26 @@ conversations.post("/:id/messages", clerkMiddleware, async (c) => {
     );
   }
 
-  const { content, message_type, image_url, metadata } = parsed.data;
-
-  // Insert message with multi-type support
-  const { data: message, error: insertError } = await supabase
-    .from("messages")
-    .insert({
-      conversation_id: conversationId,
-      sender_id: profileId,
-      content: content || null,
-      message_type,
-      image_url: image_url || null,
-      metadata: metadata || {},
-    })
-    .select()
-    .single();
-
-  if (insertError) {
-    console.error("Error sending message:", insertError);
+  // Delegate to the conversation service -- it persists the
+  // message, scans content, updates the conversation preview, and
+  // emits `message:sent` for async notification dispatch.
+  try {
+    const message = await sendMessageService({
+      conversationId,
+      senderProfileId: profileId,
+      content: parsed.data.content,
+      message_type: parsed.data.message_type,
+      image_url: parsed.data.image_url,
+      metadata: parsed.data.metadata,
+    });
+    return c.json({ message }, 201);
+  } catch (err) {
+    if (err instanceof ConversationServiceError) {
+      return c.json({ error: err.message }, err.status as 400 | 403 | 404 | 500);
+    }
+    console.error("Unexpected error in sendMessage:", err);
     return c.json({ error: "Failed to send message" }, 500);
   }
-
-  // Fire-and-forget: scan message content for phone numbers, emails, external URLs
-  if (content) {
-    scanMessageContent(message.id, content, profileId).catch((err) =>
-      console.error("Message scan failed:", err)
-    );
-  }
-
-  // Build last_message_preview based on type
-  const previewMap: Record<string, string> = {
-    image: "[Photo]",
-    photo_request: "[Photo Request]",
-    payment_link: "[Payment Link]",
-  };
-  const preview = content
-    ? truncate(content, 100)
-    : previewMap[message_type] || "[Message]";
-
-  // Update conversation with last message info
-  const { error: updateError } = await supabase
-    .from("conversations")
-    .update({
-      last_message_at: new Date().toISOString(),
-      last_message_preview: preview,
-    })
-    .eq("id", conversationId);
-
-  if (updateError) {
-    console.error("Error updating conversation last message:", updateError);
-    // Non-blocking — message was still sent
-  }
-
-  // Fire-and-forget new_message notification (debounced per conversation)
-  const recipientId = conversation.buyer_id === profileId
-    ? conversation.seller_id
-    : conversation.buyer_id;
-
-  (async () => {
-    try {
-      // Check if recipient received a new_message notification for this conversation in the last 5 minutes
-      const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000).toISOString();
-      const { count: recentCount } = await supabase
-        .from("notifications")
-        .select("id", { count: "exact", head: true })
-        .eq("user_id", recipientId)
-        .eq("type", "new_message")
-        .gte("created_at", fiveMinutesAgo)
-        .contains("data", { conversation_id: conversationId });
-
-      if (recentCount && recentCount > 0) {
-        return; // Already notified recently, skip
-      }
-
-      // Get sender display name
-      const { data: senderProfile } = await supabase
-        .from("profiles")
-        .select("display_name")
-        .eq("id", profileId)
-        .single();
-
-      const senderName = senderProfile?.display_name || "Someone";
-      const notifBody = content
-        ? truncate(content, 100)
-        : previewMap[message_type] || "[Message]";
-
-      await createNotification({
-        user_id: recipientId,
-        type: "new_message" as any, // Cast: "new_message" added to NOTIFICATION_TYPES in Plan 19-02
-        title: `New message from ${senderName}`,
-        body: notifBody,
-        data: { conversation_id: conversationId, listing_id: conversation.listing_id },
-      });
-    } catch (err) {
-      console.error("Error sending new_message notification (fire-and-forget):", err);
-    }
-  })();
-
-  return c.json({ message }, 201);
 });
 
 /**

@@ -18,6 +18,12 @@ const emailHooks = new Hono();
 function verifyInternalSecret(secretHeader: string | undefined): boolean {
   const expected = process.env.INTERNAL_API_SECRET;
   if (!expected) {
+    if (process.env.NODE_ENV === "production") {
+      console.error(
+        "[email-hooks] INTERNAL_API_SECRET not set in production — rejecting request"
+      );
+      return false;
+    }
     console.warn(
       "[email-hooks] INTERNAL_API_SECRET not set — allowing all requests (dev mode)"
     );

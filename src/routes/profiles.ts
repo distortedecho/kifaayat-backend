@@ -41,6 +41,7 @@ const updateProfileSchema = z.object({
   onesignal_player_id: z.string().optional(),
   user_intents: z.array(z.enum(["buy", "sell"])).optional(),
   wishlist_public: z.boolean().optional(),
+  payout_method: z.enum(["stripe", "kifaayat_wallet"]).optional(),
 });
 
 /**
@@ -81,8 +82,13 @@ profiles.get("/me", clerkMiddleware, async (c) => {
   }
 
   // Fire-and-forget welcome email (don't await, don't block profile creation)
-  // The welcome hook looks up the user's email via Clerk backend SDK
-  fetch(`http://localhost:${process.env.PORT || 3001}/api/email-hooks/welcome`, {
+  // The welcome hook looks up the user's email via Clerk backend SDK.
+  // NOTE: API_URL must be set to the Railway public URL in production,
+  // otherwise the internal callback will point at localhost inside the
+  // container and silently fail. Dev falls back to localhost:PORT.
+  const apiBaseUrl =
+    process.env.API_URL || `http://localhost:${process.env.PORT || 3001}`;
+  fetch(`${apiBaseUrl}/api/email-hooks/welcome`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",

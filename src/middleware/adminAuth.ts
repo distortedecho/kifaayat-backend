@@ -40,11 +40,13 @@ export const adminAuthMiddleware: MiddlewareHandler = async (c, next) => {
       return c.json({ error: "Forbidden: admin access required" }, 403);
     }
 
+    // Resolve the profile that belongs to the authenticated user — not
+    // "any admin profile". The previous query returned an arbitrary
+    // admin row, which let any admin masquerade as any other.
     const { data: profile } = await supabase
       .from("profiles")
       .select("id")
-      .eq("is_admin", true)
-      .limit(1)
+      .eq("supabase_user_id", user.id)
       .single();
 
     c.set("adminProfileId", profile?.id || user.id);

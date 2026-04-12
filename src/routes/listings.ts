@@ -242,22 +242,35 @@ async function isAdmin(clerkUserId: string): Promise<boolean> {
 
 /**
  * GET /api/listings/me
- * Return all listings by the current seller, ordered by updated_at DESC.
+ * Return the current seller's listings, ordered by created_at DESC.
+ * Cursor-paginated on created_at (default limit 20).
+ * Query params: ?cursor=<ISO>&limit=<n>&status=<status>
  */
 listings.get("/me", clerkMiddleware, requireProfile, async (c) => {
   const profile = c.get("profile");
   const supabase = createSupabaseAdmin();
 
   const statusFilter = c.req.query("status");
+  const cursor = c.req.query("cursor");
+  const limitParam = c.req.query("limit");
+  const limit = Math.min(
+    Math.max(parseInt(limitParam || "20", 10) || 20, 1),
+    100
+  );
 
   let query = supabase
     .from("listings")
     .select("*, listing_photos(*)")
     .eq("seller_id", profile.id)
-    .order("updated_at", { ascending: false });
+    .order("created_at", { ascending: false })
+    .limit(limit);
 
   if (statusFilter) {
     query = query.eq("status", statusFilter);
+  }
+
+  if (cursor) {
+    query = query.lt("created_at", cursor);
   }
 
   const { data: listingsData, error } = await query;
@@ -294,7 +307,12 @@ listings.get("/me", clerkMiddleware, requireProfile, async (c) => {
     boost_ends_at: boostMap[listing.id] || null,
   }));
 
-  return c.json({ listings: result });
+  const nextCursor =
+    result.length === limit
+      ? ((result[result.length - 1] as Record<string, unknown>).created_at as string)
+      : null;
+
+  return c.json({ items: result, listings: result, next_cursor: nextCursor });
 });
 
 /**
