@@ -64,7 +64,7 @@ export async function sendMessage(
     );
   }
 
-  // Listing must still be purchasable
+  // Listing must still be purchasable — unless the sender already has an order for it
   const { data: listing, error: listingError } = await supabase
     .from("listings")
     .select("id, status")
@@ -74,7 +74,17 @@ export async function sendMessage(
     throw new ConversationServiceError("Listing not found", 404);
   }
   if (listing.status === "sold" || listing.status === "deactivated") {
-    throw new ConversationServiceError("This listing is no longer available", 403);
+    const senderIsSeller = conversation.seller_id === params.senderProfileId;
+    if (!senderIsSeller) {
+      const { count: orderCount } = await supabase
+        .from("orders")
+        .select("id", { count: "exact", head: true })
+        .eq("listing_id", conversation.listing_id)
+        .eq("buyer_id", params.senderProfileId);
+      if (!orderCount || orderCount === 0) {
+        throw new ConversationServiceError("This listing is no longer available", 403);
+      }
+    }
   }
 
   // Insert message

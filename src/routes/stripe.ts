@@ -13,6 +13,7 @@ import {
 import { getCommissionRate, getSellerCommissionRate } from "../lib/commission.js";
 import type { StripeAccountStatus, StripeStatusResponse } from "../types/stripe.js";
 import { redeemCredits } from "../lib/referrals.js";
+import { logger } from "../lib/logger.js";
 
 let _stripe: Stripe | null = null;
 
@@ -510,6 +511,8 @@ stripeRoutes.post("/webhook", async (c) => {
     return c.json({ error: "Invalid signature" }, 400);
   }
 
+  logger.info("stripe.webhook_received", { event_type: event.type, event_id: event.id });
+
   const supabase = createSupabaseAdmin();
 
   // Handle account.updated event (Stripe Connect onboarding)
@@ -536,6 +539,17 @@ stripeRoutes.post("/webhook", async (c) => {
     const paymentIntent = event.data.object as Stripe.PaymentIntent;
     const metadata = paymentIntent.metadata;
 
+    logger.info("stripe.payment_intent_succeeded", {
+      payment_intent_id: paymentIntent.id,
+      amount: paymentIntent.amount,
+      currency: paymentIntent.currency,
+      checkout_type: metadata.checkout_type || "single_item",
+      buyer_email: metadata.buyer_email || null,
+      buyer_profile_id: metadata.buyer_profile_id || null,
+      listing_id: metadata.listing_id || null,
+      offer_id: metadata.offer_id || null,
+    });
+
     // --- BOOST CHECKOUT ---
     if (metadata.checkout_type === "boost") {
       const boostListingId = metadata.listing_id;
@@ -545,6 +559,8 @@ stripeRoutes.post("/webhook", async (c) => {
         console.error("Boost payment missing listing_id in metadata");
         return c.json({ received: true });
       }
+
+      logger.info("stripe.boost_payment_processing", { listing_id: boostListingId, seller_profile_id: sellerProfileId });
 
       // Fetch boost duration from admin_settings
       const { data: boostSettings } = await supabase
@@ -608,6 +624,13 @@ stripeRoutes.post("/webhook", async (c) => {
       const buyerProfileId = metadata.buyer_profile_id;
       const currency = paymentIntent.currency.toUpperCase();
 
+      logger.info("stripe.cart_checkout_processing", {
+        cart_checkout_id: cartCheckoutId,
+        buyer_profile_id: buyerProfileId,
+        currency,
+        amount: paymentIntent.amount,
+      });
+
       let sellerGroups: Array<{
         seller_id: string;
         stripe_account_id: string;
@@ -630,6 +653,15 @@ stripeRoutes.post("/webhook", async (c) => {
         // 1. Create order for this seller group
         const orderNumber = generateOrderNumber();
         const groupTotal = group.items_subtotal + group.shipping_total;
+
+        logger.info("stripe.cart_order_creating", {
+          order_number: orderNumber,
+          seller_id: group.seller_id,
+          listing_ids: group.listing_ids,
+          group_total: groupTotal,
+          seller_payout: group.seller_payout,
+          commission_amount: group.commission_amount,
+        });
 
         const { data: order, error: orderError } = await supabase
           .from("orders")
@@ -658,15 +690,29 @@ stripeRoutes.post("/webhook", async (c) => {
           continue;
         }
 
+        logger.info("stripe.cart_order_created", {
+          order_id: order?.id,
+          order_number: orderNumber,
+          seller_id: group.seller_id,
+        });
+
         // 2. Mark all group listings as 'sold'
         await supabase
           .from("listings")
           .update({ status: "sold" })
           .in("id", group.listing_ids);
 
+        logger.info("stripe.listings_marked_sold", { listing_ids: group.listing_ids });
+
         // 3. Create Stripe Transfer to seller
         if (group.stripe_account_id) {
           try {
+            logger.info("stripe.transfer_creating", {
+              seller_id: group.seller_id,
+              stripe_account_id: group.stripe_account_id,
+              payout_amount: group.seller_payout,
+              currency,
+            });
             await getStripe().transfers.create({
               amount: group.seller_payout,
               currency: currency.toLowerCase(),
@@ -677,6 +723,7 @@ stripeRoutes.post("/webhook", async (c) => {
                 seller_id: group.seller_id,
               },
             });
+            logger.info("stripe.transfer_created", { seller_id: group.seller_id, order_number: orderNumber });
           } catch (transferError) {
             console.error(
               `Transfer failed for seller ${group.seller_id}:`,
@@ -733,6 +780,16 @@ stripeRoutes.post("/webhook", async (c) => {
       return c.json({ received: true });
     }
 
+    logger.info("stripe.single_item_checkout_processing", {
+      payment_intent_id: paymentIntent.id,
+      listing_id: listingId,
+      buyer_email: buyerEmail,
+      buyer_profile_id: buyerProfileId,
+      offer_id: offerId,
+      amount: paymentIntent.amount,
+      currency: paymentIntent.currency,
+    });
+
     // Fetch listing for seller_id and title
     const { data: listing } = await supabase
       .from("listings")
@@ -745,6 +802,12 @@ stripeRoutes.post("/webhook", async (c) => {
       return c.json({ received: true });
     }
 
+    logger.info("stripe.single_item_listing_found", {
+      listing_id: listing.id,
+      seller_id: listing.seller_id,
+      title: listing.title,
+    });
+
     // Calculate commission (tier-specific rate for seller)
     const amount = paymentIntent.amount;
     const currency = paymentIntent.currency.toUpperCase();
@@ -752,8 +815,23 @@ stripeRoutes.post("/webhook", async (c) => {
     const commissionAmount = Math.round(amount * (commissionRate / 100));
     const sellerPayout = amount - commissionAmount;
 
+    logger.info("stripe.single_item_commission_calculated", {
+      amount,
+      currency,
+      commission_rate: commissionRate,
+      commission_amount: commissionAmount,
+      seller_payout: sellerPayout,
+    });
+
     // Generate order number
     const orderNumber = generateOrderNumber();
+
+    logger.info("stripe.single_item_order_creating", {
+      order_number: orderNumber,
+      listing_id: listingId,
+      seller_id: listing.seller_id,
+      offer_id: offerId,
+    });
 
     // Create order
     const { data: order, error: insertError } = await supabase
@@ -781,11 +859,20 @@ stripeRoutes.post("/webhook", async (c) => {
       return c.json({ received: true });
     }
 
+    logger.info("stripe.single_item_order_created", {
+      order_id: order?.id,
+      order_number: orderNumber,
+      listing_id: listingId,
+      seller_id: listing.seller_id,
+    });
+
     // Transition listing to 'sold'
     await supabase
       .from("listings")
       .update({ status: "sold" })
       .eq("id", listingId);
+
+    logger.info("stripe.listing_marked_sold", { listing_id: listingId });
 
     // If offer_id, mark offer as completed
     if (offerId) {
@@ -793,6 +880,7 @@ stripeRoutes.post("/webhook", async (c) => {
         .from("offers")
         .update({ status: "completed" })
         .eq("id", offerId);
+      logger.info("stripe.offer_marked_completed", { offer_id: offerId });
     }
 
     // Create notification for seller
@@ -808,10 +896,15 @@ stripeRoutes.post("/webhook", async (c) => {
   // Handle payment_intent.payment_failed — log for debugging, no action needed
   if (event.type === "payment_intent.payment_failed") {
     const paymentIntent = event.data.object as Stripe.PaymentIntent;
-    console.error(
-      `Payment failed for intent ${paymentIntent.id}:`,
-      paymentIntent.last_payment_error?.message || "Unknown error"
-    );
+    logger.error("stripe.payment_failed", {
+      payment_intent_id: paymentIntent.id,
+      amount: paymentIntent.amount,
+      currency: paymentIntent.currency,
+      error_code: paymentIntent.last_payment_error?.code || null,
+      error_message: paymentIntent.last_payment_error?.message || "Unknown error",
+      buyer_email: paymentIntent.metadata?.buyer_email || null,
+      listing_id: paymentIntent.metadata?.listing_id || null,
+    });
   }
 
   return c.json({ received: true });

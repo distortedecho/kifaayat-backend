@@ -170,13 +170,6 @@ conversations.post("/", clerkMiddleware, async (c) => {
     return c.json({ error: "Listing not found" }, 404);
   }
 
-  if (listing.status !== "active" && listing.status !== "reserved") {
-    return c.json(
-      { error: "Cannot start a conversation on a listing that is not active" },
-      400
-    );
-  }
-
   // Buyer cannot be the seller
   if (listing.seller_id === profileId) {
     return c.json(
@@ -185,15 +178,23 @@ conversations.post("/", clerkMiddleware, async (c) => {
     );
   }
 
-  // DMs are restricted to post-purchase: buyer must have an order for this listing
-  // or listing must be sold/reserved to this buyer
+  // Check order first — post-purchase buyers can DM regardless of listing status
   const { count: orderCount } = await supabase
     .from("orders")
     .select("id", { count: "exact", head: true })
     .eq("listing_id", listing_id)
     .eq("buyer_id", profileId);
 
-  if (!orderCount || orderCount === 0) {
+  const hasPurchased = !!orderCount && orderCount > 0;
+
+  if (!hasPurchased) {
+    // Pre-purchase: listing must still be active
+    if (listing.status !== "active" && listing.status !== "reserved") {
+      return c.json(
+        { error: "Cannot start a conversation on a listing that is not active" },
+        400
+      );
+    }
     return c.json(
       {
         error: "Direct messages are only available after purchasing. Use public comments to ask the seller questions.",
