@@ -294,11 +294,16 @@ export function orderPaidNotification(
   listingTitle: string,
   amount: number,
   currency: string,
-  sellerPayout: number
+  sellerPayout: number,
+  shippingCost?: number
 ): NotificationTemplate {
+  const totalEarnings = sellerPayout + (shippingCost || 0);
+  const earningsText = shippingCost && shippingCost > 0
+    ? `${formatPrice(totalEarnings, currency)} (incl. ${formatPrice(shippingCost, currency)} shipping)`
+    : formatPrice(sellerPayout, currency);
   return {
     title: "You Made a Sale!",
-    body: `"${listingTitle}" was purchased for ${formatPrice(amount, currency)}. Ship it to earn ${formatPrice(sellerPayout, currency)}.`,
+    body: `"${listingTitle}" was purchased for ${formatPrice(amount, currency)}. Ship it to earn ${earningsText}.`,
   };
 }
 

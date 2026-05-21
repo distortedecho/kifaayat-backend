@@ -22,13 +22,7 @@ ALTER TABLE listings ADD COLUMN IF NOT EXISTS designer_name TEXT;
 ALTER TABLE listings ADD COLUMN IF NOT EXISTS is_known_designer BOOLEAN DEFAULT FALSE;
 ALTER TABLE listings ADD COLUMN IF NOT EXISTS designer_verification_url TEXT;
 ALTER TABLE listings ADD COLUMN IF NOT EXISTS country_of_origin TEXT;
-ALTER TABLE listings ADD COLUMN IF NOT EXISTS dry_cleaning_status TEXT
-  CHECK (dry_cleaning_status IN (
-    'Dry-cleaned less than 1 month ago',
-    'Dry-cleaned over 1 month ago',
-    'Pre-loved and not dry cleaned',
-    'New, therefore not dry cleaned'
-  ));
+ALTER TABLE listings ADD COLUMN IF NOT EXISTS dry_cleaning_status TEXT;
 ALTER TABLE listings ADD COLUMN IF NOT EXISTS alteration_room TEXT;
 ALTER TABLE listings ADD COLUMN IF NOT EXISTS fit_tips TEXT;
 ALTER TABLE listings ADD COLUMN IF NOT EXISTS fabric_types TEXT[] DEFAULT '{}';
@@ -38,12 +32,13 @@ ALTER TABLE listings ADD COLUMN IF NOT EXISTS items_included TEXT[] DEFAULT '{}'
 -- size_footwear). Collapsed into two columns here. Needs proper three-column
 -- approach before Sharetribe data migration can run.
 ALTER TABLE listings ADD COLUMN IF NOT EXISTS estimated_size TEXT;
-ALTER TABLE listings ADD COLUMN IF NOT EXISTS size_type TEXT CHECK (size_type IN ('womens', 'mens_kids', 'footwear'));
+ALTER TABLE listings ADD COLUMN IF NOT EXISTS size_type TEXT CHECK (size_type IN ('womens', 'mens_kids', 'menswear_kidswear', 'footwear'));
 ALTER TABLE listings ADD COLUMN IF NOT EXISTS video_url TEXT;
 ALTER TABLE listings ADD COLUMN IF NOT EXISTS video_storage_path TEXT;
 ALTER TABLE listings ADD COLUMN IF NOT EXISTS shipping_cost_amount INTEGER;
 ALTER TABLE listings ADD COLUMN IF NOT EXISTS free_shipping BOOLEAN DEFAULT FALSE;
 ALTER TABLE listings ADD COLUMN IF NOT EXISTS pickup_available BOOLEAN DEFAULT FALSE;
+ALTER TABLE listings ADD COLUMN IF NOT EXISTS pickup_location TEXT;
 ALTER TABLE listings ADD COLUMN IF NOT EXISTS international_shipping BOOLEAN DEFAULT FALSE;
 ALTER TABLE listings ADD COLUMN IF NOT EXISTS view_count INTEGER DEFAULT 0;
 ALTER TABLE listings ADD COLUMN IF NOT EXISTS save_count INTEGER DEFAULT 0;
@@ -75,6 +70,18 @@ ALTER TABLE profiles ADD COLUMN IF NOT EXISTS trust_tier_override INTEGER;
 ALTER TABLE profiles ADD COLUMN IF NOT EXISTS user_intents TEXT[] DEFAULT '{}';
 ALTER TABLE profiles ADD COLUMN IF NOT EXISTS wishlist_public BOOLEAN DEFAULT FALSE;
 ALTER TABLE profiles ADD COLUMN IF NOT EXISTS payout_method TEXT;
+
+-- -------------------------
+-- admin_settings
+-- -------------------------
+
+ALTER TABLE admin_settings ADD COLUMN IF NOT EXISTS tier_thresholds JSONB DEFAULT '{}';
+ALTER TABLE admin_settings ADD COLUMN IF NOT EXISTS tier_commission_rates JSONB DEFAULT '{}';
+ALTER TABLE admin_settings ADD COLUMN IF NOT EXISTS category_medians JSONB DEFAULT '{}';
+ALTER TABLE admin_settings ADD COLUMN IF NOT EXISTS boost_price_cents INTEGER;
+ALTER TABLE admin_settings ADD COLUMN IF NOT EXISTS boost_duration_days INTEGER;
+ALTER TABLE admin_settings ADD COLUMN IF NOT EXISTS notification_toggles JSONB DEFAULT '{}';
+ALTER TABLE admin_settings ADD COLUMN IF NOT EXISTS auto_approve_config JSONB DEFAULT '{}';
 
 -- -------------------------
 -- orders

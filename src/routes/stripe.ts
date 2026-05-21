@@ -790,10 +790,10 @@ stripeRoutes.post("/webhook", async (c) => {
       currency: paymentIntent.currency,
     });
 
-    // Fetch listing for seller_id and title
+    // Fetch listing for seller_id, title, and shipping cost
     const { data: listing } = await supabase
       .from("listings")
-      .select("id, seller_id, title")
+      .select("id, seller_id, title, shipping_cost_amount")
       .eq("id", listingId)
       .single();
 
@@ -884,7 +884,8 @@ stripeRoutes.post("/webhook", async (c) => {
     }
 
     // Create notification for seller
-    const paidTemplate = orderPaidNotification(listing.title, amount, currency, sellerPayout);
+    const shippingCost = (listing.shipping_cost_amount as number) || 0;
+    const paidTemplate = orderPaidNotification(listing.title, amount, currency, sellerPayout, shippingCost);
     await createNotification({
       user_id: listing.seller_id,
       type: "order_paid",

@@ -57,6 +57,7 @@ export const NOTIFICATION_TYPES = [
   "re_engagement",
   "account_suspended",
   "followed_seller_new_listing",
+  "listing_comment",
 ] as const;
 export type NotificationType = (typeof NOTIFICATION_TYPES)[number];
 

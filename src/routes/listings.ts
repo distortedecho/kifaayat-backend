@@ -10,9 +10,9 @@ import {
   LISTING_CONDITIONS,
   OCCASION_TAGS,
   REQUIRED_MEASUREMENTS,
-  FABRIC_TYPES,
-  WORK_TYPES,
-  DRY_CLEANING_STATUSES,
+  // FABRIC_TYPES,
+  // WORK_TYPES,
+  // DRY_CLEANING_STATUSES,
   COUNTRIES_OF_ORIGIN,
   type ListingCategory,
   type Measurements,
@@ -46,6 +46,7 @@ const createListingSchema = z.object({
       sleeve_length: z.string().optional(),
       chest: z.string().optional(),
       age_range: z.string().optional(),
+      height: z.string().optional(),
     })
     .optional(),
   occasion_tags: z
@@ -73,13 +74,16 @@ const createListingSchema = z.object({
   is_known_designer: z.boolean().optional(),
   designer_verification_url: z.string().url().optional(),
   country_of_origin: z.enum(COUNTRIES_OF_ORIGIN as unknown as [string, ...string[]]).optional(),
-  dry_cleaning_status: z.enum(DRY_CLEANING_STATUSES as unknown as [string, ...string[]]).optional(),
+  dry_cleaning_status: z.string().max(200).optional(),
   alteration_room: z.string().max(500).optional(),
   fit_tips: z.string().max(1000).optional(),
 
   // Shipping v2
   shipping_cost_amount: z.number().int().nonnegative().optional(),
   free_shipping: z.boolean().optional(),
+  pickup_available: z.boolean().optional(),
+  pickup_location: z.string().max(500).optional(),
+  international_shipping: z.boolean().optional(),
 
   // Video
   video_url: z.string().url().optional(),
@@ -100,6 +104,7 @@ const updateListingSchema = z.object({
       sleeve_length: z.string().optional(),
       chest: z.string().optional(),
       age_range: z.string().optional(),
+      height: z.string().optional(),
     })
     .optional(),
   occasion_tags: z
@@ -126,13 +131,16 @@ const updateListingSchema = z.object({
   is_known_designer: z.boolean().optional(),
   designer_verification_url: z.string().url().nullable().optional(),
   country_of_origin: z.enum(COUNTRIES_OF_ORIGIN as unknown as [string, ...string[]]).nullable().optional(),
-  dry_cleaning_status: z.enum(DRY_CLEANING_STATUSES as unknown as [string, ...string[]]).nullable().optional(),
+  dry_cleaning_status: z.string().max(200).nullable().optional(),
   alteration_room: z.string().max(500).nullable().optional(),
   fit_tips: z.string().max(1000).nullable().optional(),
 
   // Shipping v2
   shipping_cost_amount: z.number().int().nonnegative().nullable().optional(),
   free_shipping: z.boolean().optional(),
+  pickup_available: z.boolean().optional(),
+  pickup_location: z.string().max(500).nullable().optional(),
+  international_shipping: z.boolean().optional(),
 
   // Video
   video_url: z.string().url().nullable().optional(),
@@ -395,6 +403,9 @@ listings.post("/", clerkMiddleware, requireProfile, async (c) => {
       // Shipping v2
       shipping_cost_amount: input.shipping_cost_amount || null,
       free_shipping: input.free_shipping || false,
+      pickup_available: input.pickup_available || false,
+      pickup_location: input.pickup_location || null,
+      international_shipping: input.international_shipping || false,
 
       // Video
       video_url: input.video_url || null,
@@ -572,6 +583,9 @@ listings.put("/:id", clerkMiddleware, requireProfile, async (c) => {
   // Shipping v2
   if (input.shipping_cost_amount !== undefined) updateData.shipping_cost_amount = input.shipping_cost_amount;
   if (input.free_shipping !== undefined) updateData.free_shipping = input.free_shipping;
+  if (input.pickup_available !== undefined) updateData.pickup_available = input.pickup_available;
+  if (input.pickup_location !== undefined) updateData.pickup_location = input.pickup_location;
+  if (input.international_shipping !== undefined) updateData.international_shipping = input.international_shipping;
 
   // Video
   if (input.video_url !== undefined) updateData.video_url = input.video_url;
