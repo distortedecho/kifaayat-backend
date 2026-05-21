@@ -39,6 +39,8 @@ export const NOTIFICATION_CATEGORY_MAP: Record<string, NotificationCategory> = {
   offer_countered: 'transaction',
   offer_expired: 'transaction',
   order_paid: 'transaction',
+  order_accepted: 'transaction',
+  order_rejected: 'transaction',
   order_shipped: 'transaction',
   order_delivered: 'transaction',
   order_complete: 'transaction',
@@ -570,5 +572,26 @@ export function followedSellerNewListingNotification(
   return {
     title: `${sellerName} listed something new`,
     body: `Check out "${listingTitle}"`,
+  };
+}
+
+export function orderAcceptedNotification(
+  listingTitle: string
+): NotificationTemplate {
+  return {
+    title: "Order Accepted!",
+    body: `The seller has accepted your order for "${listingTitle}". It will be shipped soon.`,
+  };
+}
+
+export function orderRejectedNotification(
+  listingTitle: string,
+  reason?: string
+): NotificationTemplate {
+  return {
+    title: "Order Cancelled",
+    body: reason
+      ? `Your order for "${listingTitle}" was cancelled. Reason: ${reason}. A refund has been issued.`
+      : `Your order for "${listingTitle}" was cancelled and a refund has been issued.`,
   };
 }

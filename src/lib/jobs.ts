@@ -17,7 +17,7 @@
 import PgBoss from "pg-boss";
 import { createNotification } from "./notifications.js";
 import { sendEmail } from "./email.js";
-import { runAutoCompleteOrders, runIsoMatchingRefresh } from "./cron.js";
+import { runAutoCompleteOrders, runIsoMatchingRefresh, autoRejectOrder } from "./cron.js";
 import { matchISOPost } from "../routes/ai.js";
 import { logger } from "./logger.js";
 
@@ -29,6 +29,7 @@ export const JOB_SEND_EMAIL = "send-email";
 export const JOB_PROCESS_ISO_MATCH = "process-iso-match";
 export const JOB_AUTO_COMPLETE_ORDERS = "auto-complete-orders";
 export const JOB_ISO_MATCHING_REFRESH = "iso-matching-refresh";
+export const JOB_AUTO_REJECT_ORDER = "auto-reject-order";
 
 // ------------------------------------------------------------
 // Job payload types
@@ -49,6 +50,10 @@ export interface SendEmailJobData {
 
 export interface ProcessIsoMatchJobData {
   isoPostId: string;
+}
+
+export interface AutoRejectOrderJobData {
+  orderId: string;
 }
 
 // ------------------------------------------------------------
@@ -178,6 +183,25 @@ export async function initJobQueue(): Promise<void> {
     await runIsoMatchingRefresh();
   });
 
+  await boss.work<AutoRejectOrderJobData>(
+    JOB_AUTO_REJECT_ORDER,
+    { batchSize: 1 },
+    async (jobs) => {
+      for (const job of jobs) {
+        try {
+          await autoRejectOrder(job.data.orderId);
+        } catch (err) {
+          logger.error("jobs.auto_reject_order_failed", {
+            jobId: job.id,
+            orderId: job.data.orderId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+          throw err;
+        }
+      }
+    }
+  );
+
   logger.info("jobs.workers_registered");
 }
 
@@ -224,6 +248,32 @@ export async function enqueue<T extends object>(
     return id;
   } catch (err) {
     logger.error("jobs.enqueue_failed", {
+      job: name,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return null;
+  }
+}
+
+/**
+ * Enqueue a background job to run after a delay.
+ * startAfterSeconds: seconds from now before the job becomes eligible.
+ */
+export async function enqueueDelayed<T extends object>(
+  name: string,
+  data: T,
+  startAfterSeconds: number
+): Promise<string | null> {
+  const boss = getBossInstance();
+  if (!boss || !_started) {
+    return null;
+  }
+  try {
+    const startAfter = new Date(Date.now() + startAfterSeconds * 1000);
+    const id = await boss.send(name, data, { startAfter });
+    return id;
+  } catch (err) {
+    logger.error("jobs.enqueue_delayed_failed", {
       job: name,
       error: err instanceof Error ? err.message : String(err),
     });

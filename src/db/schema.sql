@@ -557,7 +557,7 @@ CREATE TABLE IF NOT EXISTS notifications (
   user_id UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
   type TEXT NOT NULL CHECK (type IN (
     'offer_received', 'offer_accepted', 'offer_declined', 'offer_countered', 'offer_expired',
-    'order_paid', 'order_shipped', 'order_delivered', 'order_complete',
+    'order_paid', 'order_accepted', 'order_rejected', 'order_shipped', 'order_delivered', 'order_complete',
     'listing_approved', 'listing_rejected',
     'review_reminder', 'review_revealed',
     'tier_upgrade', 'tier_downgrade',

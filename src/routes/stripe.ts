@@ -14,19 +14,8 @@ import { getCommissionRate, getSellerCommissionRate } from "../lib/commission.js
 import type { StripeAccountStatus, StripeStatusResponse } from "../types/stripe.js";
 import { redeemCredits } from "../lib/referrals.js";
 import { logger } from "../lib/logger.js";
-
-let _stripe: Stripe | null = null;
-
-function getStripe(): Stripe {
-  if (!_stripe) {
-    const key = process.env.STRIPE_SECRET_KEY;
-    if (!key) {
-      throw new Error("STRIPE_SECRET_KEY is not set");
-    }
-    _stripe = new Stripe(key, { apiVersion: "2026-02-25.clover" });
-  }
-  return _stripe;
-}
+import { getStripe } from "../lib/stripeClient.js";
+import { enqueueDelayed, JOB_AUTO_REJECT_ORDER } from "../lib/jobs.js";
 
 const stripeRoutes = new Hono();
 
@@ -649,6 +638,8 @@ stripeRoutes.post("/webhook", async (c) => {
         return c.json({ received: true });
       }
 
+      const cartSellerDeadlineAt = new Date(Date.now() + 48 * 60 * 60 * 1000);
+
       for (const group of sellerGroups) {
         // 1. Create order for this seller group
         const orderNumber = generateOrderNumber();
@@ -678,6 +669,7 @@ stripeRoutes.post("/webhook", async (c) => {
             buyer_email: metadata.buyer_email || "",
             stripe_payment_intent_id: paymentIntent.id,
             status: "paid" as OrderStatus,
+            seller_deadline_at: cartSellerDeadlineAt.toISOString(),
           })
           .select()
           .single();
@@ -696,13 +688,13 @@ stripeRoutes.post("/webhook", async (c) => {
           seller_id: group.seller_id,
         });
 
-        // 2. Mark all group listings as 'sold'
+        // 2. Mark all group listings as 'reserved' (seller must accept before shipping)
         await supabase
           .from("listings")
-          .update({ status: "sold" })
+          .update({ status: "reserved" })
           .in("id", group.listing_ids);
 
-        logger.info("stripe.listings_marked_sold", { listing_ids: group.listing_ids });
+        logger.info("stripe.listings_marked_reserved", { listing_ids: group.listing_ids });
 
         // 3. Create Stripe Transfer to seller
         if (group.stripe_account_id) {
@@ -733,7 +725,7 @@ stripeRoutes.post("/webhook", async (c) => {
           }
         }
 
-        // 4. Send notification to seller
+        // 4. Send notification to seller + enqueue auto-reject job
         if (order) {
           const paidTemplate = orderPaidNotification(
             `Order #${orderNumber}`,
@@ -747,6 +739,10 @@ stripeRoutes.post("/webhook", async (c) => {
             ...paidTemplate,
             data: { order_id: order.id },
           });
+
+          enqueueDelayed(JOB_AUTO_REJECT_ORDER, { orderId: order.id }, 48 * 60 * 60).catch(
+            (err) => console.error("Failed to enqueue cart auto-reject job:", err)
+          );
         }
       }
 
@@ -833,6 +829,9 @@ stripeRoutes.post("/webhook", async (c) => {
       offer_id: offerId,
     });
 
+    // Seller has 48h to accept; enqueue auto-reject job at that deadline
+    const sellerDeadlineAt = new Date(Date.now() + 48 * 60 * 60 * 1000);
+
     // Create order
     const { data: order, error: insertError } = await supabase
       .from("orders")
@@ -850,6 +849,7 @@ stripeRoutes.post("/webhook", async (c) => {
         seller_payout: sellerPayout,
         stripe_payment_intent_id: paymentIntent.id,
         status: "paid" as OrderStatus,
+        seller_deadline_at: sellerDeadlineAt.toISOString(),
       })
       .select()
       .single();
@@ -866,13 +866,20 @@ stripeRoutes.post("/webhook", async (c) => {
       seller_id: listing.seller_id,
     });
 
-    // Transition listing to 'sold'
+    // Transition listing to 'reserved' (seller must accept before shipping)
     await supabase
       .from("listings")
-      .update({ status: "sold" })
+      .update({ status: "reserved" })
       .eq("id", listingId);
 
-    logger.info("stripe.listing_marked_sold", { listing_id: listingId });
+    logger.info("stripe.listing_marked_reserved", { listing_id: listingId });
+
+    // Enqueue delayed auto-reject job (fires in 48h if seller hasn't responded)
+    if (order) {
+      enqueueDelayed(JOB_AUTO_REJECT_ORDER, { orderId: order.id }, 48 * 60 * 60).catch(
+        (err) => console.error("Failed to enqueue auto-reject job:", err)
+      );
+    }
 
     // If offer_id, mark offer as completed
     if (offerId) {

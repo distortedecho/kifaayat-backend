@@ -10,6 +10,8 @@ import {
   orderDeliveredNotification,
   orderCompleteNotification,
   orderAutoCompleteNotification,
+  orderAcceptedNotification,
+  orderRejectedNotification,
 } from "../lib/notifications.js";
 import {
   type OrderStatus,
@@ -19,6 +21,7 @@ import {
 } from "../types/transactions.js";
 import { isFirstCompletedOrder, awardReferralCredits } from "../lib/referrals.js";
 import { createOrder, OrderServiceError } from "../services/orderService.js";
+import { getStripe } from "../lib/stripeClient.js";
 
 const orders = new Hono();
 
@@ -157,6 +160,9 @@ orders.get("/mine", clerkMiddleware, requireProfile, async (c) => {
       delivered_at: row.delivered_at as string | null,
       completed_at: row.completed_at as string | null,
       auto_complete_at: row.auto_complete_at as string | null,
+      seller_deadline_at: row.seller_deadline_at as string | null,
+      seller_accepted_at: row.seller_accepted_at as string | null,
+      seller_rejection_reason: row.seller_rejection_reason as string | null,
       created_at: row.created_at as string,
       updated_at: row.updated_at as string,
       listing_title: listing ? (listing.title as string) : "",
@@ -245,6 +251,9 @@ orders.get("/sales", clerkMiddleware, requireProfile, async (c) => {
       delivered_at: row.delivered_at as string | null,
       completed_at: row.completed_at as string | null,
       auto_complete_at: row.auto_complete_at as string | null,
+      seller_deadline_at: row.seller_deadline_at as string | null,
+      seller_accepted_at: row.seller_accepted_at as string | null,
+      seller_rejection_reason: row.seller_rejection_reason as string | null,
       created_at: row.created_at as string,
       updated_at: row.updated_at as string,
       listing_title: listing ? (listing.title as string) : "",
@@ -344,6 +353,11 @@ orders.patch("/:id/ship", clerkMiddleware, requireProfile, async (c) => {
     return c.json({ error: "Only the seller can ship this order" }, 403);
   }
 
+  // Seller must have accepted before shipping
+  if (!order.seller_accepted_at) {
+    return c.json({ error: "You must accept the order before marking it as shipped" }, 400);
+  }
+
   // Calculate auto-complete date (7 days from now)
   const autoCompleteAt = new Date();
   autoCompleteAt.setDate(autoCompleteAt.getDate() + AUTO_COMPLETE_DAYS);
@@ -366,6 +380,12 @@ orders.patch("/:id/ship", clerkMiddleware, requireProfile, async (c) => {
     console.error("Error shipping order:", updateError);
     return c.json({ error: "Failed to update order" }, 500);
   }
+
+  // Mark listing as sold now that it has physically shipped
+  await supabase
+    .from("listings")
+    .update({ status: "sold" })
+    .eq("id", order.listing_id);
 
   // Notify buyer
   if (order.buyer_id) {
@@ -555,6 +575,154 @@ orders.patch("/:id/complete", clerkMiddleware, requireProfile, async (c) => {
         console.error("Error processing referral credit:", err);
       }
     })();
+  }
+
+  return c.json({ order: updatedOrder });
+});
+
+/**
+ * POST /api/orders/:id/accept
+ * Seller accepts a paid order. Sets seller_accepted_at, notifies buyer.
+ * No status change — listing stays reserved, order stays paid.
+ */
+orders.post("/:id/accept", clerkMiddleware, requireProfile, async (c) => {
+  const orderId = c.req.param("id");
+  const profile = c.get("profile");
+  const supabase = createSupabaseAdmin();
+
+  if (!UUID_REGEX.test(orderId)) {
+    return c.json({ error: "Invalid order ID format" }, 400);
+  }
+
+  const { data: order, error: fetchError } = await supabase
+    .from("orders")
+    .select("*, listings!orders_listing_id_fkey(title)")
+    .eq("id", orderId)
+    .single();
+
+  if (fetchError || !order) {
+    return c.json({ error: "Order not found" }, 404);
+  }
+
+  if (order.seller_id !== profile.id) {
+    return c.json({ error: "Only the seller can accept this order" }, 403);
+  }
+
+  if (order.status !== "paid") {
+    return c.json({ error: `Cannot accept order with status '${order.status}'` }, 400);
+  }
+
+  if (order.seller_accepted_at) {
+    return c.json({ error: "Order already accepted" }, 400);
+  }
+
+  const { data: updatedOrder, error: updateError } = await supabase
+    .from("orders")
+    .update({ seller_accepted_at: new Date().toISOString() })
+    .eq("id", orderId)
+    .select()
+    .single();
+
+  if (updateError) {
+    console.error("Error accepting order:", updateError);
+    return c.json({ error: "Failed to accept order" }, 500);
+  }
+
+  // Notify buyer
+  if (order.buyer_id) {
+    const listing = order.listings as Record<string, unknown>;
+    await createNotification({
+      user_id: order.buyer_id,
+      type: "order_accepted",
+      ...orderAcceptedNotification(listing.title as string),
+      data: { order_id: orderId, listing_id: order.listing_id },
+    });
+  }
+
+  return c.json({ order: updatedOrder });
+});
+
+const rejectOrderSchema = z.object({
+  reason: z.string().max(500).optional(),
+});
+
+/**
+ * POST /api/orders/:id/reject
+ * Seller rejects a paid order. Listing → active, order → cancelled, Stripe refund, buyer notified.
+ */
+orders.post("/:id/reject", clerkMiddleware, requireProfile, async (c) => {
+  const orderId = c.req.param("id");
+  const profile = c.get("profile");
+  const supabase = createSupabaseAdmin();
+
+  if (!UUID_REGEX.test(orderId)) {
+    return c.json({ error: "Invalid order ID format" }, 400);
+  }
+
+  const body = await c.req.json();
+  const parsed = rejectOrderSchema.safeParse(body);
+  if (!parsed.success) {
+    return c.json({ error: "Validation failed", details: parsed.error.flatten().fieldErrors }, 400);
+  }
+  const { reason } = parsed.data;
+
+  const { data: order, error: fetchError } = await supabase
+    .from("orders")
+    .select("*, listings!orders_listing_id_fkey(title)")
+    .eq("id", orderId)
+    .single();
+
+  if (fetchError || !order) {
+    return c.json({ error: "Order not found" }, 404);
+  }
+
+  if (order.seller_id !== profile.id) {
+    return c.json({ error: "Only the seller can reject this order" }, 403);
+  }
+
+  if (order.status !== "paid") {
+    return c.json({ error: `Cannot reject order with status '${order.status}'` }, 400);
+  }
+
+  // Restore listing to active
+  await supabase
+    .from("listings")
+    .update({ status: "active" })
+    .eq("id", order.listing_id);
+
+  // Cancel order
+  const { data: updatedOrder, error: updateError } = await supabase
+    .from("orders")
+    .update({
+      status: "cancelled" as OrderStatus,
+      seller_rejection_reason: reason || null,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", orderId)
+    .select()
+    .single();
+
+  if (updateError) {
+    console.error("Error rejecting order:", updateError);
+    return c.json({ error: "Failed to reject order" }, 500);
+  }
+
+  // Attempt Stripe refund (fire-and-forget)
+  if (order.stripe_payment_intent_id) {
+    getStripe().refunds.create({ payment_intent: order.stripe_payment_intent_id }).catch(
+      (err) => console.error(`Stripe refund failed for order ${orderId}:`, err)
+    );
+  }
+
+  // Notify buyer
+  if (order.buyer_id) {
+    const listing = order.listings as Record<string, unknown>;
+    await createNotification({
+      user_id: order.buyer_id,
+      type: "order_rejected",
+      ...orderRejectedNotification(listing.title as string, reason),
+      data: { order_id: orderId, listing_id: order.listing_id },
+    });
   }
 
   return c.json({ order: updatedOrder });

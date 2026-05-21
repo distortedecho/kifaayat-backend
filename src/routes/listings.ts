@@ -446,14 +446,35 @@ listings.get("/:id", optionalClerkMiddleware, async (c) => {
     return c.json({ error: "Listing not found" }, 404);
   }
 
-  // If listing is not active, only the seller can view it
+  // If listing is not active, only the seller can view it —
+  // exception: buyer with an active paid order on a reserved listing can also view it.
   if (listing.status !== "active") {
     const clerkUserId = c.get("clerkUserId");
     if (!clerkUserId) {
       return c.json({ error: "Listing not found" }, 404);
     }
     const profile = await getProfileByClerkId(clerkUserId);
-    if (!profile || profile.id !== listing.seller_id) {
+    if (!profile) {
+      return c.json({ error: "Listing not found" }, 404);
+    }
+
+    const isSeller = profile.id === listing.seller_id;
+
+    // Allow buyer viewing a reserved listing they have a paid order for
+    let isBuyerWithOrder = false;
+    if (!isSeller && listing.status === "reserved") {
+      const { data: buyerOrder } = await createSupabaseAdmin()
+        .from("orders")
+        .select("id")
+        .eq("listing_id", listingId)
+        .eq("buyer_id", profile.id)
+        .eq("status", "paid")
+        .limit(1)
+        .single();
+      isBuyerWithOrder = !!buyerOrder;
+    }
+
+    if (!isSeller && !isBuyerWithOrder) {
       return c.json({ error: "Listing not found" }, 404);
     }
   }

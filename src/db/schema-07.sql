@@ -88,6 +88,9 @@ ALTER TABLE admin_settings ADD COLUMN IF NOT EXISTS auto_approve_config JSONB DE
 -- -------------------------
 
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS total_amount INTEGER;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS seller_deadline_at TIMESTAMPTZ;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS seller_accepted_at TIMESTAMPTZ;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS seller_rejection_reason TEXT;
 
 -- -------------------------
 -- messages

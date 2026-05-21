@@ -31,6 +31,8 @@ export const NOTIFICATION_TYPES = [
   "offer_countered",
   "offer_expired",
   "order_paid",
+  "order_accepted",
+  "order_rejected",
   "order_shipped",
   "order_delivered",
   "order_complete",
@@ -102,6 +104,9 @@ export interface Order {
   delivered_at: string | null;
   completed_at: string | null;
   auto_complete_at: string | null;
+  seller_deadline_at: string | null;
+  seller_accepted_at: string | null;
+  seller_rejection_reason: string | null;
   created_at: string;
   updated_at: string;
 }

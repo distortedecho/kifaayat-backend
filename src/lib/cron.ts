@@ -16,8 +16,10 @@ import {
   createNotification,
   isoMatchFoundNotification,
   orderAutoCompleteNotification,
+  orderRejectedNotification,
 } from "./notifications.js";
 import { matchISOPost } from "../routes/ai.js";
+import { getStripe } from "./stripeClient.js";
 
 /**
  * Auto-complete delivered orders that have sat in "delivered" state
@@ -99,6 +101,90 @@ export async function runAutoCompleteOrders(): Promise<void> {
     }
   } catch (err) {
     console.error("[job] runAutoCompleteOrders failed:", err);
+  }
+}
+
+/**
+ * Auto-reject a single order if the seller has not accepted within the deadline.
+ * Fired by a pg-boss delayed job enqueued at payment time (48h delay).
+ * Idempotent: skips if the order is no longer in 'paid' state or if seller already accepted.
+ */
+export async function autoRejectOrder(orderId: string): Promise<void> {
+  console.log(`[job] autoRejectOrder start: orderId=${orderId}`);
+  try {
+    const supabase = createSupabaseAdmin();
+
+    const { data: order, error } = await supabase
+      .from("orders")
+      .select(
+        "id, status, seller_accepted_at, listing_id, buyer_id, seller_id, stripe_payment_intent_id, listings!orders_listing_id_fkey(title)"
+      )
+      .eq("id", orderId)
+      .single();
+
+    if (error || !order) {
+      console.error(`[job] autoRejectOrder: order ${orderId} not found`);
+      return;
+    }
+
+    // Skip if seller already acted (accepted or rejected)
+    if (order.status !== "paid" || order.seller_accepted_at) {
+      console.log(
+        `[job] autoRejectOrder: order ${orderId} skipped (status=${order.status}, accepted=${!!order.seller_accepted_at})`
+      );
+      return;
+    }
+
+    const listingRaw = order.listings as unknown;
+    const listing = Array.isArray(listingRaw)
+      ? (listingRaw[0] as Record<string, unknown> | undefined)
+      : (listingRaw as Record<string, unknown> | null);
+    const listingTitle = listing ? (listing.title as string) : "your item";
+
+    // Restore listing to active
+    await supabase
+      .from("listings")
+      .update({ status: "active", updated_at: new Date().toISOString() })
+      .eq("id", order.listing_id as string);
+
+    // Cancel order
+    await supabase
+      .from("orders")
+      .update({
+        status: "cancelled",
+        seller_rejection_reason: "Seller did not respond within 48 hours",
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", orderId);
+
+    // Attempt Stripe refund (fire-and-forget, log on failure)
+    if (order.stripe_payment_intent_id) {
+      try {
+        await getStripe().refunds.create({
+          payment_intent: order.stripe_payment_intent_id as string,
+        });
+        console.log(`[job] autoRejectOrder: refund issued for order ${orderId}`);
+      } catch (refundErr) {
+        console.error(
+          `[job] autoRejectOrder: Stripe refund failed for order ${orderId}:`,
+          refundErr
+        );
+      }
+    }
+
+    // Notify buyer
+    if (order.buyer_id) {
+      await createNotification({
+        user_id: order.buyer_id as string,
+        type: "order_rejected",
+        ...orderRejectedNotification(listingTitle),
+        data: { order_id: orderId, listing_id: order.listing_id, auto_rejected: true },
+      });
+    }
+
+    console.log(`[job] autoRejectOrder complete: orderId=${orderId}`);
+  } catch (err) {
+    console.error(`[job] autoRejectOrder failed: orderId=${orderId}`, err);
   }
 }
 
