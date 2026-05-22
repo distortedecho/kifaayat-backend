@@ -97,14 +97,13 @@ async function sendPush(params: SendPushParams): Promise<void> {
   const restApiKey = process.env.ONESIGNAL_REST_API_KEY;
 
   if (!appId || !restApiKey) {
-    // OneSignal not configured -- skip push silently
+    console.log("[push] skipped: OneSignal env vars not set", { userId: params.userId, title: params.title });
     return;
   }
 
   try {
     const supabase = createSupabaseAdmin();
 
-    // Look up user's OneSignal player ID
     const { data: profile } = await supabase
       .from("profiles")
       .select("onesignal_player_id")
@@ -113,9 +112,11 @@ async function sendPush(params: SendPushParams): Promise<void> {
 
     const playerId = profile?.onesignal_player_id;
     if (!playerId) {
-      // User hasn't granted push permission -- skip silently
+      console.log("[push] skipped: no onesignal_player_id on profile", { userId: params.userId, title: params.title });
       return;
     }
+
+    console.log("[push] sending", { userId: params.userId, playerId, title: params.title });
 
     const response = await fetch(ONESIGNAL_API_URL, {
       method: "POST",
@@ -132,9 +133,10 @@ async function sendPush(params: SendPushParams): Promise<void> {
       }),
     });
 
+    const responseBody = await response.text();
+    console.log("[push] OneSignal response:", response.status, responseBody);
     if (!response.ok) {
-      const errorBody = await response.text();
-      console.error("OneSignal push failed:", response.status, errorBody);
+      console.error("OneSignal push failed:", response.status, responseBody);
     }
   } catch (error) {
     console.error("Error sending push notification:", error);
