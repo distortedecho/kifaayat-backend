@@ -81,6 +81,7 @@ const defaultAllowedOrigins = [
   "http://localhost:5173",
   "http://localhost:8080",
   "https://kifaayat-admin.vercel.app",
+  "https://kifaayat-admin-liart.vercel.app",
 ];
 
 const allowedOrigins = Array.from(

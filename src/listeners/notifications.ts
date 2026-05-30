@@ -29,8 +29,8 @@ import {
 
 async function dispatchNotification(data: SendNotificationJobData): Promise<void> {
   if (isJobQueueReady()) {
-    await enqueue(JOB_SEND_NOTIFICATION, data);
-    return;
+    const id = await enqueue(JOB_SEND_NOTIFICATION, data);
+    if (id !== null) return;
   }
   await createNotification({
     user_id: data.user_id,

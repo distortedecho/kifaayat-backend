@@ -90,6 +90,36 @@ orders.post("/", idempotencyMiddleware, optionalClerkMiddleware, async (c) => {
 });
 
 /**
+ * GET /api/orders/count
+ * Returns the buyer's total and completed order counts.
+ * Used by the frontend to determine first-time buyer status for welcome discounts.
+ */
+orders.get("/count", clerkMiddleware, requireProfile, async (c) => {
+  const profile = c.get("profile");
+  const supabase = createSupabaseAdmin();
+
+  const [{ count: total, error: totalError }, { count: completed, error: completedError }] =
+    await Promise.all([
+      supabase
+        .from("orders")
+        .select("id", { count: "exact", head: true })
+        .eq("buyer_id", profile.id),
+      supabase
+        .from("orders")
+        .select("id", { count: "exact", head: true })
+        .eq("buyer_id", profile.id)
+        .eq("status", "complete"),
+    ]);
+
+  if (totalError || completedError) {
+    console.error("Error fetching order count:", totalError || completedError);
+    return c.json({ error: "Failed to fetch order count" }, 500);
+  }
+
+  return c.json({ total: total ?? 0, completed: completed ?? 0 });
+});
+
+/**
  * GET /api/orders/mine
  * Buyer's order history. Cursor-paginated on created_at (default limit 20).
  * Query params: ?cursor=<ISO>&limit=<n>

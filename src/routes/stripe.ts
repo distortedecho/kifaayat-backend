@@ -12,7 +12,7 @@ import {
 } from "../types/transactions.js";
 import { getCommissionRate, getSellerCommissionRate } from "../lib/commission.js";
 import type { StripeAccountStatus, StripeStatusResponse } from "../types/stripe.js";
-import { redeemCredits } from "../lib/referrals.js";
+import { redeemCredits, recordReferralAndAwardVoucher } from "../lib/referrals.js";
 import { logger } from "../lib/logger.js";
 import { getStripe } from "../lib/stripeClient.js";
 import { enqueueDelayed, JOB_AUTO_REJECT_ORDER } from "../lib/jobs.js";
@@ -37,6 +37,8 @@ const paymentIntentSchema = z.object({
   listing_id: z.string().uuid("listing_id must be a valid UUID"),
   buyer_email: z.string().email("buyer_email must be a valid email").optional(),
   offer_id: z.string().uuid("offer_id must be a valid UUID").optional(),
+  referral_code: z.string().max(20).optional(),
+  voucher_id: z.string().uuid("voucher_id must be a valid UUID").optional(),
 });
 
 const boostPaymentIntentSchema = z.object({
@@ -188,7 +190,7 @@ stripeRoutes.post("/payment-intent", optionalClerkMiddleware, async (c) => {
     );
   }
 
-  const { listing_id, offer_id } = parsed.data;
+  const { listing_id, offer_id, referral_code, voucher_id } = parsed.data;
   let buyer_email = parsed.data.buyer_email;
 
   // Resolve buyer identity
@@ -238,6 +240,34 @@ stripeRoutes.post("/payment-intent", optionalClerkMiddleware, async (c) => {
     return c.json({ error: "You cannot buy your own listing" }, 400);
   }
 
+  // Validate referral_code if provided
+  if (referral_code) {
+    const normalizedCode = referral_code.toUpperCase().trim();
+    const { data: codeRow } = await supabase
+      .from("referral_codes")
+      .select("id, user_id, disabled")
+      .eq("code", normalizedCode)
+      .single();
+    if (!codeRow || codeRow.disabled) {
+      return c.json({ error: "Invalid or disabled referral code" }, 400);
+    }
+    if (buyerProfileId && codeRow.user_id === buyerProfileId) {
+      return c.json({ error: "You cannot use your own referral code" }, 400);
+    }
+  }
+
+  // Validate voucher_id if provided
+  if (voucher_id && buyerProfileId) {
+    const { data: voucher } = await supabase
+      .from("referral_vouchers")
+      .select("id, user_id, status")
+      .eq("id", voucher_id)
+      .single();
+    if (!voucher || voucher.user_id !== buyerProfileId || voucher.status !== "available") {
+      return c.json({ error: "Invalid or already used voucher" }, 400);
+    }
+  }
+
   // Determine payment amount (offer amount or listing price)
   let paymentAmount = listing.price_amount;
   if (offer_id) {
@@ -277,6 +307,8 @@ stripeRoutes.post("/payment-intent", optionalClerkMiddleware, async (c) => {
       buyer_email: buyer_email || "",
       buyer_profile_id: buyerProfileId || "",
       offer_id: offer_id || "",
+      referral_code: referral_code ? referral_code.toUpperCase().trim() : "",
+      voucher_id: voucher_id || "",
     },
   };
 
@@ -899,6 +931,27 @@ stripeRoutes.post("/webhook", async (c) => {
       ...paidTemplate,
       data: { listing_id: listingId, order_id: order.id },
     });
+
+    // Record referral and award voucher to referrer if a referral code was used
+    const referralCode = metadata.referral_code;
+    if (referralCode && buyerProfileId) {
+      await recordReferralAndAwardVoucher({
+        supabase,
+        referralCode,
+        buyerId: buyerProfileId,
+        orderId: order.id,
+      }).catch((err: unknown) => console.error("Error recording referral:", err));
+    }
+
+    // Mark voucher as used if buyer applied one
+    const usedVoucherId = metadata.voucher_id;
+    if (usedVoucherId) {
+      await supabase
+        .from("referral_vouchers")
+        .update({ status: "used", used_order_id: order.id, used_at: new Date().toISOString() })
+        .eq("id", usedVoucherId)
+        .eq("status", "available");
+    }
   }
 
   // Handle payment_intent.payment_failed — log for debugging, no action needed

@@ -84,6 +84,36 @@ ALTER TABLE admin_settings ADD COLUMN IF NOT EXISTS notification_toggles JSONB D
 ALTER TABLE admin_settings ADD COLUMN IF NOT EXISTS auto_approve_config JSONB DEFAULT '{}';
 
 -- -------------------------
+-- offers
+-- -------------------------
+
+ALTER TABLE offers ADD COLUMN IF NOT EXISTS message TEXT;
+
+-- -------------------------
+-- referral_vouchers
+-- -------------------------
+
+CREATE TABLE IF NOT EXISTS referral_vouchers (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+  referred_id UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+  referral_id UUID REFERENCES referrals(id) ON DELETE SET NULL,
+  status TEXT NOT NULL DEFAULT 'available' CHECK (status IN ('available', 'used')),
+  used_order_id UUID REFERENCES orders(id) ON DELETE SET NULL,
+  used_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_referral_vouchers_user_id ON referral_vouchers(user_id);
+CREATE INDEX IF NOT EXISTS idx_referral_vouchers_status ON referral_vouchers(status);
+
+ALTER TABLE referral_vouchers ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Users can read own referral vouchers"
+  ON referral_vouchers FOR SELECT
+  USING (user_id IN (SELECT id FROM profiles WHERE clerk_id = current_setting('request.jwt.claims', true)::json->>'sub'));
+
+-- -------------------------
 -- orders
 -- -------------------------
 

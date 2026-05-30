@@ -423,8 +423,8 @@ export function referralCreditEarnedNotification(
   referredName: string
 ): NotificationTemplate {
   return {
-    title: "You earned $10!",
-    body: `${referredName} made their first purchase. $10 credit added to your account!`,
+    title: "You received a new voucher!",
+    body: `${referredName} made a purchase using your referral code. You've earned a new voucher!`,
   };
 }
 

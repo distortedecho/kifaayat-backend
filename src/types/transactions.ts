@@ -77,6 +77,7 @@ export interface Offer {
   status: OfferStatus;
   round: number;
   parent_offer_id: string | null;
+  message?: string | null;
   expires_at: string | null;
   created_at: string;
   updated_at: string;

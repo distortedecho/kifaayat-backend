@@ -31,6 +31,7 @@ const createOfferSchema = z.object({
 
 const counterOfferSchema = z.object({
   amount: z.number().int().positive("Amount must be a positive integer (in cents)"),
+  message: z.string().max(500).optional(),
 });
 
 // ============================================================
@@ -214,6 +215,7 @@ offers.get("/mine", clerkMiddleware, requireProfile, async (c) => {
       status: row.status as OfferStatus,
       round: row.round as number,
       parent_offer_id: row.parent_offer_id as string | null,
+      message: row.message as string | null,
       expires_at: row.expires_at as string | null,
       created_at: row.created_at as string,
       updated_at: row.updated_at as string,
@@ -292,6 +294,7 @@ offers.get("/received", clerkMiddleware, requireProfile, async (c) => {
       status: row.status as OfferStatus,
       round: row.round as number,
       parent_offer_id: row.parent_offer_id as string | null,
+      message: row.message as string | null,
       expires_at: row.expires_at as string | null,
       created_at: row.created_at as string,
       updated_at: row.updated_at as string,
@@ -414,7 +417,7 @@ offers.post("/:id/counter", clerkMiddleware, requireProfile, async (c) => {
     );
   }
 
-  const { amount: counterAmount } = parsed.data;
+  const { amount: counterAmount, message: counterMessage } = parsed.data;
 
   // Fetch the offer
   const { data: offer, error: fetchError } = await supabase
@@ -485,6 +488,7 @@ offers.post("/:id/counter", clerkMiddleware, requireProfile, async (c) => {
       status: "pending" as OfferStatus,
       round: offer.round + 1,
       parent_offer_id: offerId,
+      message: counterMessage || null,
       expires_at: expiresAt.toISOString(),
     })
     .select()

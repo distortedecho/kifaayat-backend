@@ -1,5 +1,6 @@
 import { createSupabaseAdmin } from "./supabase.js";
 import { createNotification, referralCreditEarnedNotification } from "./notifications.js";
+import type { SupabaseClient } from "@supabase/supabase-js";
 
 // ============================================================
 // Constants
@@ -230,4 +231,91 @@ export async function awardReferralCredits(params: {
   }).catch((err) => {
     console.error("Error sending referral credit notification:", err);
   });
+}
+
+/** Max number of successful referrals a user can make */
+export const MAX_REFERRALS = 20;
+
+/**
+ * Record a referral from a checkout and award a voucher to the referrer.
+ * Called from the Stripe webhook after payment_intent.succeeded.
+ * Guards: duplicate referral, self-referral, max cap, invalid/disabled code.
+ */
+export async function recordReferralAndAwardVoucher(params: {
+  supabase: SupabaseClient;
+  referralCode: string;
+  buyerId: string;
+  orderId: string;
+}): Promise<void> {
+  const { supabase, referralCode, buyerId, orderId } = params;
+
+  // Look up the referral code
+  const { data: codeRow } = await supabase
+    .from("referral_codes")
+    .select("id, user_id, disabled")
+    .eq("code", referralCode)
+    .single();
+
+  if (!codeRow || codeRow.disabled) return;
+  if (codeRow.user_id === buyerId) return; // self-referral guard
+
+  const referrerId = codeRow.user_id;
+
+  // Guard: buyer already has a referral recorded
+  const { data: existingReferral } = await supabase
+    .from("referrals")
+    .select("id")
+    .eq("referred_id", buyerId)
+    .single();
+  if (existingReferral) return;
+
+  // Guard: referrer has already hit the 20-referral cap
+  const { count } = await supabase
+    .from("referrals")
+    .select("id", { count: "exact", head: true })
+    .eq("referrer_id", referrerId);
+  if ((count ?? 0) >= MAX_REFERRALS) return;
+
+  // Insert referral record
+  const { data: referral, error: referralError } = await supabase
+    .from("referrals")
+    .insert({
+      referrer_id: referrerId,
+      referred_id: buyerId,
+      referral_code_id: codeRow.id,
+      qualifying_order_id: orderId,
+      status: "qualified",
+      qualified_at: new Date().toISOString(),
+    })
+    .select("id")
+    .single();
+
+  if (referralError || !referral) {
+    console.error("Error inserting referral:", referralError);
+    return;
+  }
+
+  // Award voucher to referrer
+  await supabase.from("referral_vouchers").insert({
+    user_id: referrerId,
+    referred_id: buyerId,
+    referral_id: referral.id,
+    status: "available",
+  });
+
+  // Notify referrer
+  const { data: referredProfile } = await supabase
+    .from("profiles")
+    .select("display_name")
+    .eq("id", buyerId)
+    .single();
+
+  const referredName = referredProfile?.display_name || "Someone";
+  const template = referralCreditEarnedNotification(referredName);
+  createNotification({
+    user_id: referrerId,
+    type: "referral_credit_earned",
+    ...template,
+    data: { referral_id: referral.id, referred_id: buyerId },
+  }).catch((err) => console.error("Referral notification error:", err));
 }

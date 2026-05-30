@@ -23,7 +23,12 @@ referrals.get("/code", clerkMiddleware, requireProfile, async (c) => {
 
   if (error && error.code === "PGRST116") {
     // No code exists -- generate one (edge case)
-    const code = profile.id.slice(0, 8).toUpperCase();
+    const randomSuffix = () =>
+      "K" +
+      Math.random().toString(36).toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 4).padEnd(4, "0");
+
+    const base = profile.id.slice(0, 8).toUpperCase();
+    const code = `${base}-${randomSuffix()}`;
 
     const { data: newCode, error: insertError } = await supabase
       .from("referral_codes")
@@ -32,8 +37,8 @@ referrals.get("/code", clerkMiddleware, requireProfile, async (c) => {
       .single();
 
     if (insertError) {
-      // Handle unique collision
-      const fallback = `${code}${Math.floor(Math.random() * 999)}`;
+      // Handle unique collision -- regenerate suffix
+      const fallback = `${base}-${randomSuffix()}`;
       const { data: fallbackCode, error: fallbackError } = await supabase
         .from("referral_codes")
         .insert({ user_id: profile.id, code: fallback })
@@ -243,6 +248,42 @@ referrals.get("/balance", clerkMiddleware, requireProfile, async (c) => {
       type: cr.type,
     })),
   });
+});
+
+// ============================================================
+// GET /api/referrals/vouchers
+// Returns the current user's referral vouchers with referred user names.
+// ============================================================
+
+referrals.get("/vouchers", clerkMiddleware, requireProfile, async (c) => {
+  const profile = c.get("profile");
+  const supabase = createSupabaseAdmin();
+
+  const { data: vouchers, error } = await supabase
+    .from("referral_vouchers")
+    .select("id, status, created_at, used_at, referred_id, profiles!referral_vouchers_referred_id_fkey(display_name)")
+    .eq("user_id", profile.id)
+    .order("created_at", { ascending: false });
+
+  if (error) {
+    console.error("Error fetching referral vouchers:", error);
+    return c.json({ error: "Failed to fetch vouchers" }, 500);
+  }
+
+  const items = (vouchers || []).map((v) => {
+    const referred = (Array.isArray(v.profiles) ? v.profiles[0] : v.profiles) as Record<string, unknown> | null;
+    return {
+      id: v.id,
+      status: v.status,
+      referred_name: referred ? (referred.display_name as string | null) : null,
+      created_at: v.created_at,
+      used_at: v.used_at,
+    };
+  });
+
+  const available = items.filter((v) => v.status === "available").length;
+
+  return c.json({ vouchers: items, available_count: available });
 });
 
 export default referrals;

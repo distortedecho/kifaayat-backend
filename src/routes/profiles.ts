@@ -109,22 +109,27 @@ profiles.get("/me", clerkMiddleware, async (c) => {
         secretKey: process.env.CLERK_SECRET_KEY || "",
       });
       const user = await clerk.users.getUser(clerkUserId);
-      let code = (user.username || user.firstName || newProfile.id.slice(0, 8))
+      const randomSuffix = () =>
+        "K" +
+        Math.random().toString(36).toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 4).padEnd(4, "0");
+
+      const base = (user.username || user.firstName || newProfile.id.slice(0, 8))
         .toUpperCase()
-        .replace(/[^A-Z0-9]/g, "");
-      if (!code) code = newProfile.id.slice(0, 8).toUpperCase();
+        .replace(/[^A-Z0-9]/g, "")
+        .slice(0, 20) || newProfile.id.slice(0, 8).toUpperCase();
+
+      const code = `${base}-${randomSuffix()}`;
 
       const { error: codeError } = await supabase.from("referral_codes").insert({
         user_id: newProfile.id,
         code,
       });
 
-      // Handle UNIQUE collision -- append random suffix
+      // Handle UNIQUE collision -- regenerate suffix
       if (codeError?.code === "23505") {
-        const suffix = Math.floor(Math.random() * 999).toString();
         await supabase.from("referral_codes").insert({
           user_id: newProfile.id,
-          code: `${code}${suffix}`,
+          code: `${base}-${randomSuffix()}`,
         });
       }
     } catch (err) {
