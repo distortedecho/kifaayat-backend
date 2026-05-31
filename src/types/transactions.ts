@@ -178,6 +178,21 @@ export const VALID_ORDER_TRANSITIONS: Record<OrderStatus, OrderStatus[]> = {
 // Review types
 // ============================================================
 
+export const REVIEW_TAGS = [
+  // Buyer → Seller tags
+  "item_as_described",
+  "quick_to_ship",
+  "great_packaging",
+  "good_communication",
+  "would_buy_again",
+  // Seller → Buyer tags
+  "quick_payment",
+  "easy_to_work_with",
+  "would_sell_to_again",
+] as const;
+
+export type ReviewTag = (typeof REVIEW_TAGS)[number];
+
 export interface Review {
   id: string;
   order_id: string;
@@ -186,6 +201,7 @@ export interface Review {
   reviewer_role: "buyer" | "seller";
   rating: number;
   comment: string | null;
+  tags: ReviewTag[];
   revealed_at: string | null;
   seller_reply: string | null;
   seller_reply_at: string | null;

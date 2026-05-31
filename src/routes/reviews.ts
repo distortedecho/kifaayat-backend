@@ -11,6 +11,7 @@ import {
 } from "../lib/notifications.js";
 import {
   type Review,
+  REVIEW_TAGS,
   REVIEW_WINDOW_DAYS,
   REVIEW_REMINDER_HOURS,
   SELLER_REPLY_WINDOW_DAYS,
@@ -25,12 +26,14 @@ const reviews = new Hono();
 const createReviewSchema = z.object({
   order_id: z.string().uuid("order_id must be a valid UUID"),
   rating: z.number().int().min(1).max(5),
-  comment: z.string().max(1000).optional(),
+  comment: z.string().max(1000).nullish(),
+  tags: z.array(z.enum(REVIEW_TAGS)).max(5).optional(),
 });
 
 const editReviewSchema = z.object({
   rating: z.number().int().min(1).max(5).optional(),
-  comment: z.string().max(1000).optional(),
+  comment: z.string().max(1000).nullish(),
+  tags: z.array(z.enum(REVIEW_TAGS)).max(5).optional(),
 });
 
 const replySchema = z.object({
@@ -107,11 +110,12 @@ reviews.post("/", clerkMiddleware, async (c) => {
     );
   }
 
-  const { order_id, rating, comment } = parsed.data;
+  const { order_id, rating, comment, tags } = parsed.data;
 
   // Look up profile
   const profile = await getProfileByClerkId(clerkUserId);
   if (!profile) {
+    console.error("[reviews] profile not found for clerkUserId:", clerkUserId);
     return c.json({ error: "Profile not found" }, 404);
   }
 
@@ -123,11 +127,22 @@ reviews.post("/", clerkMiddleware, async (c) => {
     .single();
 
   if (orderError || !order) {
+    console.error("[reviews] order not found:", order_id, orderError);
     return c.json({ error: "Order not found" }, 404);
   }
 
+  console.info("[reviews] submit attempt", {
+    order_id,
+    profile_id: profile.id,
+    order_status: order.status,
+    order_buyer_id: order.buyer_id,
+    order_seller_id: order.seller_id,
+    completed_at: order.completed_at,
+  });
+
   // Validate order status
   if (order.status !== "complete") {
+    console.warn("[reviews] order not complete, status:", order.status);
     return c.json(
       { error: "Reviews can only be submitted for completed orders" },
       400
@@ -136,6 +151,7 @@ reviews.post("/", clerkMiddleware, async (c) => {
 
   // Validate user is buyer or seller on this order
   if (!order.buyer_id) {
+    console.warn("[reviews] guest order, no buyer_id");
     return c.json(
       { error: "Guest orders cannot have reviews" },
       400
@@ -145,7 +161,10 @@ reviews.post("/", clerkMiddleware, async (c) => {
   const isBuyer = order.buyer_id === profile.id;
   const isSeller = order.seller_id === profile.id;
 
+  console.info("[reviews] role check", { isBuyer, isSeller });
+
   if (!isBuyer && !isSeller) {
+    console.warn("[reviews] user not a party to order");
     return c.json({ error: "You are not a party to this order" }, 403);
   }
 
@@ -159,6 +178,7 @@ reviews.post("/", clerkMiddleware, async (c) => {
       completedAt.getTime() + REVIEW_WINDOW_DAYS * 24 * 60 * 60 * 1000
     );
     if (new Date() > windowEnd) {
+      console.warn("[reviews] review window closed, completed_at:", order.completed_at);
       return c.json({ error: "Review window has closed" }, 400);
     }
   }
@@ -172,6 +192,7 @@ reviews.post("/", clerkMiddleware, async (c) => {
     .single();
 
   if (existing) {
+    console.warn("[reviews] already reviewed, role:", reviewerRole, "existing id:", existing.id);
     return c.json(
       { error: "You have already submitted a review for this order" },
       409
@@ -188,6 +209,7 @@ reviews.post("/", clerkMiddleware, async (c) => {
       reviewer_role: reviewerRole,
       rating,
       comment: comment || null,
+      tags: tags || [],
     })
     .select()
     .single();
@@ -404,6 +426,7 @@ reviews.patch("/:id", clerkMiddleware, async (c) => {
   };
   if (parsed.data.rating !== undefined) updates.rating = parsed.data.rating;
   if (parsed.data.comment !== undefined) updates.comment = parsed.data.comment;
+  if (parsed.data.tags !== undefined) updates.tags = parsed.data.tags;
 
   const { data: updatedReview, error: updateError } = await supabase
     .from("reviews")
@@ -569,7 +592,7 @@ reviews.get("/seller/:sellerId", optionalClerkMiddleware, async (c) => {
   // Fetch revealed buyer-to-seller reviews with reviewer profile
   let query = supabase
     .from("reviews")
-    .select("id, order_id, reviewer_id, rating, comment, seller_reply, seller_reply_at, created_at, profiles!reviews_reviewer_id_fkey(display_name, avatar_url)")
+    .select("id, order_id, reviewer_id, rating, comment, tags, seller_reply, seller_reply_at, created_at, profiles!reviews_reviewer_id_fkey(display_name, avatar_url)")
     .eq("reviewee_id", sellerId)
     .eq("reviewer_role", "buyer")
     .not("revealed_at", "is", null)
@@ -600,6 +623,7 @@ reviews.get("/seller/:sellerId", optionalClerkMiddleware, async (c) => {
       reviewer_avatar_url: prof?.avatar_url || null,
       rating: r.rating,
       comment: r.comment,
+      tags: (r.tags as string[]) || [],
       seller_reply: r.seller_reply,
       seller_reply_at: r.seller_reply_at,
       created_at: r.created_at,
@@ -614,6 +638,87 @@ reviews.get("/seller/:sellerId", optionalClerkMiddleware, async (c) => {
           (
             reviewList.reduce((sum, r) => sum + r.rating, 0) / reviewCount
           ).toFixed(1)
+        )
+      : null;
+
+  const nextCursor =
+    reviewList.length === limit
+      ? (reviewList[reviewList.length - 1].created_at as string)
+      : null;
+
+  return c.json({
+    items: reviewList,
+    reviews: reviewList,
+    next_cursor: nextCursor,
+    avg_rating: avgRating,
+    review_count: reviewCount,
+  });
+});
+
+/**
+ * GET /api/reviews/buyer/:buyerId
+ * Public: Get revealed seller-to-buyer reviews for a buyer profile.
+ * Cursor-paginated on created_at (default limit 10).
+ * Query params: ?cursor=<ISO>&limit=<n>
+ */
+reviews.get("/buyer/:buyerId", optionalClerkMiddleware, async (c) => {
+  const buyerId = c.req.param("buyerId");
+  const supabase = createSupabaseAdmin();
+
+  if (!UUID_REGEX.test(buyerId)) {
+    return c.json({ error: "Invalid buyer ID format" }, 400);
+  }
+
+  const cursor = c.req.query("cursor");
+  const limitParam = c.req.query("limit");
+  const limit = Math.min(
+    Math.max(parseInt(limitParam || "10", 10) || 10, 1),
+    100
+  );
+
+  let query = supabase
+    .from("reviews")
+    .select("id, order_id, reviewer_id, rating, comment, tags, created_at, profiles!reviews_reviewer_id_fkey(display_name, avatar_url)")
+    .eq("reviewee_id", buyerId)
+    .eq("reviewer_role", "seller")
+    .not("revealed_at", "is", null)
+    .order("created_at", { ascending: false })
+    .limit(limit);
+
+  if (cursor) {
+    query = query.lt("created_at", cursor);
+  }
+
+  const { data: reviewRows, error: reviewError } = await query;
+
+  if (reviewError) {
+    console.error("Error fetching buyer reviews:", reviewError);
+    return c.json({ error: "Failed to fetch reviews" }, 500);
+  }
+
+  const reviewList = (reviewRows || []).map((r) => {
+    const profileRaw = r.profiles as unknown;
+    const prof = Array.isArray(profileRaw)
+      ? (profileRaw[0] as Record<string, unknown> | undefined)
+      : (profileRaw as Record<string, unknown> | null);
+    return {
+      id: r.id,
+      order_id: r.order_id,
+      reviewer_id: r.reviewer_id,
+      reviewer_name: prof?.display_name || null,
+      reviewer_avatar_url: prof?.avatar_url || null,
+      rating: r.rating,
+      comment: r.comment,
+      tags: (r.tags as string[]) || [],
+      created_at: r.created_at,
+    };
+  });
+
+  const reviewCount = reviewList.length;
+  const avgRating =
+    reviewCount > 0
+      ? parseFloat(
+          (reviewList.reduce((sum, r) => sum + r.rating, 0) / reviewCount).toFixed(1)
         )
       : null;
 

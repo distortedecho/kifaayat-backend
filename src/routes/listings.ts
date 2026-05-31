@@ -481,7 +481,7 @@ listings.get("/:id", optionalClerkMiddleware, async (c) => {
 
   // Fire-and-forget view count increment (atomic SQL function)
   supabase.rpc("increment_view_count", { p_listing_id: listingId }).then(
-    () => {},
+    ({ error }) => { if (error) console.error("View count increment error:", error); },
     (err: unknown) => console.error("View count increment error:", err)
   );
 
@@ -622,6 +622,40 @@ listings.put("/:id", clerkMiddleware, requireProfile, async (c) => {
   if (updateError) {
     console.error("Error updating listing:", updateError);
     return c.json({ error: "Failed to update listing" }, 500);
+  }
+
+  // Fire price drop notifications if price decreased
+  if (
+    input.price_amount !== undefined &&
+    input.price_amount < existing.price_amount
+  ) {
+    (async () => {
+      try {
+        const { createNotification, priceDropWishlistNotification } = await import("../lib/notifications.js");
+
+        const { data: wishlistUsers } = await supabase
+          .from("wishlists")
+          .select("user_id")
+          .eq("listing_id", listingId)
+          .not("user_id", "is", null);
+
+        if (!wishlistUsers || wishlistUsers.length === 0) return;
+
+        const currency = (updated.price_currency as string) || "AUD";
+        const template = priceDropWishlistNotification(updated.title as string, input.price_amount!, currency);
+
+        for (const { user_id } of wishlistUsers) {
+          await createNotification({
+            user_id,
+            type: "price_drop_wishlist",
+            ...template,
+            data: { listing_id: listingId },
+          });
+        }
+      } catch (err) {
+        console.error("Error sending price drop notifications:", err);
+      }
+    })();
   }
 
   return c.json({ listing: updated });
@@ -1378,11 +1412,13 @@ listings.post("/:id/comments", clerkMiddleware, requireProfile, async (c) => {
     return c.json({ error: "Failed to create comment" }, 500);
   }
 
-  // Fire-and-forget: notify seller of new comment (skip if author is the seller)
-  if (listing.seller_id !== profile.id) {
-    (async () => {
-      try {
-        const { createNotification } = await import("../lib/notifications.js");
+  // Fire-and-forget: notify relevant parties of new comment
+  (async () => {
+    try {
+      const { createNotification } = await import("../lib/notifications.js");
+
+      if (listing.seller_id !== profile.id) {
+        // Buyer commented → notify seller
         await createNotification({
           user_id: listing.seller_id,
           type: "listing_comment" as any,
@@ -1390,11 +1426,31 @@ listings.post("/:id/comments", clerkMiddleware, requireProfile, async (c) => {
           body: `${profile.display_name || "Someone"} commented on "${listing.title}"`,
           data: { listing_id: listingId, comment_id: comment.id },
         });
-      } catch (err) {
-        console.error("Error sending listing comment notification:", err);
+      } else {
+        // Seller commented → notify all unique buyers who have commented before
+        const { data: prevComments } = await supabase
+          .from("listing_comments")
+          .select("author_id")
+          .eq("listing_id", listingId)
+          .neq("author_id", listing.seller_id)
+          .neq("id", comment.id);
+
+        const buyerIds = [...new Set((prevComments || []).map((c) => c.author_id))];
+
+        for (const buyerId of buyerIds) {
+          await createNotification({
+            user_id: buyerId,
+            type: "listing_comment" as any,
+            title: "Seller replied on a listing",
+            body: `${profile.display_name || "The seller"} replied on "${listing.title}"`,
+            data: { listing_id: listingId, comment_id: comment.id },
+          });
+        }
       }
-    })();
-  }
+    } catch (err) {
+      console.error("Error sending listing comment notification:", err);
+    }
+  })();
 
   return c.json({
     comment: {
@@ -1455,6 +1511,86 @@ listings.delete("/:id/comments/:commentId", clerkMiddleware, requireProfile, asy
     console.error("Error deleting listing comment:", deleteError);
     return c.json({ error: "Failed to delete comment" }, 500);
   }
+
+  return c.body(null, 204);
+});
+
+/**
+ * GET /api/listings/:id/stats
+ * Returns engagement stats for a listing. Seller-only.
+ */
+listings.get("/:id/stats", clerkMiddleware, requireProfile, async (c) => {
+  const listingId = c.req.param("id");
+  const profile = c.get("profile");
+  const supabase = createSupabaseAdmin();
+
+  const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  if (!uuidRegex.test(listingId)) {
+    return c.json({ error: "Invalid listing ID format" }, 400);
+  }
+
+  const { data: listing, error: listingError } = await supabase
+    .from("listings")
+    .select("id, seller_id, view_count, share_count")
+    .eq("id", listingId)
+    .single();
+
+  if (listingError || !listing) {
+    return c.json({ error: "Listing not found" }, 404);
+  }
+
+  if (listing.seller_id !== profile.id) {
+    return c.json({ error: "Not authorized" }, 403);
+  }
+
+  const [
+    { count: saveCount },
+    { count: commentCount },
+    { count: offerCount },
+  ] = await Promise.all([
+    supabase
+      .from("wishlists")
+      .select("id", { count: "exact", head: true })
+      .eq("listing_id", listingId),
+    supabase
+      .from("listing_comments")
+      .select("id", { count: "exact", head: true })
+      .eq("listing_id", listingId),
+    supabase
+      .from("offers")
+      .select("id", { count: "exact", head: true })
+      .eq("listing_id", listingId),
+  ]);
+
+  return c.json({
+    listing_id: listingId,
+    views: listing.view_count ?? 0,
+    shares: listing.share_count ?? 0,
+    saves: saveCount ?? 0,
+    comments: commentCount ?? 0,
+    offers: offerCount ?? 0,
+  });
+});
+
+/**
+ * POST /api/listings/:id/share
+ * Increments the share count for a listing. No auth required.
+ */
+listings.post("/:id/share", async (c) => {
+  const listingId = c.req.param("id");
+  const supabase = createSupabaseAdmin();
+
+  const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  if (!uuidRegex.test(listingId)) {
+    return c.json({ error: "Invalid listing ID format" }, 400);
+  }
+
+  supabase
+    .rpc("increment_share_count", { p_listing_id: listingId })
+    .then(
+      ({ error }) => { if (error) console.error("Share count increment error:", error); },
+      (err: unknown) => console.error("Share count increment error:", err)
+    );
 
   return c.body(null, 204);
 });

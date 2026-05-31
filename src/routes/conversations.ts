@@ -25,6 +25,7 @@ const conversations = new Hono();
 
 const createConversationSchema = z.object({
   listing_id: z.string().uuid("listing_id must be a valid UUID"),
+  buyer_id: z.string().uuid("buyer_id must be a valid UUID").optional(),
 });
 
 const sendMessageSchema = z.object({
@@ -157,9 +158,9 @@ conversations.post("/", clerkMiddleware, async (c) => {
     );
   }
 
-  const { listing_id } = parsed.data;
+  const { listing_id, buyer_id: requestedBuyerId } = parsed.data;
 
-  // Validate listing exists and is active
+  // Validate listing exists
   const { data: listing, error: listingError } = await supabase
     .from("listings")
     .select("id, seller_id, status")
@@ -170,14 +171,59 @@ conversations.post("/", clerkMiddleware, async (c) => {
     return c.json({ error: "Listing not found" }, 404);
   }
 
-  // Buyer cannot be the seller
-  if (listing.seller_id === profileId) {
-    return c.json(
-      { error: "You cannot start a conversation on your own listing" },
-      400
-    );
+  const isSeller = listing.seller_id === profileId;
+
+  console.info("[conversations] role check", {
+    profile_id: profileId,
+    listing_seller_id: listing.seller_id,
+    is_seller: isSeller,
+    listing_status: listing.status,
+    requested_buyer_id: requestedBuyerId,
+  });
+
+  if (isSeller) {
+    // Seller initiating — buyer_id required
+    if (!requestedBuyerId) {
+      return c.json({ error: "buyer_id is required when seller initiates a conversation" }, 400);
+    }
+
+    // Verify an order exists between this seller's listing and the buyer
+    const { count: orderCount, data: orderDebug } = await supabase
+      .from("orders")
+      .select("id, listing_id, buyer_id", { count: "exact" })
+      .eq("listing_id", listing_id)
+      .eq("buyer_id", requestedBuyerId);
+
+    console.info("[conversations] seller flow order check", {
+      seller_profile_id: profileId,
+      listing_id,
+      requested_buyer_id: requestedBuyerId,
+      order_count: orderCount,
+      orders_found: orderDebug,
+    });
+
+    if (!orderCount || orderCount === 0) {
+      return c.json({ error: "No order found between this seller and buyer" }, 400);
+    }
+
+    const { data: conversation, error: upsertError } = await supabase
+      .from("conversations")
+      .upsert(
+        { listing_id, buyer_id: requestedBuyerId, seller_id: profileId },
+        { onConflict: "listing_id,buyer_id,seller_id", ignoreDuplicates: false }
+      )
+      .select()
+      .single();
+
+    if (upsertError || !conversation) {
+      console.error("Error creating seller-initiated conversation:", upsertError);
+      return c.json({ error: "Failed to create conversation" }, 500);
+    }
+
+    return c.json({ conversation });
   }
 
+  // Buyer flow
   // Check order first — post-purchase buyers can DM regardless of listing status
   const { count: orderCount } = await supabase
     .from("orders")
@@ -493,6 +539,18 @@ conversations.post("/:id/messages", idempotencyMiddleware, clerkMiddleware, asyn
       image_url: parsed.data.image_url,
       metadata: parsed.data.metadata,
     });
+
+    // Broadcast new message to conversation channel so both parties
+    // receive it in real-time without relying on postgres_changes RLS.
+    createSupabaseAdmin()
+      .channel(`conversation:${conversationId}`)
+      .send({
+        type: "broadcast",
+        event: "new_message",
+        payload: message,
+      })
+      .catch((err: unknown) => console.error("[realtime] broadcast error:", err));
+
     return c.json({ message }, 201);
   } catch (err) {
     if (err instanceof ConversationServiceError) {

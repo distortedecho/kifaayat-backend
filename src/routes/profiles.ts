@@ -42,6 +42,7 @@ const updateProfileSchema = z.object({
   user_intents: z.array(z.enum(["buy", "sell"])).optional(),
   wishlist_public: z.boolean().optional(),
   payout_method: z.enum(["stripe", "kifaayat_wallet"]).optional(),
+  bio: z.string().max(500).nullish(),
 });
 
 /**

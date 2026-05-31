@@ -319,6 +319,39 @@ wishlists.get("/", optionalClerkMiddleware, async (c) => {
 });
 
 /**
+ * GET /api/wishlists/summary
+ * Returns total saved count and per-category breakdown.
+ */
+wishlists.get("/summary", clerkMiddleware, requireProfile, async (c) => {
+  const profile = c.get("profile");
+  const supabase = createSupabaseAdmin();
+
+  const { data, error } = await supabase
+    .from("wishlists")
+    .select("listings!wishlists_listing_id_fkey(category, status)")
+    .eq("user_id", profile.id);
+
+  if (error) {
+    console.error("Error fetching wishlist summary:", error);
+    return c.json({ error: "Failed to fetch summary" }, 500);
+  }
+
+  const categoryCounts: Record<string, number> = {};
+  let total = 0;
+
+  for (const row of data || []) {
+    const listing = (Array.isArray(row.listings) ? row.listings[0] : row.listings) as
+      | { category: string; status: string }
+      | null;
+    if (!listing || listing.status !== "active") continue;
+    categoryCounts[listing.category] = (categoryCounts[listing.category] || 0) + 1;
+    total++;
+  }
+
+  return c.json({ total, categories: categoryCounts });
+});
+
+/**
  * GET /api/wishlists/check
  * Check if listings are wishlisted (for heart icon state).
  */

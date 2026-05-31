@@ -43,6 +43,7 @@ ALTER TABLE listings ADD COLUMN IF NOT EXISTS international_shipping BOOLEAN DEF
 ALTER TABLE listings ADD COLUMN IF NOT EXISTS view_count INTEGER DEFAULT 0;
 ALTER TABLE listings ADD COLUMN IF NOT EXISTS save_count INTEGER DEFAULT 0;
 ALTER TABLE listings ADD COLUMN IF NOT EXISTS inquiry_count INTEGER DEFAULT 0;
+ALTER TABLE listings ADD COLUMN IF NOT EXISTS share_count INTEGER DEFAULT 0;
 ALTER TABLE listings ADD COLUMN IF NOT EXISTS sale_percentage INTEGER;
 ALTER TABLE listings ADD COLUMN IF NOT EXISTS risk_score NUMERIC(5,2);
 ALTER TABLE listings ADD COLUMN IF NOT EXISTS risk_scored_at TIMESTAMPTZ;
@@ -58,6 +59,12 @@ ALTER TABLE listings ADD COLUMN IF NOT EXISTS rental_security_deposit INTEGER;
 
 CREATE INDEX IF NOT EXISTS idx_listings_view_count ON listings(view_count DESC);
 CREATE INDEX IF NOT EXISTS idx_listings_save_count ON listings(save_count DESC);
+CREATE INDEX IF NOT EXISTS idx_listings_share_count ON listings(share_count DESC);
+
+CREATE OR REPLACE FUNCTION increment_share_count(p_listing_id UUID)
+RETURNS void LANGUAGE sql AS $$
+  UPDATE listings SET share_count = share_count + 1 WHERE id = p_listing_id;
+$$;
 CREATE INDEX IF NOT EXISTS idx_listings_curation_tags ON listings USING GIN(curation_tags);
 CREATE INDEX IF NOT EXISTS idx_listings_risk_score ON listings(risk_score) WHERE risk_score IS NOT NULL;
 
@@ -163,6 +170,33 @@ CREATE TABLE IF NOT EXISTS reviews (
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
+
+ALTER TABLE reviews ADD COLUMN IF NOT EXISTS tags TEXT[] DEFAULT '{}';
+
+ALTER TABLE profiles ADD COLUMN IF NOT EXISTS bio TEXT;
+
+-- -------------------------
+-- messages — Realtime support
+-- -------------------------
+
+ALTER TABLE messages REPLICA IDENTITY FULL;
+
+-- Realtime evaluates RLS using auth.jwt() from the Clerk JWT passed via setAuth().
+-- The existing policy uses current_setting() which only works for REST API calls.
+-- This second policy handles Realtime subscriptions; Supabase ORs both.
+CREATE POLICY IF NOT EXISTS "Realtime: participants can read messages"
+  ON messages FOR SELECT
+  USING (
+    conversation_id IN (
+      SELECT id FROM conversations
+      WHERE buyer_id IN (
+        SELECT id FROM profiles WHERE clerk_id = (auth.jwt() ->> 'sub')
+      )
+      OR seller_id IN (
+        SELECT id FROM profiles WHERE clerk_id = (auth.jwt() ->> 'sub')
+      )
+    )
+  );
 
 CREATE INDEX IF NOT EXISTS idx_reviews_reviewee_id ON reviews(reviewee_id);
 CREATE INDEX IF NOT EXISTS idx_reviews_order_id ON reviews(order_id);
