@@ -176,6 +176,20 @@ ALTER TABLE reviews ADD COLUMN IF NOT EXISTS tags TEXT[] DEFAULT '{}';
 ALTER TABLE profiles ADD COLUMN IF NOT EXISTS bio TEXT;
 
 -- -------------------------
+-- listing_photos — photo type discriminator
+-- -------------------------
+-- 'product'   = regular gallery photo (default, what we've always had)
+-- 'brand_tag' = photo of the brand/designer tag on the garment (optional, max 1)
+-- 'receipt'   = photo of the original receipt / proof of purchase (optional, max 1)
+
+ALTER TABLE listing_photos
+  ADD COLUMN IF NOT EXISTS photo_type TEXT NOT NULL DEFAULT 'product'
+  CHECK (photo_type IN ('product', 'brand_tag', 'receipt'));
+
+CREATE INDEX IF NOT EXISTS idx_listing_photos_type
+  ON listing_photos(listing_id, photo_type);
+
+-- -------------------------
 -- messages — Realtime support
 -- -------------------------
 
@@ -235,6 +249,41 @@ CREATE TABLE IF NOT EXISTS listing_comments (
 );
 
 CREATE INDEX IF NOT EXISTS idx_listing_comments_listing_id ON listing_comments(listing_id);
+
+-- Forum-style replies (1-level deep). parent_comment_id always points to the
+-- THREAD ROOT (a top-level comment). reply_to_comment_id points to the specific
+-- comment the user tapped "Reply" on (may be the root or another reply in the
+-- thread) — used for @mention rendering and notification targeting.
+ALTER TABLE listing_comments
+  ADD COLUMN IF NOT EXISTS parent_comment_id UUID
+    REFERENCES listing_comments(id) ON DELETE CASCADE;
+
+ALTER TABLE listing_comments
+  ADD COLUMN IF NOT EXISTS reply_to_comment_id UUID
+    REFERENCES listing_comments(id) ON DELETE SET NULL;
+
+CREATE INDEX IF NOT EXISTS idx_listing_comments_parent ON listing_comments(parent_comment_id);
+
+-- Allow 'comment_reply' as a notification type (was missing from initial CHECK)
+ALTER TABLE notifications DROP CONSTRAINT IF EXISTS notifications_type_check;
+ALTER TABLE notifications ADD CONSTRAINT notifications_type_check CHECK (type IN (
+  'offer_received', 'offer_accepted', 'offer_declined', 'offer_countered', 'offer_expired',
+  'order_paid', 'order_accepted', 'order_rejected', 'order_shipped', 'order_delivered', 'order_complete',
+  'listing_approved', 'listing_rejected',
+  'review_reminder', 'review_revealed',
+  'tier_upgrade', 'tier_downgrade',
+  'boost_activated', 'boost_expiring',
+  'sale_applied', 'referral_credit_earned',
+  'iso_match', 'iso_response',
+  'new_message', 'price_drop_wishlist',
+  'new_matching_listing', 'new_listing_your_size',
+  'listing_stale_reminder', 'milestone_achieved',
+  'weekly_digest', 'referral_nudge',
+  're_engagement', 'account_suspended',
+  'followed_seller_new_listing',
+  'listing_comment',
+  'comment_reply'
+));
 
 ALTER TABLE listing_comments ENABLE ROW LEVEL SECURITY;
 

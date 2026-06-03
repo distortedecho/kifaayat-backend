@@ -149,10 +149,14 @@ CREATE TABLE IF NOT EXISTS listing_photos (
   storage_path TEXT NOT NULL,  -- Supabase storage path
   url TEXT NOT NULL,           -- Public URL
   position INTEGER NOT NULL DEFAULT 0,  -- For ordering, first = cover
+  -- 'product' = regular gallery photo, 'brand_tag' = tag on garment, 'receipt' = proof of purchase
+  photo_type TEXT NOT NULL DEFAULT 'product'
+    CHECK (photo_type IN ('product', 'brand_tag', 'receipt')),
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 CREATE INDEX IF NOT EXISTS idx_listing_photos_listing_id ON listing_photos(listing_id);
+CREATE INDEX IF NOT EXISTS idx_listing_photos_type ON listing_photos(listing_id, photo_type);
 
 -- ============================================================
 -- Wishlist Folders table (must be created before wishlists for FK)
@@ -570,7 +574,8 @@ CREATE TABLE IF NOT EXISTS notifications (
     'weekly_digest', 'referral_nudge',
     're_engagement', 'account_suspended',
     'followed_seller_new_listing',
-    'listing_comment'
+    'listing_comment',
+    'comment_reply'
   )),
   title TEXT NOT NULL,
   body TEXT NOT NULL,

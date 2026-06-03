@@ -26,6 +26,12 @@ const listings = new Hono();
 
 const createCommentSchema = z.object({
   content: z.string().min(1, "Comment cannot be empty").max(1000, "Comment must be 1000 characters or less"),
+  // Thread root (top-level comment id). May be sent alongside reply_to_comment_id,
+  // or alone (legacy: treated as the tapped target).
+  parent_comment_id: z.string().uuid().nullish(),
+  // The specific comment the user tapped Reply on. Source of truth for @mention
+  // target and notification routing. If omitted, falls back to parent_comment_id.
+  reply_to_comment_id: z.string().uuid().nullish(),
 });
 
 // ============================================================
@@ -199,12 +205,13 @@ async function validateListingCompleteness(
   if (!listingData.fabric_types?.length) missing.push("fabric_types");
   if (!listingData.items_included?.length) missing.push("items_included");
 
-  // Check photo count
+  // Check photo count (only product photos count toward the minimum)
   const supabase = createSupabaseAdmin();
   const { count } = await supabase
     .from("listing_photos")
     .select("id", { count: "exact", head: true })
-    .eq("listing_id", listingId);
+    .eq("listing_id", listingId)
+    .eq("photo_type", "product");
 
   if (!count || count < 3) {
     missing.push(`photos (need at least 3, have ${count || 0})`);
@@ -304,16 +311,26 @@ listings.get("/me", clerkMiddleware, requireProfile, async (c) => {
     }
   }
 
-  // Sort photos by position for each listing and add stats + boost info
-  const result = (listingsData || []).map((listing) => ({
-    ...listing,
-    photos: (listing.listing_photos || []).sort(
-      (a: { position: number }, b: { position: number }) => a.position - b.position
-    ),
-    listing_photos: undefined,
-    boost_status: boostMap[listing.id] ? "active" as const : null,
-    boost_ends_at: boostMap[listing.id] || null,
-  }));
+  // Sort photos by position and split product gallery from brand_tag/receipt
+  const result = (listingsData || []).map((listing) => {
+    const allPhotos = (listing.listing_photos || []) as Array<{
+      position: number;
+      photo_type?: string;
+    }>;
+    return {
+      ...listing,
+      photos: allPhotos
+        .filter((p) => (p.photo_type ?? "product") === "product")
+        .sort((a, b) => a.position - b.position),
+      brand_tag_photo:
+        allPhotos.find((p) => p.photo_type === "brand_tag") || null,
+      receipt_photo:
+        allPhotos.find((p) => p.photo_type === "receipt") || null,
+      listing_photos: undefined,
+      boost_status: boostMap[listing.id] ? ("active" as const) : null,
+      boost_ends_at: boostMap[listing.id] || null,
+    };
+  });
 
   const nextCursor =
     result.length === limit
@@ -485,15 +502,25 @@ listings.get("/:id", optionalClerkMiddleware, async (c) => {
     (err: unknown) => console.error("View count increment error:", err)
   );
 
-  // Shape response
-  const photos = (listing.listing_photos || []).sort(
-    (a: { position: number }, b: { position: number }) => a.position - b.position
-  );
+  // Shape response — split product gallery from brand_tag/receipt singletons
+  const allPhotos = (listing.listing_photos || []) as Array<{
+    position: number;
+    photo_type?: string;
+  }>;
+  const photos = allPhotos
+    .filter((p) => (p.photo_type ?? "product") === "product")
+    .sort((a, b) => a.position - b.position);
+  const brand_tag_photo =
+    allPhotos.find((p) => p.photo_type === "brand_tag") || null;
+  const receipt_photo =
+    allPhotos.find((p) => p.photo_type === "receipt") || null;
   const seller = listing.profiles || null;
 
   const result = {
     ...listing,
     photos,
+    brand_tag_photo,
+    receipt_photo,
     seller,
     listing_photos: undefined,
     profiles: undefined,
@@ -1024,19 +1051,37 @@ listings.post("/:id/photos", clerkMiddleware, requireProfile, async (c) => {
     return c.json({ error: "Not authorized to upload photos for this listing" }, 403);
   }
 
-  // Check photo count limit
-  const { count: existingCount } = await supabase
-    .from("listing_photos")
-    .select("id", { count: "exact", head: true })
-    .eq("listing_id", listingId);
-
-  if (existingCount !== null && existingCount >= 15) {
-    return c.json({ error: "Maximum 15 photos per listing" }, 400);
-  }
-
   // Parse multipart form data
   const formData = await c.req.formData();
   const photo = formData.get("photo");
+  const rawPhotoType = (formData.get("photo_type") as string | null) || "product";
+
+  const PHOTO_TYPES = ["product", "brand_tag", "receipt"] as const;
+  type PhotoType = (typeof PHOTO_TYPES)[number];
+  if (!PHOTO_TYPES.includes(rawPhotoType as PhotoType)) {
+    return c.json(
+      { error: `Invalid photo_type. Allowed: ${PHOTO_TYPES.join(", ")}` },
+      400
+    );
+  }
+  const photoType = rawPhotoType as PhotoType;
+
+  // Enforce per-type limits: product photos cap at 15, brand_tag/receipt at 1 each
+  const { count: typeCount } = await supabase
+    .from("listing_photos")
+    .select("id", { count: "exact", head: true })
+    .eq("listing_id", listingId)
+    .eq("photo_type", photoType);
+
+  if (photoType === "product" && typeCount !== null && typeCount >= 15) {
+    return c.json({ error: "Maximum 15 product photos per listing" }, 400);
+  }
+  if (photoType !== "product" && typeCount !== null && typeCount >= 1) {
+    return c.json(
+      { error: `Only one ${photoType} photo allowed per listing. Delete the existing one first.` },
+      400
+    );
+  }
 
   if (!photo || !(photo instanceof File)) {
     return c.json({ error: "Photo file is required" }, 400);
@@ -1081,8 +1126,8 @@ listings.post("/:id/photos", clerkMiddleware, requireProfile, async (c) => {
     .from("listing-photos")
     .getPublicUrl(storagePath);
 
-  // Determine next position
-  const nextPosition = existingCount ?? 0;
+  // Determine next position (within this photo_type group)
+  const nextPosition = typeCount ?? 0;
 
   // Insert photo record
   const { data: photoRecord, error: insertError } = await supabase
@@ -1092,6 +1137,7 @@ listings.post("/:id/photos", clerkMiddleware, requireProfile, async (c) => {
       storage_path: storagePath,
       url: urlData.publicUrl,
       position: nextPosition,
+      photo_type: photoType,
     })
     .select()
     .single();
@@ -1148,16 +1194,17 @@ listings.delete("/:id/photos/:photoId", clerkMiddleware, requireProfile, async (
     return c.json({ error: "Photo not found" }, 404);
   }
 
-  // Enforce min 3 photos if listing is active
-  if (listing.status === "active") {
+  // Enforce min 3 product photos if listing is active (brand_tag/receipt don't count)
+  if (listing.status === "active" && photoRecord.photo_type === "product") {
     const { count } = await supabase
       .from("listing_photos")
       .select("id", { count: "exact", head: true })
-      .eq("listing_id", listingId);
+      .eq("listing_id", listingId)
+      .eq("photo_type", "product");
 
     if (count !== null && count <= 3) {
       return c.json(
-        { error: "Active listings must have at least 3 photos" },
+        { error: "Active listings must have at least 3 product photos" },
         400
       );
     }
@@ -1296,7 +1343,7 @@ listings.get("/:id/comments", optionalClerkMiddleware, async (c) => {
   let query = supabase
     .from("listing_comments")
     .select(
-      "id, listing_id, author_id, content, created_at, profiles!listing_comments_author_id_fkey(id, display_name, avatar_url)"
+      "id, listing_id, author_id, content, parent_comment_id, reply_to_comment_id, created_at, profiles!listing_comments_author_id_fkey(id, display_name, avatar_url)"
     )
     .eq("listing_id", listingId)
     .order("created_at", { ascending: true })
@@ -1324,6 +1371,8 @@ listings.get("/:id/comments", optionalClerkMiddleware, async (c) => {
       listing_id: row.listing_id,
       author_id: row.author_id,
       content: row.content,
+      parent_comment_id: row.parent_comment_id ?? null,
+      reply_to_comment_id: row.reply_to_comment_id ?? null,
       created_at: row.created_at,
       author_name: author ? (author.display_name as string | null) : null,
       author_avatar: author ? (author.avatar_url as string | null) : null,
@@ -1380,7 +1429,7 @@ listings.post("/:id/comments", clerkMiddleware, requireProfile, async (c) => {
     );
   }
 
-  const { content } = parsed.data;
+  const { content, parent_comment_id, reply_to_comment_id } = parsed.data;
 
   // Validate listing exists and is active
   const { data: listing, error: listingError } = await supabase
@@ -1397,12 +1446,50 @@ listings.post("/:id/comments", clerkMiddleware, requireProfile, async (c) => {
     return c.json({ error: "Cannot comment on a listing that is not active" }, 400);
   }
 
+  // If replying, the "tapped target" is reply_to_comment_id when sent (the actual
+  // comment the user tapped Reply on), else parent_comment_id (legacy contract).
+  // We always store parent_comment_id = thread root and reply_to_comment_id = tapped.
+  const tappedTargetId = reply_to_comment_id || parent_comment_id || null;
+  let threadRootId: string | null = null;
+  let tappedTargetIdResolved: string | null = null;
+  let replyToAuthorId: string | null = null;
+
+  if (tappedTargetId) {
+    const { data: target, error: targetError } = await supabase
+      .from("listing_comments")
+      .select("id, author_id, listing_id, parent_comment_id")
+      .eq("id", tappedTargetId)
+      .single();
+
+    if (targetError || !target) {
+      return c.json({ error: "Comment to reply to not found" }, 404);
+    }
+    if (target.listing_id !== listingId) {
+      return c.json({ error: "Comment belongs to a different listing" }, 400);
+    }
+
+    // If tapped is itself a reply, the root is its parent. Otherwise tapped IS the root.
+    threadRootId = target.parent_comment_id ?? target.id;
+    tappedTargetIdResolved = target.id;
+    replyToAuthorId = target.author_id;
+
+    // If the frontend also sent parent_comment_id, sanity-check it matches the derived root.
+    if (parent_comment_id && parent_comment_id !== threadRootId) {
+      return c.json(
+        { error: "parent_comment_id does not match the thread root of reply_to_comment_id" },
+        400
+      );
+    }
+  }
+
   const { data: comment, error: insertError } = await supabase
     .from("listing_comments")
     .insert({
       listing_id: listingId,
       author_id: profile.id,
       content,
+      parent_comment_id: threadRootId,
+      reply_to_comment_id: tappedTargetIdResolved,
     })
     .select()
     .single();
@@ -1412,22 +1499,41 @@ listings.post("/:id/comments", clerkMiddleware, requireProfile, async (c) => {
     return c.json({ error: "Failed to create comment" }, 500);
   }
 
-  // Fire-and-forget: notify relevant parties of new comment
+  // Fire-and-forget: notify relevant parties
   (async () => {
     try {
       const { createNotification } = await import("../lib/notifications.js");
 
+      // Reply → notify only the author of the comment that was tapped (skip if self-reply)
+      if (replyToAuthorId) {
+        if (replyToAuthorId !== profile.id) {
+          const snippet = content.length > 80 ? content.slice(0, 80) + "..." : content;
+          await createNotification({
+            user_id: replyToAuthorId,
+            type: "comment_reply",
+            title: `${profile.display_name || "Someone"} replied to your comment`,
+            body: snippet,
+            data: {
+              listing_id: listingId,
+              comment_id: comment.id,
+              parent_comment_id: threadRootId,
+              reply_to_comment_id: tappedTargetIdResolved,
+            },
+          });
+        }
+        return;
+      }
+
+      // Top-level comment → existing seller/buyer broadcast logic
       if (listing.seller_id !== profile.id) {
-        // Buyer commented → notify seller
         await createNotification({
           user_id: listing.seller_id,
-          type: "listing_comment" as any,
+          type: "listing_comment",
           title: "New comment on your listing",
           body: `${profile.display_name || "Someone"} commented on "${listing.title}"`,
           data: { listing_id: listingId, comment_id: comment.id },
         });
       } else {
-        // Seller commented → notify all unique buyers who have commented before
         const { data: prevComments } = await supabase
           .from("listing_comments")
           .select("author_id")
@@ -1440,7 +1546,7 @@ listings.post("/:id/comments", clerkMiddleware, requireProfile, async (c) => {
         for (const buyerId of buyerIds) {
           await createNotification({
             user_id: buyerId,
-            type: "listing_comment" as any,
+            type: "listing_comment",
             title: "Seller replied on a listing",
             body: `${profile.display_name || "The seller"} replied on "${listing.title}"`,
             data: { listing_id: listingId, comment_id: comment.id },
@@ -1591,6 +1697,152 @@ listings.post("/:id/share", async (c) => {
       ({ error }) => { if (error) console.error("Share count increment error:", error); },
       (err: unknown) => console.error("Share count increment error:", err)
     );
+
+  return c.body(null, 204);
+});
+
+// ============================================================
+// Video upload (signed URL flow — client uploads directly to storage)
+// ============================================================
+
+const VIDEO_BUCKET = "listing-videos";
+const ALLOWED_VIDEO_EXTENSIONS = ["mp4", "mov", "webm", "m4v"] as const;
+const MAX_VIDEO_BYTES = 100 * 1024 * 1024; // 100 MB
+
+const videoUploadUrlSchema = z.object({
+  file_name: z.string().min(1).max(255),
+  content_type: z.string().min(1).max(100).optional(),
+  size_bytes: z.number().int().positive().optional(),
+});
+
+/**
+ * POST /api/listings/:id/video/upload-url
+ * Returns a signed URL the client can PUT the video to directly.
+ * Server verifies seller owns the listing and chooses the storage path
+ * so users can't write outside their own folder.
+ */
+listings.post("/:id/video/upload-url", clerkMiddleware, requireProfile, async (c) => {
+  const listingId = c.req.param("id");
+  const profile = c.get("profile");
+  const supabase = createSupabaseAdmin();
+
+  const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  if (!uuidRegex.test(listingId)) {
+    return c.json({ error: "Invalid listing ID format" }, 400);
+  }
+
+  const body = await c.req.json().catch(() => ({}));
+  const parsed = videoUploadUrlSchema.safeParse(body);
+  if (!parsed.success) {
+    return c.json(
+      { error: "Validation failed", details: parsed.error.flatten().fieldErrors },
+      400
+    );
+  }
+  const { file_name, size_bytes } = parsed.data;
+
+  if (size_bytes !== undefined && size_bytes > MAX_VIDEO_BYTES) {
+    return c.json(
+      { error: `Video too large. Maximum ${MAX_VIDEO_BYTES / 1024 / 1024} MB` },
+      400
+    );
+  }
+
+  const ext = (file_name.split(".").pop() || "mp4").toLowerCase();
+  if (!ALLOWED_VIDEO_EXTENSIONS.includes(ext as typeof ALLOWED_VIDEO_EXTENSIONS[number])) {
+    return c.json(
+      { error: `Invalid file extension. Allowed: ${ALLOWED_VIDEO_EXTENSIONS.join(", ")}` },
+      400
+    );
+  }
+
+  // Verify caller owns the listing
+  const { data: listing, error: fetchError } = await supabase
+    .from("listings")
+    .select("id, seller_id")
+    .eq("id", listingId)
+    .single();
+
+  if (fetchError || !listing) {
+    return c.json({ error: "Listing not found" }, 404);
+  }
+  if (listing.seller_id !== profile.id) {
+    return c.json({ error: "Not authorized to upload video for this listing" }, 403);
+  }
+
+  // Path layout: <profile_id>/<listing_id>/<random>.<ext>
+  // Random suffix prevents collision when replacing a video — old one stays
+  // until explicitly deleted, so partial uploads don't clobber the live video.
+  const fileId = crypto.randomUUID();
+  const storagePath = `${profile.id}/${listingId}/${fileId}.${ext}`;
+
+  const { data: signed, error: signError } = await supabase.storage
+    .from(VIDEO_BUCKET)
+    .createSignedUploadUrl(storagePath);
+
+  if (signError || !signed) {
+    console.error("Error creating signed upload URL:", signError);
+    return c.json({ error: "Failed to create upload URL" }, 500);
+  }
+
+  const { data: publicUrlData } = supabase.storage
+    .from(VIDEO_BUCKET)
+    .getPublicUrl(storagePath);
+
+  return c.json({
+    signed_url: signed.signedUrl,
+    token: signed.token,
+    storage_path: storagePath,
+    public_url: publicUrlData.publicUrl,
+  });
+});
+
+/**
+ * DELETE /api/listings/:id/video
+ * Removes the video file from storage and clears the URL columns on the listing.
+ */
+listings.delete("/:id/video", clerkMiddleware, requireProfile, async (c) => {
+  const listingId = c.req.param("id");
+  const profile = c.get("profile");
+  const supabase = createSupabaseAdmin();
+
+  const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  if (!uuidRegex.test(listingId)) {
+    return c.json({ error: "Invalid listing ID format" }, 400);
+  }
+
+  const { data: listing, error: fetchError } = await supabase
+    .from("listings")
+    .select("id, seller_id, video_storage_path")
+    .eq("id", listingId)
+    .single();
+
+  if (fetchError || !listing) {
+    return c.json({ error: "Listing not found" }, 404);
+  }
+  if (listing.seller_id !== profile.id) {
+    return c.json({ error: "Not authorized to delete video for this listing" }, 403);
+  }
+
+  if (listing.video_storage_path) {
+    const { error: removeError } = await supabase.storage
+      .from(VIDEO_BUCKET)
+      .remove([listing.video_storage_path]);
+    if (removeError) {
+      console.error("Error removing video from storage:", removeError);
+      // Continue — still clear the DB columns so the listing isn't broken
+    }
+  }
+
+  const { error: updateError } = await supabase
+    .from("listings")
+    .update({ video_url: null, video_storage_path: null })
+    .eq("id", listingId);
+
+  if (updateError) {
+    console.error("Error clearing video columns:", updateError);
+    return c.json({ error: "Failed to clear video on listing" }, 500);
+  }
 
   return c.body(null, 204);
 });

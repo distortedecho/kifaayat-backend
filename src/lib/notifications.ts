@@ -71,6 +71,9 @@ export const NOTIFICATION_CATEGORY_MAP: Record<string, NotificationCategory> = {
   re_engagement: 'marketing',
   // Seller follow (engagement)
   followed_seller_new_listing: 'engagement',
+  // Forum comments / replies (engagement)
+  listing_comment: 'engagement',
+  comment_reply: 'engagement',
 };
 
 /** Default push_enabled value for categories without an explicit user preference */
@@ -175,16 +178,30 @@ export async function createNotification(
     }
 
     // 2. Always insert in-app notification row (visible in notification center)
-    const { error } = await supabase.from("notifications").insert({
-      user_id: params.user_id,
-      type: params.type,
-      title: params.title,
-      body: params.body,
-      data: params.data || {},
-    });
+    const { error, data: newRow } = await supabase
+      .from("notifications")
+      .insert({
+        user_id: params.user_id,
+        type: params.type,
+        title: params.title,
+        body: params.body,
+        data: params.data || {},
+      })
+      .select()
+      .single();
 
     if (error) {
       console.error("Error creating notification:", error);
+    }
+
+    // Broadcast to in-app realtime channel (fire-and-forget)
+    if (newRow) {
+      createSupabaseAdmin()
+        .channel(`user:${params.user_id}`)
+        .send({ type: "broadcast", event: "new_notification", payload: newRow })
+        .catch((err: unknown) =>
+          console.error("[realtime] notification broadcast error:", err)
+        );
     }
 
     // 3. Determine if push should be sent based on user preferences
