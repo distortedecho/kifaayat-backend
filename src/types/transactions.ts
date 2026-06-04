@@ -215,7 +215,7 @@ export interface Review {
 // ============================================================
 
 /** Platform commission rate (percentage) */
-export const COMMISSION_RATE = 12;
+export const COMMISSION_RATE = 15;
 
 /** Maximum offer rounds before expiry */
 export const MAX_OFFER_ROUNDS = 3;
@@ -227,7 +227,7 @@ export const OFFER_EXPIRY_HOURS = 48;
 export const ACCEPTED_OFFER_PAYMENT_HOURS = 24;
 
 /** Days after shipping before auto-complete */
-export const AUTO_COMPLETE_DAYS = 7;
+export const AUTO_COMPLETE_DAYS = 10;
 
 /** Days after order completion before review window closes and auto-reveal */
 export const REVIEW_WINDOW_DAYS = 14;

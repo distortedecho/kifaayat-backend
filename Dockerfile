@@ -1,10 +1,9 @@
 FROM node:20-slim AS base
 
-# curl is needed at runtime for the HEALTHCHECK probe below.
+# python3 + build-essential are needed for native module builds (sharp, etc.).
 RUN apt-get update && apt-get install -y \
     python3 \
     build-essential \
-    curl \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -27,13 +26,12 @@ COPY --chown=node:node src ./src
 COPY --chown=node:node tsconfig.json ./
 
 ENV NODE_ENV=production
-ENV PORT=3001
 
-EXPOSE 3001
-
-# Liveness probe — hits the public /health route every 30s.
-HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
-    CMD curl -f http://localhost:3001/health || exit 1
+# Container port is assigned at runtime by the host (Railway injects $PORT).
+# Server reads process.env.PORT in src/index.ts. No EXPOSE / HEALTHCHECK here —
+# the host's own healthcheck (configured in Railway dashboard / railway.toml)
+# probes /health on the correct port. A Dockerfile HEALTHCHECK with a
+# hardcoded port will fail every deploy and cause SIGTERMs.
 
 # Drop root before running the app.
 USER node

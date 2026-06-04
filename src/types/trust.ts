@@ -33,10 +33,10 @@ export const DEFAULT_TIER_THRESHOLDS: Record<string, TierThreshold> = {
 
 /** Default commission rates per trust tier */
 export const DEFAULT_TIER_COMMISSION_RATES: TierCommissionRates = {
-  "0": 12,
-  "1": 11,
-  "2": 10,
-  "3": 8,
+  "0": 15,
+  "1": 13,
+  "2": 11,
+  "3": 9,
 };
 
 /** Listing badge types */

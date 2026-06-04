@@ -27,6 +27,7 @@ interface ListingSummaryWithSavedAt {
   condition: string;
   estimated_size: string | null;
   size_type: string | null;
+  designer_name: string | null;
   cover_photo_url: string | null;
   seller_name: string | null;
   seller_location: string | null;
@@ -253,7 +254,7 @@ wishlists.get("/", optionalClerkMiddleware, async (c) => {
   let query = supabase
     .from("wishlists")
     .select(
-      "id, listing_id, folder_id, created_at, listings!wishlists_listing_id_fkey(id, title, price_amount, price_currency, original_price_amount, category, condition, estimated_size, size_type, status, listing_photos(url, position), profiles!listings_seller_id_fkey(display_name, location))",
+      "id, listing_id, folder_id, created_at, listings!wishlists_listing_id_fkey(id, title, price_amount, price_currency, original_price_amount, category, condition, estimated_size, size_type, designer_name, status, listing_photos(url, position), profiles!listings_seller_id_fkey(display_name, location))",
       { count: "exact" }
     )
     .order("created_at", { ascending: false })
@@ -305,6 +306,7 @@ wishlists.get("/", optionalClerkMiddleware, async (c) => {
         condition: listing.condition as string,
         estimated_size: (listing.estimated_size as string) || null,
         size_type: (listing.size_type as string) || null,
+        designer_name: (listing.designer_name as string) || null,
         cover_photo_url: coverUrl,
         seller_name: profiles ? (profiles.display_name as string | null) : null,
         seller_location: profiles ? (profiles.location as string | null) : null,

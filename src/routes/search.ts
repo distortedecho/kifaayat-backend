@@ -18,6 +18,9 @@ interface ListingSummary {
   original_price_amount: number | null;
   category: string;
   condition: string;
+  estimated_size: string | null;
+  size_type: string | null;
+  designer_name: string | null;
   cover_photo_url: string | null;
   seller_name: string | null;
   seller_location: string | null;
@@ -201,7 +204,7 @@ search.get("/", optionalClerkMiddleware, async (c) => {
   let query = supabase
     .from("listings")
     .select(
-      "id, title, description, price_amount, price_currency, original_price_amount, category, condition, measurements, occasion_tags, colors, created_at, listing_photos(url, position), profiles!listings_seller_id_fkey(display_name, location, trust_tier)",
+      "id, title, description, price_amount, price_currency, original_price_amount, category, condition, estimated_size, size_type, designer_name, measurements, occasion_tags, colors, created_at, listing_photos(url, position), profiles!listings_seller_id_fkey(display_name, location, trust_tier)",
       { count: "estimated" }
     )
     .eq("status", "active");
@@ -399,6 +402,9 @@ search.get("/", optionalClerkMiddleware, async (c) => {
         original_price_amount: (row.original_price_amount as number) || null,
         category,
         condition: row.condition as string,
+        estimated_size: (row.estimated_size as string | null) ?? null,
+        size_type: (row.size_type as string | null) ?? null,
+        designer_name: (row.designer_name as string | null) ?? null,
         cover_photo_url: coverUrl,
         seller_name: profiles
           ? (profiles.display_name as string | null)

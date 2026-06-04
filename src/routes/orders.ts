@@ -499,6 +499,130 @@ orders.patch("/:id/deliver", clerkMiddleware, requireProfile, async (c) => {
 });
 
 /**
+ * POST /api/orders/:id/confirm-received
+ * Buyer confirms they received the item. Transitions the order straight to
+ * `complete` (skipping the intermediate `delivered` state when called from
+ * `shipped`), so reviews unlock immediately. Fires the delivered notification
+ * to the seller if it hadn't been fired yet, then the complete notifications.
+ */
+orders.post("/:id/confirm-received", clerkMiddleware, requireProfile, async (c) => {
+  const orderId = c.req.param("id");
+  const profile = c.get("profile");
+  const supabase = createSupabaseAdmin();
+
+  if (!UUID_REGEX.test(orderId)) {
+    return c.json({ error: "Invalid order ID format" }, 400);
+  }
+
+  const { data: order, error: fetchError } = await supabase
+    .from("orders")
+    .select("*, listings!orders_listing_id_fkey(title)")
+    .eq("id", orderId)
+    .single();
+
+  if (fetchError || !order) {
+    return c.json({ error: "Order not found" }, 404);
+  }
+
+  if (order.buyer_id !== profile.id) {
+    return c.json({ error: "Only the buyer can confirm receipt" }, 403);
+  }
+
+  if (order.status !== "shipped" && order.status !== "delivered") {
+    return c.json(
+      { error: `Cannot confirm receipt for order with status '${order.status}'` },
+      400
+    );
+  }
+
+  const wasShipped = order.status === "shipped";
+  const now = new Date().toISOString();
+
+  const { data: updatedOrder, error: updateError } = await supabase
+    .from("orders")
+    .update({
+      status: "complete" as OrderStatus,
+      delivered_at: order.delivered_at || now,
+      completed_at: now,
+    })
+    .eq("id", orderId)
+    .select()
+    .single();
+
+  if (updateError) {
+    console.error("Error confirming receipt:", updateError);
+    return c.json({ error: "Failed to confirm receipt" }, 500);
+  }
+
+  const listing = order.listings as Record<string, unknown>;
+
+  // If we skipped the explicit delivered transition, still fire the
+  // "delivered" notification to the seller so their timeline is correct.
+  if (wasShipped) {
+    const deliveredTemplate = orderDeliveredNotification(listing.title as string);
+    await createNotification({
+      user_id: order.seller_id,
+      type: "order_delivered",
+      ...deliveredTemplate,
+      data: { order_id: orderId, listing_id: order.listing_id },
+    });
+  }
+
+  // Complete notifications for both parties
+  if (order.buyer_id) {
+    const buyerTemplate = orderCompleteNotification(listing.title as string, "buyer");
+    await createNotification({
+      user_id: order.buyer_id,
+      type: "order_complete",
+      ...buyerTemplate,
+      data: { order_id: orderId, listing_id: order.listing_id },
+    });
+  }
+  const sellerTemplate = orderCompleteNotification(
+    listing.title as string,
+    "seller",
+    order.seller_payout,
+    order.currency
+  );
+  await createNotification({
+    user_id: order.seller_id,
+    type: "order_complete",
+    ...sellerTemplate,
+    data: { order_id: orderId, listing_id: order.listing_id },
+  });
+
+  // Fire-and-forget referral credit check (mirrors /complete)
+  if (order.buyer_id) {
+    (async () => {
+      try {
+        const isFirst = await isFirstCompletedOrder(order.buyer_id);
+        if (isFirst) {
+          const { data: referral } = await supabase
+            .from("referrals")
+            .select("*, referral_codes!referrals_referral_code_id_fkey(user_id)")
+            .eq("referred_id", order.buyer_id)
+            .eq("status", "pending")
+            .single();
+
+          if (referral) {
+            await awardReferralCredits({
+              referrer_id: (referral.referral_codes as { user_id: string }).user_id,
+              referred_id: order.buyer_id,
+              referral_code_id: referral.referral_code_id,
+              qualifying_order_id: orderId,
+            });
+          }
+        }
+      } catch (err) {
+        console.error("Error processing referral credit:", err);
+      }
+    })();
+  }
+
+  return c.json({ order: updatedOrder });
+});
+
+/**
  * PATCH /api/orders/:id/complete
  * Mark order as complete.
  */

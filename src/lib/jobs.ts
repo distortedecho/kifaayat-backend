@@ -68,6 +68,10 @@ function getBossInstance(): PgBoss | null {
   if (!url) return null;
   _boss = new PgBoss({
     connectionString: url,
+    // Supabase session-mode pooler caps at ~15 connections. Keep pg-boss's
+    // internal pool small so the rest of the app (direct postgres-js client,
+    // Supabase JS) has room to breathe. 5 is enough for normal job throughput.
+    max: 5,
     // Supavisor transaction pooler cannot handle prepared statements;
     // pg-boss uses its own `pg` client internally but the default
     // `schema` is fine since it auto-creates a pgboss schema.

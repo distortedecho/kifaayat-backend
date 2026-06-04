@@ -171,7 +171,7 @@ sellers.get("/:id/wishlist", optionalClerkMiddleware, async (c) => {
   const { data: wishlistRows } = await supabase
     .from("wishlists")
     .select(
-      "listing_id, created_at, listings!wishlists_listing_id_fkey(id, title, price_amount, price_currency, original_price_amount, category, condition, seller_id, listing_photos(url, position), profiles!listings_seller_id_fkey(display_name, location))"
+      "listing_id, created_at, listings!wishlists_listing_id_fkey(id, title, price_amount, price_currency, original_price_amount, category, condition, estimated_size, size_type, designer_name, seller_id, listing_photos(url, position), profiles!listings_seller_id_fkey(display_name, location))"
     )
     .eq("user_id", sellerId)
     .order("created_at", { ascending: false })
@@ -193,6 +193,9 @@ sellers.get("/:id/wishlist", optionalClerkMiddleware, async (c) => {
         original_price_amount: l.original_price_amount as number | null,
         category: l.category as string,
         condition: l.condition as string,
+        estimated_size: (l.estimated_size as string | null) ?? null,
+        size_type: (l.size_type as string | null) ?? null,
+        designer_name: (l.designer_name as string | null) ?? null,
         cover_photo_url: (cover?.url as string) || null,
         seller_name: sellerProf?.display_name as string | null,
         seller_location: sellerProf?.location as string | null,
@@ -250,7 +253,7 @@ sellers.get("/:id", optionalClerkMiddleware, async (c) => {
 
     supabase
       .from("listings")
-      .select("id, title, price_amount, price_currency, original_price_amount, category, condition")
+      .select("id, title, price_amount, price_currency, original_price_amount, category, condition, estimated_size, size_type, designer_name")
       .eq("seller_id", sellerId)
       .eq("status", "active")
       .order("created_at", { ascending: false })
@@ -327,6 +330,9 @@ sellers.get("/:id", optionalClerkMiddleware, async (c) => {
     original_price_amount: listing.original_price_amount,
     category: listing.category,
     condition: listing.condition,
+    estimated_size: listing.estimated_size ?? null,
+    size_type: listing.size_type ?? null,
+    designer_name: listing.designer_name ?? null,
     cover_photo_url: coverPhotos[listing.id] || null,
   }));
 
