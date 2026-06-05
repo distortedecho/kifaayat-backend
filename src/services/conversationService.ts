@@ -159,6 +159,9 @@ export async function sendMessage(
     conversation.buyer_id === params.senderProfileId
       ? conversation.seller_id
       : conversation.buyer_id;
+  // Recipient's role on the conversation.
+  const recipientRole: "buyer" | "seller" =
+    recipientId === conversation.seller_id ? "seller" : "buyer";
 
   const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000).toISOString();
   const { count: recentCount } = await supabase
@@ -174,6 +177,7 @@ export async function sendMessage(
       conversationId: params.conversationId,
       listingId: conversation.listing_id,
       recipientId,
+      recipientRole,
       senderId: params.senderProfileId,
       senderName,
       preview,

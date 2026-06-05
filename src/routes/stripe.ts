@@ -632,7 +632,8 @@ stripeRoutes.post("/webhook", async (c) => {
           type: "boost_activated",
           title: "Boost Activated",
           body: "Your listing boost is now active! It will appear at the top of search results.",
-          data: { listing_id: boostListingId },
+          // Boosts are a seller-only action.
+          data: { listing_id: boostListingId, role: "seller" },
         });
       }
 
@@ -769,7 +770,7 @@ stripeRoutes.post("/webhook", async (c) => {
             user_id: group.seller_id,
             type: "order_paid",
             ...paidTemplate,
-            data: { order_id: order.id },
+            data: { order_id: order.id, role: "seller" },
           });
 
           enqueueDelayed(JOB_AUTO_REJECT_ORDER, { orderId: order.id }, 48 * 60 * 60).catch(
@@ -929,7 +930,7 @@ stripeRoutes.post("/webhook", async (c) => {
       user_id: listing.seller_id,
       type: "order_paid",
       ...paidTemplate,
-      data: { listing_id: listingId, order_id: order.id },
+      data: { listing_id: listingId, order_id: order.id, role: "seller" },
     });
 
     // Record referral and award voucher to referrer if a referral code was used

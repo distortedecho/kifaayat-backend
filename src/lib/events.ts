@@ -44,6 +44,9 @@ export interface AppEventMap {
     listingId: string;
     listingTitle: string;
     notifyUserId: string;
+    // Role of the notification recipient (the party whose offer was accepted).
+    // Used to bucket notifications under buying vs selling on the client.
+    recipientRole: "buyer" | "seller";
     amount: number;
     currency: string;
   };
@@ -52,6 +55,7 @@ export interface AppEventMap {
     listingId: string;
     listingTitle: string;
     notifyUserId: string;
+    recipientRole: "buyer" | "seller";
     amount: number;
     currency: string;
   };
@@ -70,6 +74,8 @@ export interface AppEventMap {
     conversationId: string;
     listingId: string;
     recipientId: string;
+    // Role of the recipient on the underlying conversation (buyer or seller).
+    recipientRole: "buyer" | "seller";
     senderId: string;
     senderName: string;
     preview: string;

@@ -370,7 +370,8 @@ admin.post("/listings/:id/approve", async (c) => {
               type: "followed_seller_new_listing",
               title: template.title,
               body: template.body,
-              data: { listing_id: listingId, seller_id: sellerId },
+              // Followers receive this as buyers — discovery surface.
+              data: { listing_id: listingId, seller_id: sellerId, role: "buyer" },
             }).catch(() => {});
           }
         }
@@ -500,7 +501,7 @@ admin.post("/listings/batch", async (c) => {
           type: action === "approve" ? "listing_approved" : "listing_rejected",
           title: template.title,
           body: template.body,
-          data: { listing_id: id },
+          data: { listing_id: id, role: "seller" },
         }).catch((err) => console.error("[admin] Batch notification error:", err));
 
         const { data: coverPhoto } = await supabase
@@ -541,7 +542,7 @@ admin.post("/listings/batch", async (c) => {
                     type: "followed_seller_new_listing",
                     title: tmpl.title,
                     body: tmpl.body,
-                    data: { listing_id: id, seller_id: seller.id },
+                    data: { listing_id: id, seller_id: seller.id, role: "buyer" },
                   }).catch(() => {});
                 }
               }
@@ -1559,7 +1560,8 @@ admin.post("/cron/recalculate-tiers", async (c) => {
         type: "tier_upgrade",
         title: template.title,
         body: template.body,
-        data: { new_tier: change.newTier, old_tier: change.oldTier },
+        // Tier changes are seller-only.
+        data: { new_tier: change.newTier, old_tier: change.oldTier, role: "seller" },
       }).catch((err) => console.error("[cron] Tier upgrade notification error:", err));
     } else {
       const template = tierDowngradeNotification(
@@ -1573,7 +1575,7 @@ admin.post("/cron/recalculate-tiers", async (c) => {
         type: "tier_downgrade",
         title: template.title,
         body: template.body,
-        data: { new_tier: change.newTier, old_tier: change.oldTier },
+        data: { new_tier: change.newTier, old_tier: change.oldTier, role: "seller" },
       }).catch((err) => console.error("[cron] Tier downgrade notification error:", err));
     }
   }
@@ -2223,13 +2225,13 @@ admin.post("/moderation/suspend", async (c) => {
       .in("entity_id", userMessageIds);
   }
 
-  // Create notification for the user
+  // Create notification for the user — system-level, no buyer/seller role.
   createNotification({
     user_id: parsed.data.user_id,
     type: "account_suspended",
     title: "Account Suspended",
     body: `Your account has been suspended: ${parsed.data.reason}`,
-    data: { reason: parsed.data.reason },
+    data: { reason: parsed.data.reason, role: "system" },
   }).catch((err) => console.error("[admin] Suspension notification error:", err));
 
   return c.json({ success: true });

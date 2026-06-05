@@ -26,6 +26,8 @@ import cart from "./routes/cart.js";
 import referrals from "./routes/referrals.js";
 import iso from "./routes/iso.js";
 import sitemap from "./routes/sitemap.js";
+import config from "./routes/config.js";
+import addresses from "./routes/addresses.js";
 import {
   initJobQueue,
   scheduleRecurringJobs,
@@ -169,6 +171,7 @@ const writeRouteGroups = [
   "iso",
   "cart",
   "wishlists",
+  "addresses",
 ] as const;
 for (const group of writeRouteGroups) {
   app.use(`/api/${group}/*`, writeLimiter);
@@ -210,6 +213,8 @@ v1.route("/admin", admin);
 v1.route("/cart", cart);
 v1.route("/referrals", referrals);
 v1.route("/iso", iso);
+v1.route("/listing-config", config);
+v1.route("/addresses", addresses);
 
 // Canonical versioned mount
 app.route("/api/v1", v1);

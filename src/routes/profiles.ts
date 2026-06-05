@@ -6,6 +6,32 @@ import { createSupabaseAdmin } from "../lib/supabase.js";
 
 const profiles = new Hono();
 
+/**
+ * Follower / following counts attached to GET /api/profiles/me so the
+ * profile screen can render them in one round-trip. Other stats
+ * (avg_rating, listing_count, sold_count) already live on dedicated
+ * endpoints the frontend calls separately — don't duplicate them here.
+ */
+async function fetchFollowCounts(
+  supabase: ReturnType<typeof createSupabaseAdmin>,
+  userId: string
+): Promise<{ follower_count: number; following_count: number }> {
+  const [{ count: followerCount }, { count: followingCount }] = await Promise.all([
+    supabase
+      .from("seller_follows")
+      .select("id", { count: "exact", head: true })
+      .eq("seller_id", userId),
+    supabase
+      .from("seller_follows")
+      .select("id", { count: "exact", head: true })
+      .eq("follower_id", userId),
+  ]);
+  return {
+    follower_count: followerCount || 0,
+    following_count: followingCount || 0,
+  };
+}
+
 // Zod schema for profile updates
 const updateProfileSchema = z.object({
   display_name: z
@@ -67,7 +93,8 @@ profiles.get("/me", clerkMiddleware, async (c) => {
   }
 
   if (profile) {
-    return c.json({ profile });
+    const counts = await fetchFollowCounts(supabase, profile.id);
+    return c.json({ profile: { ...profile, ...counts } });
   }
 
   // Profile doesn't exist — create one
@@ -139,7 +166,10 @@ profiles.get("/me", clerkMiddleware, async (c) => {
     }
   })();
 
-  return c.json({ profile: newProfile }, 201);
+  return c.json(
+    { profile: { ...newProfile, follower_count: 0, following_count: 0 } },
+    201
+  );
 });
 
 /**
@@ -178,7 +208,8 @@ profiles.put("/me", clerkMiddleware, async (c) => {
     return c.json({ error: "Profile not found" }, 404);
   }
 
-  // Merge existing data with updates to check completeness
+  // Addresses live in their own table (user_addresses) so users can save
+  // multiple. Profile completeness stays at the original bar: name + country.
   const merged = { ...existingProfile, ...updateData };
   const profileComplete =
     !!merged.display_name &&

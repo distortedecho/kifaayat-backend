@@ -335,6 +335,73 @@ orders.get("/:id", clerkMiddleware, requireProfile, async (c) => {
 });
 
 /**
+ * GET /api/orders/:id/buyer-address
+ * Returns the buyer's CURRENT default shipping address for this order.
+ * Only the seller (or buyer) on this order can view it.
+ *
+ * Returns the live default — if the buyer updates their default address
+ * after ordering, the seller will see the new one. If you need an address
+ * snapshot frozen at order time, switch to storing a copy on the order row.
+ *
+ * 400 — guest order (no buyer profile, no saved address)
+ * 403 — caller is not the buyer or seller on this order
+ * 404 — order not found, or buyer hasn't saved any address yet
+ */
+orders.get("/:id/buyer-address", clerkMiddleware, requireProfile, async (c) => {
+  const orderId = c.req.param("id");
+  const profile = c.get("profile");
+  const supabase = createSupabaseAdmin();
+
+  if (!UUID_REGEX.test(orderId)) {
+    return c.json({ error: "Invalid order ID format" }, 400);
+  }
+
+  const { data: order, error: orderError } = await supabase
+    .from("orders")
+    .select("id, buyer_id, seller_id")
+    .eq("id", orderId)
+    .single();
+
+  if (orderError || !order) {
+    return c.json({ error: "Order not found" }, 404);
+  }
+
+  if (order.buyer_id !== profile.id && order.seller_id !== profile.id) {
+    return c.json({ error: "Not authorized to view this address" }, 403);
+  }
+
+  if (!order.buyer_id) {
+    return c.json({ error: "Guest order has no saved buyer address" }, 400);
+  }
+
+  // Prefer the buyer's default; fall back to most-recent saved address.
+  const { data: defaultAddress } = await supabase
+    .from("user_addresses")
+    .select("*")
+    .eq("user_id", order.buyer_id)
+    .eq("is_default", true)
+    .maybeSingle();
+
+  if (defaultAddress) {
+    return c.json({ address: defaultAddress });
+  }
+
+  const { data: anyAddress } = await supabase
+    .from("user_addresses")
+    .select("*")
+    .eq("user_id", order.buyer_id)
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (!anyAddress) {
+    return c.json({ error: "Buyer has not saved a shipping address yet" }, 404);
+  }
+
+  return c.json({ address: anyAddress });
+});
+
+/**
  * PATCH /api/orders/:id/ship
  * Seller marks order as shipped.
  */
@@ -425,7 +492,7 @@ orders.patch("/:id/ship", clerkMiddleware, requireProfile, async (c) => {
       user_id: order.buyer_id,
       type: "order_shipped",
       ...shippedTemplate,
-      data: { order_id: orderId, listing_id: order.listing_id },
+      data: { order_id: orderId, listing_id: order.listing_id, role: "buyer" },
     });
   }
 
@@ -492,7 +559,7 @@ orders.patch("/:id/deliver", clerkMiddleware, requireProfile, async (c) => {
     user_id: order.seller_id,
     type: "order_delivered",
     ...deliveredTemplate,
-    data: { order_id: orderId, listing_id: order.listing_id },
+    data: { order_id: orderId, listing_id: order.listing_id, role: "seller" },
   });
 
   return c.json({ order: updatedOrder });
@@ -564,7 +631,7 @@ orders.post("/:id/confirm-received", clerkMiddleware, requireProfile, async (c) 
       user_id: order.seller_id,
       type: "order_delivered",
       ...deliveredTemplate,
-      data: { order_id: orderId, listing_id: order.listing_id },
+      data: { order_id: orderId, listing_id: order.listing_id, role: "seller" },
     });
   }
 
@@ -575,7 +642,7 @@ orders.post("/:id/confirm-received", clerkMiddleware, requireProfile, async (c) 
       user_id: order.buyer_id,
       type: "order_complete",
       ...buyerTemplate,
-      data: { order_id: orderId, listing_id: order.listing_id },
+      data: { order_id: orderId, listing_id: order.listing_id, role: "buyer" },
     });
   }
   const sellerTemplate = orderCompleteNotification(
@@ -588,7 +655,7 @@ orders.post("/:id/confirm-received", clerkMiddleware, requireProfile, async (c) 
     user_id: order.seller_id,
     type: "order_complete",
     ...sellerTemplate,
-    data: { order_id: orderId, listing_id: order.listing_id },
+    data: { order_id: orderId, listing_id: order.listing_id, role: "seller" },
   });
 
   // Fire-and-forget referral credit check (mirrors /complete)
@@ -685,7 +752,7 @@ orders.patch("/:id/complete", clerkMiddleware, requireProfile, async (c) => {
       user_id: order.buyer_id,
       type: "order_complete",
       ...buyerTemplate,
-      data: { order_id: orderId, listing_id: order.listing_id },
+      data: { order_id: orderId, listing_id: order.listing_id, role: "buyer" },
     });
   }
 
@@ -699,7 +766,7 @@ orders.patch("/:id/complete", clerkMiddleware, requireProfile, async (c) => {
     user_id: order.seller_id,
     type: "order_complete",
     ...sellerTemplate,
-    data: { order_id: orderId, listing_id: order.listing_id },
+    data: { order_id: orderId, listing_id: order.listing_id, role: "seller" },
   });
 
   // Fire-and-forget referral credit check
@@ -789,7 +856,7 @@ orders.post("/:id/accept", clerkMiddleware, requireProfile, async (c) => {
       user_id: order.buyer_id,
       type: "order_accepted",
       ...orderAcceptedNotification(listing.title as string),
-      data: { order_id: orderId, listing_id: order.listing_id },
+      data: { order_id: orderId, listing_id: order.listing_id, role: "buyer" },
     });
   }
 
@@ -875,7 +942,7 @@ orders.post("/:id/reject", clerkMiddleware, requireProfile, async (c) => {
       user_id: order.buyer_id,
       type: "order_rejected",
       ...orderRejectedNotification(listing.title as string, reason),
-      data: { order_id: orderId, listing_id: order.listing_id },
+      data: { order_id: orderId, listing_id: order.listing_id, role: "buyer" },
     });
   }
 
@@ -951,7 +1018,7 @@ orders.post("/cron/auto-complete", async (c) => {
         user_id: order.buyer_id,
         type: "order_complete",
         ...buyerAutoTemplate,
-        data: { order_id: order.id, listing_id: order.listing_id },
+        data: { order_id: order.id, listing_id: order.listing_id, role: "buyer" },
       });
     }
 
@@ -966,7 +1033,7 @@ orders.post("/cron/auto-complete", async (c) => {
       user_id: order.seller_id,
       type: "order_complete",
       ...sellerAutoTemplate,
-      data: { order_id: order.id, listing_id: order.listing_id },
+      data: { order_id: order.id, listing_id: order.listing_id, role: "seller" },
     });
 
     // Fire-and-forget referral credit check

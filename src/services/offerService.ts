@@ -96,11 +96,14 @@ export async function acceptOffer(
     .eq("id", listing.id as string);
 
   const notifyUserId = isSeller ? offer.buyer_id : offer.seller_id;
+  // If the caller is the seller, the recipient is the buyer (and vice versa).
+  const recipientRole: "buyer" | "seller" = isSeller ? "buyer" : "seller";
   emit("offer:accepted", {
     offerId,
     listingId: offer.listing_id,
     listingTitle: listing.title as string,
     notifyUserId,
+    recipientRole,
     amount: offer.amount,
     currency: offer.currency,
   });
@@ -157,11 +160,13 @@ export async function declineOffer(
 
   const listing = offer.listings as Record<string, unknown>;
   const notifyUserId = isSeller ? offer.buyer_id : offer.seller_id;
+  const recipientRole: "buyer" | "seller" = isSeller ? "buyer" : "seller";
   emit("offer:rejected", {
     offerId,
     listingId: offer.listing_id,
     listingTitle: listing.title as string,
     notifyUserId,
+    recipientRole,
     amount: offer.amount,
     currency: offer.currency,
   });

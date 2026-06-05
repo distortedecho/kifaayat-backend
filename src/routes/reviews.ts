@@ -259,7 +259,8 @@ reviews.post("/", clerkMiddleware, async (c) => {
       user_id: profile.id,
       type: "review_revealed",
       ...template1,
-      data: { order_id, listing_id: order.listing_id },
+      // Recipient is the current reviewer — their role is reviewerRole.
+      data: { order_id, listing_id: order.listing_id, role: reviewerRole },
     }).catch((err) =>
       console.error("Notification error (fire-and-forget):", err)
     );
@@ -270,7 +271,8 @@ reviews.post("/", clerkMiddleware, async (c) => {
       user_id: revieweeId,
       type: "review_revealed",
       ...template2,
-      data: { order_id, listing_id: order.listing_id },
+      // Recipient is the reviewee — opposite role from reviewer.
+      data: { order_id, listing_id: order.listing_id, role: reviewerRole === "buyer" ? "seller" : "buyer" },
     }).catch((err) =>
       console.error("Notification error (fire-and-forget):", err)
     );
@@ -556,6 +558,8 @@ reviews.post("/:id/reply", clerkMiddleware, async (c) => {
       order_id: review.order_id,
       listing_id: order?.listing_id || "",
       review_id: reviewId,
+      // Seller replies are gated to buyer reviews above; recipient is always the buyer.
+      role: "buyer",
     },
   }).catch((err) =>
     console.error("Notification error (fire-and-forget):", err)
@@ -833,7 +837,7 @@ reviews.post("/cron/auto-reveal", async (c) => {
         user_id: buyerId,
         type: "review_revealed",
         ...template,
-        data: { order_id: orderId, listing_id: listingId },
+        data: { order_id: orderId, listing_id: listingId, role: "buyer" },
       }).catch((err) =>
         console.error("Notification error (fire-and-forget):", err)
       );
@@ -846,7 +850,7 @@ reviews.post("/cron/auto-reveal", async (c) => {
         user_id: sellerId,
         type: "review_revealed",
         ...template,
-        data: { order_id: orderId, listing_id: listingId },
+        data: { order_id: orderId, listing_id: listingId, role: "seller" },
       }).catch((err) =>
         console.error("Notification error (fire-and-forget):", err)
       );
@@ -938,7 +942,7 @@ reviews.post("/cron/remind", async (c) => {
         user_id: order.buyer_id,
         type: "review_reminder",
         ...template,
-        data: { order_id: order.id, listing_id: order.listing_id },
+        data: { order_id: order.id, listing_id: order.listing_id, role: "buyer" },
       }).catch((err) =>
         console.error("Notification error (fire-and-forget):", err)
       );
@@ -952,7 +956,7 @@ reviews.post("/cron/remind", async (c) => {
         user_id: order.seller_id,
         type: "review_reminder",
         ...template,
-        data: { order_id: order.id, listing_id: order.listing_id },
+        data: { order_id: order.id, listing_id: order.listing_id, role: "seller" },
       }).catch((err) =>
         console.error("Notification error (fire-and-forget):", err)
       );

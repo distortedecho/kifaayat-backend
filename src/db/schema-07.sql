@@ -176,6 +176,71 @@ ALTER TABLE reviews ADD COLUMN IF NOT EXISTS tags TEXT[] DEFAULT '{}';
 ALTER TABLE profiles ADD COLUMN IF NOT EXISTS bio TEXT;
 
 -- -------------------------
+-- user_addresses — multiple addresses per user
+-- -------------------------
+-- Users can save several addresses (home, work, parents', etc.) and pick one
+-- as default for checkout pre-fill. RLS limits each user to their own rows.
+-- Country code lives on the address (not just on profile) so users can have
+-- addresses in different markets (e.g. AU primary, NZ holiday home).
+CREATE TABLE IF NOT EXISTS user_addresses (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+  label TEXT,                     -- optional nickname e.g. "Home", "Work"
+  recipient_name TEXT,            -- who the package is for (defaults to profile.display_name)
+  street_line1 TEXT NOT NULL,
+  street_line2 TEXT,
+  city TEXT NOT NULL,
+  state TEXT NOT NULL,
+  postal_code TEXT NOT NULL,
+  country TEXT NOT NULL CHECK (country IN ('AU', 'US', 'NZ', 'CA', 'UK')),
+  phone TEXT,
+  is_default BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_addresses_user_id ON user_addresses(user_id);
+-- Enforce one default per user at the DB layer.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_user_addresses_one_default
+  ON user_addresses(user_id) WHERE is_default = true;
+
+ALTER TABLE user_addresses ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Users can read own addresses"
+  ON user_addresses FOR SELECT
+  USING (user_id IN (
+    SELECT id FROM profiles
+    WHERE clerk_id = current_setting('request.jwt.claims', true)::json->>'sub'
+  ));
+
+CREATE POLICY "Users can insert own addresses"
+  ON user_addresses FOR INSERT
+  WITH CHECK (user_id IN (
+    SELECT id FROM profiles
+    WHERE clerk_id = current_setting('request.jwt.claims', true)::json->>'sub'
+  ));
+
+CREATE POLICY "Users can update own addresses"
+  ON user_addresses FOR UPDATE
+  USING (user_id IN (
+    SELECT id FROM profiles
+    WHERE clerk_id = current_setting('request.jwt.claims', true)::json->>'sub'
+  ));
+
+CREATE POLICY "Users can delete own addresses"
+  ON user_addresses FOR DELETE
+  USING (user_id IN (
+    SELECT id FROM profiles
+    WHERE clerk_id = current_setting('request.jwt.claims', true)::json->>'sub'
+  ));
+
+-- Tables created via SQL Editor don't get automatic role grants (only
+-- dashboard-created tables do). Without these the service_role gets a
+-- "permission denied for table user_addresses" (42501) even though RLS
+-- would have allowed the query.
+GRANT ALL ON user_addresses TO service_role, authenticated, anon;
+
+-- -------------------------
 -- listing_photos — photo type discriminator
 -- -------------------------
 -- 'product'   = regular gallery photo (default, what we've always had)

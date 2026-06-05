@@ -2,15 +2,22 @@
 // Categories — matching live Play Store app + Footwear
 // ============================================================
 
+// Canonical 9-category taxonomy — matches live Sharetribe platform.
+// Display labels stay as written; Sharetribe IDs are noted in comments:
+//   Lehenga      = lehengas
+//   Saree        = sarees
+//   Suit/Salwar  = salwarsuits
+//   Blouse       = blouses
+//   Indowestern  = indowestern
+//   Menswear     = menswear
+//   Kidswear     = kids
+//   Footwear     = footwear
+//   Other        = other
 export const LISTING_CATEGORIES = [
   "Lehenga",
   "Saree",
   "Suit/Salwar",
-  "Anarkali",
   "Indowestern",
-  "Sharara",
-  "Jewellery",
-  "Dupatta",
   "Blouse",
   "Menswear",
   "Kidswear",
@@ -62,13 +69,12 @@ export type OccasionTag = (typeof OCCASION_TAGS)[number];
 // Predefined Lists — aligned with live app
 // ============================================================
 
-// Fabric types — merged live app + new app values
+// Fabric types — 15 options, matches live Sharetribe platform exactly.
 export const FABRIC_TYPES = [
   "Art silk",
   "Chiffon",
-  "Chinon",
   "Cotton",
-  "Crepe",
+  "Chinon",
   "Georgette",
   "Lawn",
   "Linen",
@@ -79,11 +85,6 @@ export const FABRIC_TYPES = [
   "Satin",
   "Sequin",
   "Velvet",
-  "Brocade",
-  "Banarasi",
-  "Jacquard",
-  "Lycra",
-  "Rayon",
   "Other",
 ] as const;
 export type FabricType = (typeof FABRIC_TYPES)[number];
@@ -114,28 +115,14 @@ export type WorkType = (typeof WORK_TYPES)[number];
 // Items included — matching live Play Store app labels
 // ============================================================
 
+// Items included — only 3 lists exist in Sharetribe (lehengas, sarees, salwar/menswear shared).
+// Blouse, Indowestern, Kidswear, Footwear, Other DO NOT have an items_included field.
 export const ITEMS_INCLUDED_OPTIONS: Record<string, string[]> = {
-  Lehenga: ["Lehenga skirt", "Lehenga top/blouse", "Dupatta", "Matching potli bag/purse"],
+  Lehenga: ["Lehenga skirt", "Dupatta", "Lehenga top/blouse", "Matching potli bag/purse"],
   Saree: ["Stitched Blouse", "Blouse piece (material)", "Petticoat/Underskirt"],
   "Suit/Salwar": ["Kurta/Kurti", "Dupatta", "Bottoms (e.g. Pant, Salwar, Shalwar, Sharara)"],
-  Anarkali: ["Anarkali Kurta", "Bottom (Churidar/Legging)", "Dupatta"],
-  Sharara: ["Top/Kurta", "Sharara", "Dupatta"],
+  // Menswear shares the Suit/Salwar items list per Sharetribe.
   Menswear: ["Kurta/Kurti", "Dupatta", "Bottoms (e.g. Pant, Salwar, Shalwar, Sharara)"],
-  Kidswear: ["Top/Kurta", "Bottom", "Dupatta/Stole", "Accessories"],
-  Jewellery: [
-    "Necklace",
-    "Earrings",
-    "Bangles/Choori",
-    "Maang Tikka",
-    "Ring",
-    "Anklet/Payal",
-    "Nose Ring/Nath",
-  ],
-  Dupatta: ["Dupatta"],
-  Blouse: ["Blouse"],
-  Indowestern: ["Top/Blouse", "Bottom/Skirt", "Dupatta/Stole", "Jacket/Cape"],
-  Footwear: ["Shoes", "Juttis/Mojris", "Sandals", "Heels"],
-  Other: [],
 };
 
 // ============================================================
@@ -298,21 +285,19 @@ export const FOOTWEAR_SIZES = [
 
 export type SizeType = "womens" | "menswear_kidswear" | "footwear" | "free_size";
 
-// Which size chart a category uses
+// Which size chart a category uses (matches Sharetribe field assignments).
+// Sarees have no required size (length only — handled via measurements free text).
+// "Other" allows women's sizing per Sharetribe (estimateWomenSSizeAu applies to "other").
 export const CATEGORY_SIZE_TYPE: Record<ListingCategory, SizeType | null> = {
   Lehenga: "womens",
-  Saree: null,
+  Saree: "womens",
   "Suit/Salwar": "womens",
-  Anarkali: "womens",
   Indowestern: "womens",
-  Sharara: "womens",
-  Jewellery: null,
-  Dupatta: null,
   Blouse: "womens",
   Menswear: "menswear_kidswear",
   Kidswear: "menswear_kidswear",
   Footwear: "footwear",
-  Other: null,
+  Other: "womens",
 };
 
 // Admin curation tag options
@@ -323,6 +308,59 @@ export const CURATION_TAGS = [
   "Popular Brands",
 ] as const;
 export type CurationTag = (typeof CURATION_TAGS)[number];
+
+// ============================================================
+// Per-category field visibility — single source of truth.
+// Matches Sharetribe field assignments from the live platform.
+// Drives both the listing form pickers and GET /api/listing-config.
+// ============================================================
+
+export interface CategoryFieldConfig {
+  size_type: SizeType | null;
+  shows_items_included: boolean;
+  shows_fabric: boolean;
+  shows_dry_cleaning: boolean;
+  shows_measurements: boolean;
+  shows_alteration: boolean;
+  // Fully enumerated list of fields the frontend must collect before allowing
+  // the seller to activate the listing. Universal fields (title, category,
+  // condition, price, original_price, negotiable, photos) appear here too so
+  // the frontend doesn't have to compose from multiple sources.
+  // `photos` represents at least PHOTO_MIN_COUNT (3) product photos.
+  required_fields: string[];
+}
+
+// Universal required fields — apply to every category per Sharetribe spec.
+// Size is added per-category below based on whether size_type is non-null.
+const UNIVERSAL_REQUIRED = [
+  "title",
+  "category",
+  "condition",
+  "price_amount",
+  "original_price_amount",
+  "negotiable",
+  "photos",
+] as const;
+
+/** Minimum number of product photos required to activate a listing. */
+export const PHOTO_MIN_COUNT = 3;
+
+const WITH_SIZE = [...UNIVERSAL_REQUIRED, "estimated_size"];
+
+// "Other" follows strict CSV reading: gets women's size but no clothing-only
+// fields. Flip the bools below if the product team wants Other treated as a
+// clothing catch-all.
+export const LISTING_CATEGORY_CONFIG: Record<ListingCategory, CategoryFieldConfig> = {
+  Lehenga:       { size_type: "womens",            shows_items_included: true,  shows_fabric: true,  shows_dry_cleaning: true,  shows_measurements: true,  shows_alteration: true,  required_fields: WITH_SIZE },
+  Saree:         { size_type: "womens",            shows_items_included: true,  shows_fabric: true,  shows_dry_cleaning: true,  shows_measurements: true,  shows_alteration: true,  required_fields: WITH_SIZE },
+  "Suit/Salwar": { size_type: "womens",            shows_items_included: true,  shows_fabric: true,  shows_dry_cleaning: true,  shows_measurements: true,  shows_alteration: true,  required_fields: WITH_SIZE },
+  Indowestern:   { size_type: "womens",            shows_items_included: false, shows_fabric: true,  shows_dry_cleaning: true,  shows_measurements: true,  shows_alteration: true,  required_fields: WITH_SIZE },
+  Blouse:        { size_type: "womens",            shows_items_included: false, shows_fabric: true,  shows_dry_cleaning: true,  shows_measurements: true,  shows_alteration: true,  required_fields: WITH_SIZE },
+  Menswear:      { size_type: "menswear_kidswear", shows_items_included: true,  shows_fabric: true,  shows_dry_cleaning: true,  shows_measurements: true,  shows_alteration: true,  required_fields: WITH_SIZE },
+  Kidswear:      { size_type: "menswear_kidswear", shows_items_included: false, shows_fabric: true,  shows_dry_cleaning: true,  shows_measurements: true,  shows_alteration: true,  required_fields: WITH_SIZE },
+  Footwear:      { size_type: "footwear",          shows_items_included: false, shows_fabric: false, shows_dry_cleaning: false, shows_measurements: false, shows_alteration: false, required_fields: WITH_SIZE },
+  Other:         { size_type: "womens",            shows_items_included: false, shows_fabric: false, shows_dry_cleaning: false, shows_measurements: false, shows_alteration: false, required_fields: WITH_SIZE },
+};
 
 // ============================================================
 // Measurement fields vary by category
@@ -338,7 +376,11 @@ export interface Measurements {
   age_range?: string;
 }
 
-// Required measurements per category
+// Sharetribe treats measurements as one optional free-text field for all
+// clothing categories. We keep a structured per-category hint list here for
+// the form UX (suggested fields), but none of these are hard-required at the
+// API level — see the listings POST validator which checks measurements as
+// an optional object.
 export const REQUIRED_MEASUREMENTS: Record<
   ListingCategory,
   (keyof Measurements)[]
@@ -346,14 +388,10 @@ export const REQUIRED_MEASUREMENTS: Record<
   Lehenga: ["bust", "waist", "length"],
   Saree: ["length"],
   "Suit/Salwar": ["bust", "waist", "hip", "length", "sleeve_length"],
-  Anarkali: ["bust", "waist", "length"],
-  Sharara: ["waist", "hip", "length"],
+  Indowestern: ["bust", "waist", "length"],
   Blouse: ["bust", "waist", "length", "sleeve_length"],
   Menswear: ["chest", "waist", "length", "sleeve_length"],
   Kidswear: ["chest", "length", "age_range"],
-  Jewellery: [],
-  Dupatta: [],
-  Indowestern: [],
   Footwear: [],
   Other: [],
 };

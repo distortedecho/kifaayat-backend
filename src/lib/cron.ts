@@ -84,7 +84,7 @@ export async function runAutoCompleteOrders(): Promise<void> {
           user_id: order.buyer_id as string,
           type: "order_complete",
           ...orderAutoCompleteNotification(listingTitle, "buyer"),
-          data: { order_id: order.id, listing_id: order.listing_id },
+          data: { order_id: order.id, listing_id: order.listing_id, role: "buyer" },
         });
       }
       await createNotification({
@@ -96,7 +96,7 @@ export async function runAutoCompleteOrders(): Promise<void> {
           order.seller_payout as number,
           order.currency as string
         ),
-        data: { order_id: order.id, listing_id: order.listing_id },
+        data: { order_id: order.id, listing_id: order.listing_id, role: "seller" },
       });
     }
   } catch (err) {
@@ -178,7 +178,7 @@ export async function autoRejectOrder(orderId: string): Promise<void> {
         user_id: order.buyer_id as string,
         type: "order_rejected",
         ...orderRejectedNotification(listingTitle),
-        data: { order_id: orderId, listing_id: order.listing_id, auto_rejected: true },
+        data: { order_id: orderId, listing_id: order.listing_id, auto_rejected: true, role: "buyer" },
       });
     }
 
@@ -269,7 +269,8 @@ export async function runIsoMatchingRefresh(): Promise<void> {
                 user_id: isoPost.author_id as string,
                 type: "iso_match",
                 ...template,
-                data: { iso_post_id: post.id },
+                // ISO author is a prospective buyer.
+                data: { iso_post_id: post.id, role: "buyer" },
               });
             }
           }

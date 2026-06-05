@@ -514,7 +514,8 @@ offers.post("/:id/counter", clerkMiddleware, requireProfile, async (c) => {
     user_id: notifyUserId,
     type: "offer_countered",
     ...counterTemplate,
-    data: { listing_id: offer.listing_id, offer_id: counterOffer.id },
+    // Recipient's role: if caller is seller, recipient is buyer; vice versa.
+    data: { listing_id: offer.listing_id, offer_id: counterOffer.id, role: isSeller ? "buyer" : "seller" },
   });
 
   return c.json({ offer: counterOffer }, 201);

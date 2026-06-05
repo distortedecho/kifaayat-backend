@@ -693,7 +693,7 @@ cart.post("/checkout", clerkMiddleware, requireProfile, async (c) => {
             user_id: group.seller_id,
             type: "order_paid",
             ...paidTemplate,
-            data: { order_id: order.id },
+            data: { order_id: order.id, role: "seller" },
           });
         }
       }

@@ -394,7 +394,8 @@ iso.post(
         user_id: isoPostData.author_id,
         type: "iso_response",
         ...template,
-        data: { iso_post_id: isoPostId },
+        // ISO author is the prospective buyer; the seller responded to their request.
+        data: { iso_post_id: isoPostId, role: "buyer" },
       }).catch(() => {}); // fire-and-forget
     }
 

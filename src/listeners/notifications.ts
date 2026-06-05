@@ -53,7 +53,7 @@ export function registerNotificationListeners(): void {
       user_id: payload.sellerId,
       type: "order_paid",
       ...template,
-      data: { listing_id: payload.listingId, order_id: payload.orderId },
+      data: { listing_id: payload.listingId, order_id: payload.orderId, role: "seller" },
     });
   });
 
@@ -68,7 +68,7 @@ export function registerNotificationListeners(): void {
       user_id: payload.sellerId,
       type: "offer_received",
       ...template,
-      data: { listing_id: payload.listingId, offer_id: payload.offerId },
+      data: { listing_id: payload.listingId, offer_id: payload.offerId, role: "seller" },
     });
   });
 
@@ -82,7 +82,7 @@ export function registerNotificationListeners(): void {
       user_id: payload.notifyUserId,
       type: "offer_accepted",
       ...template,
-      data: { listing_id: payload.listingId, offer_id: payload.offerId },
+      data: { listing_id: payload.listingId, offer_id: payload.offerId, role: payload.recipientRole },
     });
   });
 
@@ -96,7 +96,7 @@ export function registerNotificationListeners(): void {
       user_id: payload.notifyUserId,
       type: "offer_declined",
       ...template,
-      data: { listing_id: payload.listingId, offer_id: payload.offerId },
+      data: { listing_id: payload.listingId, offer_id: payload.offerId, role: payload.recipientRole },
     });
   });
 
@@ -106,7 +106,7 @@ export function registerNotificationListeners(): void {
       user_id: payload.sellerId,
       type: "listing_approved",
       ...template,
-      data: { listing_id: payload.listingId },
+      data: { listing_id: payload.listingId, role: "seller" },
     });
   });
 
@@ -116,7 +116,7 @@ export function registerNotificationListeners(): void {
       user_id: payload.sellerId,
       type: "listing_rejected",
       ...template,
-      data: { listing_id: payload.listingId },
+      data: { listing_id: payload.listingId, role: "seller" },
     });
   });
 
@@ -130,6 +130,7 @@ export function registerNotificationListeners(): void {
       data: {
         conversation_id: payload.conversationId,
         listing_id: payload.listingId,
+        role: payload.recipientRole,
       },
     });
   });

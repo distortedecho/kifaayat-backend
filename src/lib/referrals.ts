@@ -223,10 +223,12 @@ export async function awardReferralCredits(params: {
     user_id: params.referrer_id,
     type: "referral_credit_earned",
     ...template,
+    // Vouchers are spent when buying, so this surfaces in the buying tab.
     data: {
       referral_id: referral.id,
       referred_id: params.referred_id,
       amount: REFERRAL_CREDIT_AMOUNT,
+      role: "buyer",
     },
   }).catch((err) => {
     console.error("Error sending referral credit notification:", err);
@@ -316,6 +318,6 @@ export async function recordReferralAndAwardVoucher(params: {
     user_id: referrerId,
     type: "referral_credit_earned",
     ...template,
-    data: { referral_id: referral.id, referred_id: buyerId },
+    data: { referral_id: referral.id, referred_id: buyerId, role: "buyer" },
   }).catch((err) => console.error("Referral notification error:", err));
 }

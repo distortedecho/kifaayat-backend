@@ -14,6 +14,7 @@ import {
   // WORK_TYPES,
   // DRY_CLEANING_STATUSES,
   COUNTRIES_OF_ORIGIN,
+  PHOTO_MIN_COUNT,
   type ListingCategory,
   type Measurements,
 } from "../types/listings.js";
@@ -167,17 +168,19 @@ const photoReorderSchema = z.object({
 // ============================================================
 
 /**
- * Validate that required measurements for a category are present.
- * Returns array of missing field names, or empty array if valid.
+ * Per Sharetribe, measurements is a single optional free-text field for all
+ * categories. We keep REQUIRED_MEASUREMENTS exported as a per-category hint
+ * list (consumed by GET /api/listing-config as `measurement_hints`) so the
+ * frontend can render suggested input fields, but the API never rejects a
+ * listing for missing measurements. This function is intentionally a no-op
+ * placeholder kept in case we want category-specific hard requirements again
+ * in the future.
  */
 function validateMeasurements(
-  category: ListingCategory,
-  measurements: Measurements | undefined
+  _category: ListingCategory,
+  _measurements: Measurements | undefined
 ): string[] {
-  const required = REQUIRED_MEASUREMENTS[category];
-  if (required.length === 0) return [];
-  if (!measurements) return [...required];
-  return required.filter((field) => !measurements[field]);
+  return [];
 }
 
 /**
@@ -192,18 +195,25 @@ async function validateListingCompleteness(
     category?: string | null;
     condition?: string | null;
     price_amount?: number | null;
-    fabric_types?: string[] | null;
-    items_included?: string[] | null;
+    original_price_amount?: number | null;
+    negotiable?: boolean | null;
+    estimated_size?: string | null;
   }
 ): Promise<string | null> {
   const missing: string[] = [];
 
+  // Universal required fields (mirror LISTING_CATEGORY_CONFIG.required_fields).
   if (!listingData.title) missing.push("title");
   if (!listingData.category) missing.push("category");
   if (!listingData.condition) missing.push("condition");
   if (!listingData.price_amount) missing.push("price_amount");
-  if (!listingData.fabric_types?.length) missing.push("fabric_types");
-  if (!listingData.items_included?.length) missing.push("items_included");
+  if (!listingData.original_price_amount) missing.push("original_price_amount");
+  if (listingData.negotiable === null || listingData.negotiable === undefined) {
+    missing.push("negotiable");
+  }
+
+  // estimated_size required for every category (all 9 have size_type set).
+  if (!listingData.estimated_size) missing.push("estimated_size");
 
   // Check photo count (only product photos count toward the minimum)
   const supabase = createSupabaseAdmin();
@@ -213,8 +223,8 @@ async function validateListingCompleteness(
     .eq("listing_id", listingId)
     .eq("photo_type", "product");
 
-  if (!count || count < 3) {
-    missing.push(`photos (need at least 3, have ${count || 0})`);
+  if (!count || count < PHOTO_MIN_COUNT) {
+    missing.push(`photos (need at least ${PHOTO_MIN_COUNT}, have ${count || 0})`);
   }
 
   if (missing.length > 0) {
@@ -675,7 +685,8 @@ listings.put("/:id", clerkMiddleware, requireProfile, async (c) => {
             user_id,
             type: "price_drop_wishlist",
             ...template,
-            data: { listing_id: listingId },
+            // Wishlist owners are prospective buyers, never the seller.
+            data: { listing_id: listingId, role: "buyer" },
           });
         }
       } catch (err) {
@@ -1507,6 +1518,8 @@ listings.post("/:id/comments", clerkMiddleware, requireProfile, async (c) => {
       if (replyToAuthorId) {
         if (replyToAuthorId !== profile.id) {
           const snippet = content.length > 80 ? content.slice(0, 80) + "..." : content;
+          // Recipient's role relative to the listing: seller if they own it, else buyer.
+          const recipientRole = replyToAuthorId === listing.seller_id ? "seller" : "buyer";
           await createNotification({
             user_id: replyToAuthorId,
             type: "comment_reply",
@@ -1517,6 +1530,7 @@ listings.post("/:id/comments", clerkMiddleware, requireProfile, async (c) => {
               comment_id: comment.id,
               parent_comment_id: threadRootId,
               reply_to_comment_id: tappedTargetIdResolved,
+              role: recipientRole,
             },
           });
         }
@@ -1530,7 +1544,8 @@ listings.post("/:id/comments", clerkMiddleware, requireProfile, async (c) => {
           type: "listing_comment",
           title: "New comment on your listing",
           body: `${profile.display_name || "Someone"} commented on "${listing.title}"`,
-          data: { listing_id: listingId, comment_id: comment.id },
+          // Notifying the listing owner; role is always seller here.
+          data: { listing_id: listingId, comment_id: comment.id, role: "seller" },
         });
       } else {
         const { data: prevComments } = await supabase
@@ -1548,7 +1563,8 @@ listings.post("/:id/comments", clerkMiddleware, requireProfile, async (c) => {
             type: "listing_comment",
             title: "Seller replied on a listing",
             body: `${profile.display_name || "The seller"} replied on "${listing.title}"`,
-            data: { listing_id: listingId, comment_id: comment.id },
+            // Notifying prior commenters (always buyers — sellers can't comment on their own listing as buyers).
+            data: { listing_id: listingId, comment_id: comment.id, role: "buyer" },
           });
         }
       }
