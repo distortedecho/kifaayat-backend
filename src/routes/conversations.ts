@@ -540,16 +540,9 @@ conversations.post("/:id/messages", idempotencyMiddleware, clerkMiddleware, asyn
       metadata: parsed.data.metadata,
     });
 
-    // Broadcast new message to conversation channel so both parties
-    // receive it in real-time without relying on postgres_changes RLS.
-    createSupabaseAdmin()
-      .channel(`conversation:${conversationId}`)
-      .send({
-        type: "broadcast",
-        event: "new_message",
-        payload: message,
-      })
-      .catch((err: unknown) => console.error("[realtime] broadcast error:", err));
+    // (Realtime broadcast on `conversation:<id>` is fired inside sendMessage
+    // so any caller of the service — including server-side system messages —
+    // gets live delivery for free.)
 
     return c.json({ message }, 201);
   } catch (err) {
@@ -597,28 +590,47 @@ conversations.patch("/:id/read", clerkMiddleware, async (c) => {
     return c.json({ error: "Not authorized to update this conversation" }, 403);
   }
 
-  // Mark messages from the other party as read
-  // We need to count affected rows, so we first count then update
-  const { count: unreadCount } = await supabase
+  // Mark messages from the other party as read, returning the affected rows
+  // in a single round-trip so we can broadcast the IDs to the conversation
+  // channel for live "Seen" indicators on the sender's side.
+  const readAt = new Date().toISOString();
+  const { data: updatedMessages, error: updateError } = await supabase
     .from("messages")
-    .select("id", { count: "exact", head: true })
+    .update({ read_at: readAt })
     .eq("conversation_id", conversationId)
     .neq("sender_id", profileId)
-    .is("read_at", null);
-
-  const { error: updateError } = await supabase
-    .from("messages")
-    .update({ read_at: new Date().toISOString() })
-    .eq("conversation_id", conversationId)
-    .neq("sender_id", profileId)
-    .is("read_at", null);
+    .is("read_at", null)
+    .select("id");
 
   if (updateError) {
     console.error("Error marking messages as read:", updateError);
     return c.json({ error: "Failed to mark messages as read" }, 500);
   }
 
-  return c.json({ updated_count: unreadCount || 0 });
+  const messageIds = (updatedMessages || []).map((m) => m.id as string);
+
+  // Fire-and-forget realtime broadcast so the sender's UI can flip the
+  // ticks from "Sent" to "Seen" without re-fetching. Matches the existing
+  // new_message broadcast pattern — see also: PATCH-on-open from FE.
+  if (messageIds.length > 0) {
+    createSupabaseAdmin()
+      .channel(`conversation:${conversationId}`)
+      .send({
+        type: "broadcast",
+        event: "messages_read",
+        payload: {
+          conversation_id: conversationId,
+          message_ids: messageIds,
+          read_at: readAt,
+          reader_id: profileId, // recipient (the one marking as read)
+        },
+      })
+      .catch((err: unknown) =>
+        console.error("[realtime] messages_read broadcast error:", err)
+      );
+  }
+
+  return c.json({ updated_count: messageIds.length });
 });
 
 export default conversations;

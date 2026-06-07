@@ -184,5 +184,86 @@ export async function sendMessage(
     });
   }
 
+  // Realtime broadcast on the conversation channel so both parties see the
+  // message live without re-fetching. Fire-and-forget — broadcast failures
+  // must not affect the message persistence above.
+  createSupabaseAdmin()
+    .channel(`conversation:${params.conversationId}`)
+    .send({
+      type: "broadcast",
+      event: "new_message",
+      payload: message,
+    })
+    .catch((err: unknown) =>
+      logger.error("conversationService.broadcast_failed", {
+        conversation_id: params.conversationId,
+        error: err instanceof Error ? err.message : String(err),
+      })
+    );
+
   return message;
+}
+
+/**
+ * Find-or-create the conversation between (listing, buyer, seller) and
+ * post a system-style message into it as the seller. Used for order
+ * lifecycle messages — e.g. "tracking added, your order is on its way."
+ *
+ * `metadata.system: true` is stamped on the message so the frontend can
+ * render these as centered grey bubbles (or whatever system styling) and
+ * skip the regular sender-avatar treatment. `metadata.kind` lets the UI
+ * pick an icon per event ("order_shipped", "order_delivered", etc.).
+ *
+ * Fire-and-forget from the caller's perspective: failures only log
+ * (never throw) so an order action like /ship is never blocked by a
+ * chat hiccup.
+ */
+export async function postSystemMessage(params: {
+  listingId: string;
+  buyerId: string;
+  sellerId: string;
+  content: string;
+  kind: string; // e.g. "order_shipped" — drives icon/styling on the client
+}): Promise<void> {
+  try {
+    const supabase = createSupabaseAdmin();
+
+    // Upsert the conversation row — same pattern used by the seller-initiated
+    // /api/conversations POST flow. Safe to call repeatedly; returns existing.
+    const { data: conversation, error: upsertError } = await supabase
+      .from("conversations")
+      .upsert(
+        {
+          listing_id: params.listingId,
+          buyer_id: params.buyerId,
+          seller_id: params.sellerId,
+        },
+        { onConflict: "listing_id,buyer_id,seller_id", ignoreDuplicates: false }
+      )
+      .select()
+      .single();
+
+    if (upsertError || !conversation) {
+      logger.error("postSystemMessage.upsert_failed", {
+        listing_id: params.listingId,
+        buyer_id: params.buyerId,
+        seller_id: params.sellerId,
+        error: upsertError?.message,
+      });
+      return;
+    }
+
+    await sendMessage({
+      conversationId: conversation.id as string,
+      senderProfileId: params.sellerId,
+      content: params.content,
+      message_type: "text",
+      metadata: { system: true, kind: params.kind },
+    });
+  } catch (err) {
+    logger.error("postSystemMessage.failed", {
+      listing_id: params.listingId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
 }

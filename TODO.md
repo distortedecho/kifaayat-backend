@@ -78,17 +78,47 @@ ALTER TABLE orders ADD CONSTRAINT orders_currency_check CHECK (currency IN ('AUD
 
 ---
 
-### DB constraint cleanup — taxonomy (low priority, cosmetic)
+### DB constraint cleanup — listings.category (BLOCKING: Footwear listings)
+
+**Status:** confirmed bug, not yet fixed
+**Effort:** 5 min (1 ALTER in Supabase SQL editor)
+**Why:** Footwear listing creation fails in prod with `23514 listings_category_check` because the live DB's CHECK constraint is missing `Footwear` (and still allows the 4 dropped phantom categories: Anarkali, Sharara, Dupatta, Jewellery).
+
+**Repro** (2026-06-07):
+```
+POST /api/listings { category: "Footwear", ... }
+Error creating listing: {
+  code: '23514',
+  message: 'new row for relation "listings" violates check constraint "listings_category_check"'
+}
+```
+
+**Fix:**
+```sql
+ALTER TABLE listings DROP CONSTRAINT IF EXISTS listings_category_check;
+ALTER TABLE listings ADD CONSTRAINT listings_category_check CHECK (category IN (
+  'Lehenga', 'Saree', 'Suit/Salwar', 'Indowestern', 'Blouse',
+  'Menswear', 'Kidswear', 'Footwear', 'Other'
+));
+```
+
+Before running, check whether any existing rows would be rejected (4 phantom categories):
+```sql
+SELECT category, COUNT(*) FROM listings
+WHERE category IN ('Anarkali','Sharara','Dupatta','Jewellery')
+GROUP BY category;
+```
+If rows exist, migrate to `'Other'` first: `UPDATE listings SET category = 'Other' WHERE category IN ('Anarkali','Sharara','Dupatta','Jewellery');`
+
+**Trigger:** run today — blocks Footwear creation.
+
+---
+
+### DB constraint cleanup — listings.condition (cosmetic)
 
 **Status:** not started — deferred indefinitely
 **Effort:** 5 min
-**Why:** Pure data hygiene. Code already won't send the stale values, so there's no functional impact — just extra values the DB allows that the app will never use.
-
-**Affected:**
-- `listings.category` CHECK still allows `Anarkali`, `Sharara`, `Dupatta`, `Jewellery` (4 dropped categories), and is missing `Footwear`. If `Footwear` is missing in the live DB it's a real bug — diagnostic above will show.
-- `listings.condition` CHECK still allows `'New'`, `'Like New'`, `'Good'`, `'Fair'` (4 stale values from before the live-app alignment).
-
-**Trigger to do this:** never urgent. Tackle if/when we do a broader schema cleanup or compliance audit. Can also be skipped permanently — extra allowed values cost nothing.
+**Why:** `listings.condition` CHECK still allows `'New'`, `'Like New'`, `'Good'`, `'Fair'` (stale values from before the live-app alignment). Code won't send them; just extra noise. No functional impact, fix whenever.
 
 ---
 

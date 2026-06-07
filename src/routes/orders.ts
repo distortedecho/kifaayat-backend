@@ -496,6 +496,35 @@ orders.patch("/:id/ship", clerkMiddleware, requireProfile, async (c) => {
     });
   }
 
+  // Post a system-style message into the buyer↔seller chat so the buyer sees
+  // the shipping update in their inbox between regular messages. Fire-and-
+  // forget: chat hiccups never block the ship operation.
+  if (order.buyer_id) {
+    (async () => {
+      try {
+        const { postSystemMessage } = await import("../services/conversationService.js");
+        const { data: sellerProfile } = await supabase
+          .from("profiles")
+          .select("display_name")
+          .eq("id", order.seller_id)
+          .single();
+        const sellerName = sellerProfile?.display_name || "The seller";
+        const content = tracking_number
+          ? `${sellerName} added tracking. Your order is on its way!`
+          : `${sellerName} marked your order as shipped. It's on its way!`;
+        await postSystemMessage({
+          listingId: order.listing_id,
+          buyerId: order.buyer_id,
+          sellerId: order.seller_id,
+          content,
+          kind: "order_shipped",
+        });
+      } catch (err) {
+        console.error("Failed to post shipped system message:", err);
+      }
+    })();
+  }
+
   return c.json({ order: updatedOrder });
 });
 

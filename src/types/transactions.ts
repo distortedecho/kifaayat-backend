@@ -217,6 +217,12 @@ export interface Review {
 /** Platform commission rate (percentage) */
 export const COMMISSION_RATE = 15;
 
+/** Referral voucher discount rate (percentage of item price).
+ *  Always applied to item amount only — never to shipping.
+ *  No cap; on tier sellers with a lower commission rate, Kifaayat absorbs
+ *  the small loss as an acquisition cost. */
+export const VOUCHER_DISCOUNT_RATE = 10;
+
 /** Maximum offer rounds before expiry */
 export const MAX_OFFER_ROUNDS = 3;
 

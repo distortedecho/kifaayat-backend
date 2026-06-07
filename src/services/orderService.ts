@@ -84,6 +84,27 @@ export async function createOrder(
     throw new OrderServiceError("Server configuration error", 500);
   }
 
+  // --- Idempotency check -------------------------------------
+  // The Stripe webhook ALSO creates orders for `payment_intent.succeeded`,
+  // so if it landed first we'd otherwise insert a duplicate row here and
+  // emit a second `order:created` event (→ duplicate `order_paid` push to
+  // the seller). Return the existing order silently so the caller still
+  // gets a 201 with the canonical row, but no second notification fires.
+  const supabaseForCheck = createSupabaseAdmin();
+  const { data: existingOrder } = await supabaseForCheck
+    .from("orders")
+    .select("*")
+    .eq("stripe_payment_intent_id", stripe_payment_intent_id)
+    .maybeSingle();
+
+  if (existingOrder) {
+    logger.info("orderService.idempotent_return", {
+      payment_intent_id: stripe_payment_intent_id,
+      existing_order_id: existingOrder.id,
+    });
+    return existingOrder as CreatedOrder;
+  }
+
   // --- Stripe verification -----------------------------------
   let intent: Stripe.PaymentIntent;
   try {
@@ -149,9 +170,33 @@ export async function createOrder(
   }
 
   // --- Commission --------------------------------------------
-  const commissionRate = await getCommissionRate();
-  const commissionAmount = Math.round(amount * (commissionRate / 100));
-  const sellerPayout = amount - commissionAmount;
+  // Trust the split that was pre-computed at payment-intent creation time
+  // (metadata.item_amount / shipping_amount / commission_amount). Commission
+  // is calculated on the ITEM only — shipping passes through to the seller.
+  //
+  // Fallback for payment intents created before that change shipped (no
+  // metadata): treat the whole amount as item amount, recompute commission
+  // on it. Older orders still come out clean; new orders carry the right
+  // item-only commission.
+  const intentMetadata = (intent.metadata || {}) as Record<string, string>;
+  const itemAmount = parseInt(intentMetadata.item_amount || String(amount), 10);
+  const shippingAmount = parseInt(intentMetadata.shipping_amount || "0", 10);
+  const voucherDiscount = parseInt(intentMetadata.voucher_discount || "0", 10);
+  const fallbackRate = await getCommissionRate();
+  const commissionAmount = intentMetadata.commission_amount
+    ? parseInt(intentMetadata.commission_amount, 10)
+    : Math.round(itemAmount * (fallbackRate / 100));
+  // Reverse out the actual rate that was applied so commission_rate stays
+  // consistent with commission_amount (won't drift even if the global rate
+  // changes between payment and order creation).
+  const commissionRate = itemAmount > 0
+    ? Math.round((commissionAmount / itemAmount) * 10000) / 100
+    : fallbackRate;
+  // Seller payout = item - commission + shipping. UNCHANGED by voucher —
+  // voucher comes out of Kifaayat's commission, not the seller's payout.
+  const sellerPayout = intentMetadata.seller_payout
+    ? parseInt(intentMetadata.seller_payout, 10)
+    : itemAmount - commissionAmount + shippingAmount;
   const orderNumber = generateOrderNumber();
 
   // --- Atomic write (direct PG if available) ------------------
@@ -164,13 +209,14 @@ export async function createOrder(
         const inserted = await tx<CreatedOrder[]>`
           INSERT INTO orders (
             order_number, listing_id, buyer_id, seller_id, buyer_email,
-            offer_id, amount, currency, commission_rate, commission_amount,
+            offer_id, amount, item_amount, shipping_amount, voucher_discount,
+            currency, commission_rate, commission_amount,
             seller_payout, stripe_payment_intent_id, stripe_checkout_session_id,
             status
           ) VALUES (
             ${orderNumber}, ${listing_id}, ${buyerId}, ${listing.seller_id},
-            ${buyer_email}, ${offer_id || null}, ${amount}, ${currency},
-            ${commissionRate}, ${commissionAmount}, ${sellerPayout},
+            ${buyer_email}, ${offer_id || null}, ${amount}, ${itemAmount}, ${shippingAmount}, ${voucherDiscount},
+            ${currency}, ${commissionRate}, ${commissionAmount}, ${sellerPayout},
             ${stripe_payment_intent_id},
             ${stripe_checkout_session_id || null},
             ${"paid" as OrderStatus}
@@ -203,6 +249,9 @@ export async function createOrder(
         buyer_email,
         offer_id: offer_id || null,
         amount,
+        item_amount: itemAmount,
+        shipping_amount: shippingAmount,
+        voucher_discount: voucherDiscount,
         currency,
         commission_rate: commissionRate,
         commission_amount: commissionAmount,

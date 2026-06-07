@@ -176,6 +176,21 @@ ALTER TABLE reviews ADD COLUMN IF NOT EXISTS tags TEXT[] DEFAULT '{}';
 ALTER TABLE profiles ADD COLUMN IF NOT EXISTS bio TEXT;
 
 -- -------------------------
+-- orders — item/shipping breakdown
+-- -------------------------
+-- orders.amount already stores the total Stripe charge (item + shipping).
+-- Adding the breakdown so the frontend can show "$X item + $Y shipping = $Z
+-- total" without doing client-side math against the listing (which may have
+-- been edited or deleted since the order was placed). Also unlocks revenue
+-- reporting that separates item GMV from shipping passthrough.
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS item_amount INTEGER;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS shipping_amount INTEGER;
+-- voucher_discount = how much Kifaayat absorbed from its commission to fund
+-- the buyer's voucher. Helps reporting tell "low commission" from "voucher
+-- applied" apart.
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS voucher_discount INTEGER DEFAULT 0;
+
+-- -------------------------
 -- user_addresses — multiple addresses per user
 -- -------------------------
 -- Users can save several addresses (home, work, parents', etc.) and pick one

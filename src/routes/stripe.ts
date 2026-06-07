@@ -8,6 +8,7 @@ import { createSupabaseAdmin } from "../lib/supabase.js";
 import { createNotification, orderPaidNotification } from "../lib/notifications.js";
 import {
   generateOrderNumber,
+  VOUCHER_DISCOUNT_RATE,
   type OrderStatus,
 } from "../types/transactions.js";
 import { getCommissionRate, getSellerCommissionRate } from "../lib/commission.js";
@@ -219,7 +220,7 @@ stripeRoutes.post("/payment-intent", optionalClerkMiddleware, async (c) => {
   // Validate listing exists and is purchasable
   const { data: listing, error: listingError } = await supabase
     .from("listings")
-    .select("id, title, seller_id, price_amount, price_currency, status, negotiable")
+    .select("id, title, seller_id, price_amount, price_currency, status, negotiable, shipping_cost_amount, free_shipping")
     .eq("id", listing_id)
     .single();
 
@@ -293,14 +294,34 @@ stripeRoutes.post("/payment-intent", optionalClerkMiddleware, async (c) => {
   const sellerStripeAccountId = sellerProfile?.stripe_account_id || null;
   const sellerOnboardingComplete = sellerProfile?.stripe_onboarding_complete ?? false;
 
-  // Calculate commission (tier-specific rate for seller)
-  const amount = paymentAmount; // already in cents
+  // Item amount = either offer amount or listing price (negotiated price excludes shipping).
+  // Shipping is added on top, charged to the buyer, and passes through to the seller.
+  const itemAmount = paymentAmount; // already in cents
+  const shippingAmount = (listing.free_shipping ? 0 : (listing.shipping_cost_amount as number | null) ?? 0);
+
+  // Commission is computed on the ITEM only — shipping is not Kifaayat's revenue,
+  // it's a passthrough so the seller can pay for postage.
   const commissionRate = await getSellerCommissionRate(listing.seller_id);
-  const commission = Math.round(amount * commissionRate / 100);
+  const commission = Math.round(itemAmount * commissionRate / 100);
+
+  // Seller payout — UNCHANGED by voucher. Seller always gets the full
+  // item-minus-commission + shipping. Vouchers come out of Kifaayat's cut,
+  // never the seller's.
+  const sellerPayout = itemAmount - commission + shippingAmount;
+
+  // Voucher discount — applied to item only, never shipping. No cap; on
+  // tier sellers with a commission below VOUCHER_DISCOUNT_RATE, Kifaayat
+  // absorbs the small loss as acquisition cost.
+  const voucherDiscount = voucher_id
+    ? Math.round(itemAmount * VOUCHER_DISCOUNT_RATE / 100)
+    : 0;
+
+  // What Stripe actually charges the buyer.
+  const chargeAmount = itemAmount + shippingAmount - voucherDiscount;
 
   // Build PaymentIntent params
   const intentParams: Stripe.PaymentIntentCreateParams = {
-    amount,
+    amount: chargeAmount,
     currency: listing.price_currency.toLowerCase(),
     metadata: {
       listing_id,
@@ -309,6 +330,12 @@ stripeRoutes.post("/payment-intent", optionalClerkMiddleware, async (c) => {
       offer_id: offer_id || "",
       referral_code: referral_code ? referral_code.toUpperCase().trim() : "",
       voucher_id: voucher_id || "",
+      // Pre-computed split so the webhook doesn't have to re-derive these.
+      item_amount: String(itemAmount),
+      shipping_amount: String(shippingAmount),
+      commission_amount: String(commission),
+      seller_payout: String(sellerPayout),
+      voucher_discount: String(voucherDiscount),
     },
   };
 
@@ -837,15 +864,33 @@ stripeRoutes.post("/webhook", async (c) => {
       title: listing.title,
     });
 
-    // Calculate commission (tier-specific rate for seller)
-    const amount = paymentIntent.amount;
+    // Total charged includes both the item price and shipping. Commission is
+    // computed on the ITEM portion only — shipping is a passthrough so the
+    // seller can cover postage. The split is pre-computed in metadata at
+    // payment-intent creation time; we trust it here rather than re-deriving.
+    // Fallbacks keep older payment intents (before this change shipped)
+    // working: if metadata.item_amount is missing, the whole amount is
+    // treated as item amount and shipping is zero.
+    const amount = paymentIntent.amount; // total charged to buyer (post-voucher)
     const currency = paymentIntent.currency.toUpperCase();
     const commissionRate = await getSellerCommissionRate(listing.seller_id);
-    const commissionAmount = Math.round(amount * (commissionRate / 100));
-    const sellerPayout = amount - commissionAmount;
+    const itemAmount = parseInt(metadata.item_amount || String(amount), 10);
+    const shippingAmount = parseInt(metadata.shipping_amount || "0", 10);
+    const voucherDiscount = parseInt(metadata.voucher_discount || "0", 10);
+    const commissionAmount = metadata.commission_amount
+      ? parseInt(metadata.commission_amount, 10)
+      : Math.round(itemAmount * (commissionRate / 100));
+    // Seller payout is UNCHANGED by voucher — they get item-net + shipping.
+    // Voucher comes out of Kifaayat's net (commission - voucher_discount).
+    const sellerPayout = metadata.seller_payout
+      ? parseInt(metadata.seller_payout, 10)
+      : itemAmount - commissionAmount + shippingAmount;
 
     logger.info("stripe.single_item_commission_calculated", {
       amount,
+      item_amount: itemAmount,
+      shipping_amount: shippingAmount,
+      voucher_discount: voucherDiscount,
       currency,
       commission_rate: commissionRate,
       commission_amount: commissionAmount,
@@ -876,6 +921,9 @@ stripeRoutes.post("/webhook", async (c) => {
         buyer_email: buyerEmail,
         offer_id: offerId,
         amount,
+        item_amount: itemAmount,
+        shipping_amount: shippingAmount,
+        voucher_discount: voucherDiscount,
         currency,
         commission_rate: commissionRate,
         commission_amount: commissionAmount,
