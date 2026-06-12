@@ -34,6 +34,33 @@ _(nothing right now)_
 
 ---
 
+### Gemini API key — harden + align rate limits when client rotates
+
+**Status:** waiting on client to send a new key
+**Effort:** ~30 min (mostly in Google Cloud / AI Studio consoles, plus a one-line code change)
+**Why:** The current key is shared, has no restrictions, and our user-facing queue is configured for 25 RPM while the free-tier cap on `gemini-2.5-flash` is 10 RPM. Burst traffic could trigger rate-limit errors today. Rotating to a client-owned key is a good moment to lock it down properly.
+
+**Steps when the new key arrives:**
+
+- [ ] Update `GEMINI_API_KEY` env var on Railway, verify `/api/ai/analyze` works
+- [ ] In Google AI Studio: click into the key → API restrictions → restrict to **Generative Language API** only
+- [ ] In Google AI Studio: Application restrictions → IP addresses → add Railway's egress IPs (find via `curl httpbin.org/ip` from the deployed instance)
+- [ ] In Google Cloud Console for the project: APIs & Services → Generative Language API → Quotas → cap daily requests (e.g. 500 RPD to start, well above expected ~30-90 RPD)
+- [ ] In Google Cloud Console: Billing → Budgets & alerts → create a $10/month budget with email alerts at 50% / 90% / 100%
+- [ ] Drop `userGeminiQueue` from `intervalCap: 25` → `intervalCap: 10` in [src/routes/ai.ts:41](src/routes/ai.ts#L41) to match the 2.5-flash free tier RPM
+- [ ] Ask client to revoke the old key in AI Studio after we confirm the new one works
+- [ ] Calendar reminder: "Rotate Gemini API key" — quarterly cadence
+
+**Models in use (FYI for client):**
+- `gemini-2.5-flash` — listing analysis, ISO matching, risk scoring (3 endpoints)
+- `gemini-2.0-flash` — chat summarization only
+
+Both are free-tier eligible. ~30-90 RPD on 2.5-flash today, well under 250 RPD daily cap.
+
+**Open question:** standardize on `gemini-2.5-flash` for chat summarization too, or leave `2.0-flash` alone since it's cheaper for text-only? Default: leave 2.0 — costs less, summarization is rare. Revisit if behavior diverges.
+
+---
+
 ### DB constraint cleanup — currency + location (CA/UK markets)
 
 **Status:** not started — deferred

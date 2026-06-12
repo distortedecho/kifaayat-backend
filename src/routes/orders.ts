@@ -1,5 +1,6 @@
 import { Hono } from "hono";
 import { z } from "zod";
+import crypto from "node:crypto";
 import { clerkMiddleware, optionalClerkMiddleware } from "../middleware/clerk.js";
 import { requireProfile } from "../middleware/requireProfile.js";
 import { idempotencyMiddleware } from "../middleware/idempotency.js";
@@ -331,6 +332,42 @@ orders.get("/:id", clerkMiddleware, requireProfile, async (c) => {
     return c.json({ error: "Not authorized to view this order" }, 403);
   }
 
+  // Enrich the embedded `buyer` object with trust signals the seller needs
+  // when reviewing the buyer's note: average rating across all completed
+  // orders + total completed purchases. Skipped for guest orders (no buyer
+  // profile). Two parallel queries — fixed cost regardless of buyer history.
+  if (order.buyer_id) {
+    const [{ data: buyerReviews }, { count: completedCount }] = await Promise.all([
+      supabase
+        .from("reviews")
+        .select("rating")
+        .eq("reviewee_id", order.buyer_id)
+        .eq("reviewer_role", "seller")
+        .not("revealed_at", "is", null),
+      supabase
+        .from("orders")
+        .select("id", { count: "exact", head: true })
+        .eq("buyer_id", order.buyer_id)
+        .eq("status", "complete"),
+    ]);
+
+    const ratingRows = (buyerReviews || []) as Array<{ rating: number }>;
+    const reviewCount = ratingRows.length;
+    const avgRating =
+      reviewCount > 0
+        ? parseFloat(
+            (ratingRows.reduce((sum, r) => sum + r.rating, 0) / reviewCount).toFixed(1)
+          )
+        : null;
+
+    const buyer = order.buyer as Record<string, unknown> | null;
+    if (buyer) {
+      buyer.avg_rating = avgRating;
+      buyer.review_count = reviewCount;
+      buyer.total_purchases = completedCount || 0;
+    }
+  }
+
   return c.json({ order });
 });
 
@@ -526,6 +563,119 @@ orders.patch("/:id/ship", clerkMiddleware, requireProfile, async (c) => {
   }
 
   return c.json({ order: updatedOrder });
+});
+
+/**
+ * POST /api/orders/:id/shipping-receipt
+ * Seller uploads a photo of the postage receipt / shipping label as proof
+ * of dispatch. Optional — many sellers won't have a physical receipt.
+ * Visible to the buyer on the order detail screen.
+ *
+ * Multipart form: photo=<File>
+ * Returns: { shipping_receipt_photo_url }
+ *
+ * Idempotent: replacing an existing receipt deletes the old file from
+ * storage before writing the new one.
+ *
+ * 400 — no/invalid file
+ * 403 — caller is not the seller
+ * 404 — order not found
+ */
+orders.post("/:id/shipping-receipt", clerkMiddleware, requireProfile, async (c) => {
+  const orderId = c.req.param("id");
+  const profile = c.get("profile");
+  const supabase = createSupabaseAdmin();
+
+  if (!UUID_REGEX.test(orderId)) {
+    return c.json({ error: "Invalid order ID format" }, 400);
+  }
+
+  const { data: order, error: fetchError } = await supabase
+    .from("orders")
+    .select("id, seller_id, shipping_receipt_photo_url")
+    .eq("id", orderId)
+    .single();
+
+  if (fetchError || !order) {
+    return c.json({ error: "Order not found" }, 404);
+  }
+
+  if (order.seller_id !== profile.id) {
+    return c.json({ error: "Only the seller can upload a shipping receipt" }, 403);
+  }
+
+  // Parse multipart form
+  const formData = await c.req.formData();
+  const photo = formData.get("photo");
+
+  if (!photo || !(photo instanceof File)) {
+    return c.json({ error: "Photo file is required (field: photo)" }, 400);
+  }
+
+  const allowedTypes = ["image/jpeg", "image/png", "image/webp", "image/heic", "image/heif"];
+  if (!allowedTypes.includes(photo.type)) {
+    return c.json(
+      { error: "Invalid file type. Allowed: JPEG, PNG, WebP, HEIC" },
+      400
+    );
+  }
+
+  // 10MB cap — same as listing photos
+  const maxSize = 10 * 1024 * 1024;
+  if (photo.size > maxSize) {
+    return c.json({ error: "File too large. Maximum 10MB" }, 400);
+  }
+
+  // Storage path: shipping-receipts/{order_id}/{uuid}.{ext}
+  // Reusing the listing-photos bucket keeps RLS + grants simple.
+  const ext = photo.name.split(".").pop() || "jpg";
+  const fileId = crypto.randomUUID();
+  const storagePath = `shipping-receipts/${orderId}/${fileId}.${ext}`;
+
+  const fileBuffer = await photo.arrayBuffer();
+  const { error: uploadError } = await supabase.storage
+    .from("listing-photos")
+    .upload(storagePath, fileBuffer, {
+      contentType: photo.type,
+      upsert: false,
+    });
+
+  if (uploadError) {
+    console.error("Error uploading shipping receipt:", uploadError);
+    return c.json({ error: "Failed to upload receipt" }, 500);
+  }
+
+  const { data: urlData } = supabase.storage
+    .from("listing-photos")
+    .getPublicUrl(storagePath);
+
+  // If there was an existing receipt, delete the old file so we don't
+  // accumulate orphaned uploads in storage.
+  if (order.shipping_receipt_photo_url) {
+    const oldPath = order.shipping_receipt_photo_url
+      .split("/listing-photos/")
+      .pop();
+    if (oldPath) {
+      await supabase.storage
+        .from("listing-photos")
+        .remove([oldPath])
+        .catch(() => {});
+    }
+  }
+
+  const { error: updateError } = await supabase
+    .from("orders")
+    .update({ shipping_receipt_photo_url: urlData.publicUrl })
+    .eq("id", orderId);
+
+  if (updateError) {
+    console.error("Error saving receipt URL on order:", updateError);
+    // Clean up the file we just uploaded so we don't leave it orphaned
+    await supabase.storage.from("listing-photos").remove([storagePath]).catch(() => {});
+    return c.json({ error: "Failed to save receipt" }, 500);
+  }
+
+  return c.json({ shipping_receipt_photo_url: urlData.publicUrl });
 });
 
 /**

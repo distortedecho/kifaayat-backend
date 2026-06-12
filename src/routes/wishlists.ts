@@ -33,6 +33,10 @@ interface ListingSummaryWithSavedAt {
   seller_location: string | null;
   saved_at: string;
   folder_id: string | null;
+  // Price at the moment the user saved this listing — comparison baseline
+  // for price-drop banner. Renders "was $X, now $Y" when price_dropped=true.
+  price_at_save: number | null;
+  price_dropped: boolean;
 }
 
 // ============================================================
@@ -126,10 +130,12 @@ wishlists.post("/", optionalClerkMiddleware, async (c) => {
   }
   const { identifier } = result;
 
-  // Validate listing exists and is active
+  // Validate listing exists and is active. Also pull the current price so we
+  // can snapshot it on the wishlist row — the baseline for the "was $X, now
+  // $Y" banner if the seller later drops the price.
   const { data: listing, error: listingError } = await supabase
     .from("listings")
-    .select("id, status")
+    .select("id, status, price_amount")
     .eq("id", listing_id)
     .single();
 
@@ -155,9 +161,11 @@ wishlists.post("/", optionalClerkMiddleware, async (c) => {
     }
   }
 
-  // Insert wishlist entry
+  // Insert wishlist entry — capture current price as the comparison baseline
+  // for future price-drop detection.
   const insertData: Record<string, unknown> = {
     listing_id,
+    price_at_save: listing.price_amount,
     ...(identifier.user_id ? { user_id: identifier.user_id } : {}),
     ...(identifier.guest_token ? { guest_token: identifier.guest_token } : {}),
     ...(folder_id ? { folder_id } : {}),
@@ -250,11 +258,12 @@ wishlists.get("/", optionalClerkMiddleware, async (c) => {
   }
   const { identifier } = result;
 
-  // Build query: wishlists joined with listings and photos
+  // Build query: wishlists joined with listings and photos. price_at_save
+  // is selected from the wishlist row so we can compute the drop flag below.
   let query = supabase
     .from("wishlists")
     .select(
-      "id, listing_id, folder_id, created_at, listings!wishlists_listing_id_fkey(id, title, price_amount, price_currency, original_price_amount, category, condition, estimated_size, size_type, designer_name, status, listing_photos(url, position), profiles!listings_seller_id_fkey(display_name, location))",
+      "id, listing_id, folder_id, price_at_save, created_at, listings!wishlists_listing_id_fkey(id, title, price_amount, price_currency, original_price_amount, category, condition, estimated_size, size_type, designer_name, status, listing_photos(url, position), profiles!listings_seller_id_fkey(display_name, location))",
       { count: "exact" }
     )
     .order("created_at", { ascending: false })
@@ -296,10 +305,19 @@ wishlists.get("/", optionalClerkMiddleware, async (c) => {
         coverUrl = (cover.url as string) || null;
       }
 
+      const currentPrice = listing.price_amount as number;
+      const priceAtSave = (row.price_at_save as number | null) ?? null;
+      // Drop = current price is strictly lower than the price when saved.
+      // Hides automatically if the seller raises the price back to/above
+      // the saved baseline, or if we don't have a baseline (legacy row
+      // backfilled to current price → no drop).
+      const priceDropped =
+        priceAtSave !== null && currentPrice < priceAtSave;
+
       return {
         id: listing.id as string,
         title: listing.title as string,
-        price_amount: listing.price_amount as number,
+        price_amount: currentPrice,
         price_currency: listing.price_currency as string,
         original_price_amount: (listing.original_price_amount as number) || null,
         category: listing.category as string,
@@ -312,6 +330,8 @@ wishlists.get("/", optionalClerkMiddleware, async (c) => {
         seller_location: profiles ? (profiles.location as string | null) : null,
         saved_at: row.created_at as string,
         folder_id: (row.folder_id as string) || null,
+        price_at_save: priceAtSave,
+        price_dropped: priceDropped,
       };
     });
 
@@ -334,7 +354,7 @@ wishlists.get("/summary", clerkMiddleware, requireProfile, async (c) => {
 
   const { data, error } = await supabase
     .from("wishlists")
-    .select("listings!wishlists_listing_id_fkey(category, status)")
+    .select("price_at_save, listings!wishlists_listing_id_fkey(category, status, price_amount)")
     .eq("user_id", profile.id);
 
   if (error) {
@@ -344,17 +364,22 @@ wishlists.get("/summary", clerkMiddleware, requireProfile, async (c) => {
 
   const categoryCounts: Record<string, number> = {};
   let total = 0;
+  let priceDropsCount = 0;
 
   for (const row of data || []) {
     const listing = (Array.isArray(row.listings) ? row.listings[0] : row.listings) as
-      | { category: string; status: string }
+      | { category: string; status: string; price_amount: number }
       | null;
     if (!listing || listing.status !== "active") continue;
     categoryCounts[listing.category] = (categoryCounts[listing.category] || 0) + 1;
     total++;
+    const priceAtSave = (row as { price_at_save: number | null }).price_at_save;
+    if (priceAtSave !== null && listing.price_amount < priceAtSave) {
+      priceDropsCount++;
+    }
   }
 
-  return c.json({ total, categories: categoryCounts });
+  return c.json({ total, categories: categoryCounts, price_drops_count: priceDropsCount });
 });
 
 /**

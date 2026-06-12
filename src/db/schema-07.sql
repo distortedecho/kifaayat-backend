@@ -190,6 +190,36 @@ ALTER TABLE orders ADD COLUMN IF NOT EXISTS shipping_amount INTEGER;
 -- applied" apart.
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS voucher_discount INTEGER DEFAULT 0;
 
+-- buyer_note = optional message the buyer leaves at checkout (e.g. "please
+-- ship by Friday, wearing it on Saturday"). Read-only from seller's side
+-- until they accept the order — full chat unlocks post-acceptance.
+-- Capped at 500 chars to keep it a note rather than a message thread.
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS buyer_note TEXT;
+
+-- shipping_receipt_photo_url = optional photo of the postage label/receipt
+-- the seller uploads when marking shipped. Public URL into the listing-photos
+-- bucket. Visible to the buyer on the order detail screen — serves as proof
+-- of dispatch for trust and dispute resolution. Optional; not all sellers
+-- have a physical receipt (barcode-only labels are common).
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS shipping_receipt_photo_url TEXT;
+
+-- -------------------------
+-- wishlists — price-at-save baseline
+-- -------------------------
+-- Capture the listing's price at the moment a user saves it. Powers the
+-- "was $X, now $Y" banner on the saved items screen: any wishlist row
+-- where listing.price_amount < wishlists.price_at_save renders the
+-- price-dropped indicator. Existing rows are backfilled to the current
+-- listing price so they start at "no drop" — avoids false positives for
+-- historic saves where we don't actually know the original save price.
+ALTER TABLE wishlists ADD COLUMN IF NOT EXISTS price_at_save INTEGER;
+
+UPDATE wishlists w
+SET price_at_save = l.price_amount
+FROM listings l
+WHERE w.listing_id = l.id
+  AND w.price_at_save IS NULL;
+
 -- -------------------------
 -- user_addresses — multiple addresses per user
 -- -------------------------

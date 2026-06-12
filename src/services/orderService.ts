@@ -182,6 +182,8 @@ export async function createOrder(
   const itemAmount = parseInt(intentMetadata.item_amount || String(amount), 10);
   const shippingAmount = parseInt(intentMetadata.shipping_amount || "0", 10);
   const voucherDiscount = parseInt(intentMetadata.voucher_discount || "0", 10);
+  // Optional buyer note from checkout — empty string in metadata = no note.
+  const buyerNote = intentMetadata.buyer_note ? intentMetadata.buyer_note : null;
   const fallbackRate = await getCommissionRate();
   const commissionAmount = intentMetadata.commission_amount
     ? parseInt(intentMetadata.commission_amount, 10)
@@ -210,12 +212,14 @@ export async function createOrder(
           INSERT INTO orders (
             order_number, listing_id, buyer_id, seller_id, buyer_email,
             offer_id, amount, item_amount, shipping_amount, voucher_discount,
+            buyer_note,
             currency, commission_rate, commission_amount,
             seller_payout, stripe_payment_intent_id, stripe_checkout_session_id,
             status
           ) VALUES (
             ${orderNumber}, ${listing_id}, ${buyerId}, ${listing.seller_id},
             ${buyer_email}, ${offer_id || null}, ${amount}, ${itemAmount}, ${shippingAmount}, ${voucherDiscount},
+            ${buyerNote},
             ${currency}, ${commissionRate}, ${commissionAmount}, ${sellerPayout},
             ${stripe_payment_intent_id},
             ${stripe_checkout_session_id || null},
@@ -252,6 +256,7 @@ export async function createOrder(
         item_amount: itemAmount,
         shipping_amount: shippingAmount,
         voucher_discount: voucherDiscount,
+        buyer_note: buyerNote,
         currency,
         commission_rate: commissionRate,
         commission_amount: commissionAmount,

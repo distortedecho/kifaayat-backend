@@ -21,6 +21,7 @@ interface ListingSummary {
   estimated_size: string | null;
   size_type: string | null;
   designer_name: string | null;
+  international_shipping: boolean;
   cover_photo_url: string | null;
   seller_name: string | null;
   seller_location: string | null;
@@ -200,11 +201,14 @@ search.get("/", optionalClerkMiddleware, async (c) => {
   // We use a raw SQL approach via rpc for FTS + trigram combined queries
   // Build filters as a Supabase query chain
 
-  // Base query: active listings with photos and seller info
+  // Base query: active listings with photos and seller info.
+  // international_shipping is pulled so we can include "ships globally"
+  // listings in non-local markets (matching feed behavior) and so the
+  // frontend can render a "Ships internationally" badge per result.
   let query = supabase
     .from("listings")
     .select(
-      "id, title, description, price_amount, price_currency, original_price_amount, category, condition, estimated_size, size_type, designer_name, measurements, occasion_tags, colors, created_at, listing_photos(url, position), profiles!listings_seller_id_fkey(display_name, location, trust_tier)",
+      "id, title, description, price_amount, price_currency, original_price_amount, category, condition, estimated_size, size_type, designer_name, international_shipping, measurements, occasion_tags, colors, created_at, listing_photos(url, position), profiles!listings_seller_id_fkey(display_name, location, trust_tier)",
       { count: "estimated" }
     )
     .eq("status", "active");
@@ -267,16 +271,20 @@ search.get("/", optionalClerkMiddleware, async (c) => {
     query = query.eq("estimated_size", size);
   }
 
-  // Location filter: join with profiles
+  // Location filter: explicit user choice (e.g. "show me only AU sellers") —
+  // strict, no international shipping bypass.
   if (location) {
-    // Filter by seller's location via the join
     query = query.eq("profiles.location", location);
   }
 
-  // Market filter: same mechanism as location but uses `market` param
-  if (market) {
-    query = query.eq("profiles.location", market);
-  }
+  // Market filter (`?market=US`): drives the home-feed/marketplace context.
+  // Unlike `location` above, this is NOT strict — international-shipping
+  // listings from other markets are also surfaced (matches GET /api/feed
+  // behavior). The actual OR (local OR international) is applied in JS
+  // after fetching since PostgREST .or() across embedded + native columns
+  // is awkward. Caveat: page sizes may be slightly under `limit` when
+  // many fetched rows are filtered out — acceptable trade-off for now.
+  // (No DB filter applied here.)
 
   // --- Apply sort ---
   switch (sort) {
@@ -345,15 +353,31 @@ search.get("/", optionalClerkMiddleware, async (c) => {
 
   const allRows = rows || [];
 
-  // If location/market filter is active, the join filter may have returned listings
-  // where the profiles join is null — filter those out
-  const locationFilter = location || market;
+  // location (strict, explicit user choice) — drop anything not in that country
+  // market (inclusive) — keep local sellers OR listings that ship internationally
   let filteredRows = allRows;
-  if (locationFilter) {
+  if (location) {
     filteredRows = allRows.filter((row: Record<string, unknown>) => {
       const profiles = row.profiles as Record<string, unknown> | null;
-      return profiles && profiles.location === locationFilter;
+      return profiles && profiles.location === location;
     });
+  } else if (market) {
+    filteredRows = allRows
+      .filter((row: Record<string, unknown>) => {
+        const profiles = row.profiles as Record<string, unknown> | null;
+        if (!profiles) return false;
+        const sellerMarket = profiles.location as string | null | undefined;
+        const intl = row.international_shipping === true;
+        return sellerMarket === market || intl;
+      })
+      // Local sellers bubble to the top of search results; international fills out.
+      .sort((a: Record<string, unknown>, b: Record<string, unknown>) => {
+        const aLocal =
+          (a.profiles as Record<string, unknown> | null)?.location === market ? 0 : 1;
+        const bLocal =
+          (b.profiles as Record<string, unknown> | null)?.location === market ? 0 : 1;
+        return aLocal - bLocal;
+      });
   }
 
   const hasMore = filteredRows.length > limit;
@@ -405,6 +429,7 @@ search.get("/", optionalClerkMiddleware, async (c) => {
         estimated_size: (row.estimated_size as string | null) ?? null,
         size_type: (row.size_type as string | null) ?? null,
         designer_name: (row.designer_name as string | null) ?? null,
+        international_shipping: row.international_shipping === true,
         cover_photo_url: coverUrl,
         seller_name: profiles
           ? (profiles.display_name as string | null)

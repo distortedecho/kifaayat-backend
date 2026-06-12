@@ -165,10 +165,9 @@ export const POPULAR_DESIGNERS = [
 
 // Dry cleaning status — matching live Play Store app
 export const DRY_CLEANING_STATUSES = [
-  "Dry-cleaned less than 1 month ago",
-  "Dry-cleaned over 1 month ago",
-  "Pre-loved and not dry cleaned",
-  "New, therefore not dry cleaned",
+  "Pre-loved, never dry cleaned",
+  "Pre-loved, previously dry cleaned",
+  "Brand new, never dry cleaned",
 ] as const;
 export type DryCleaningStatus = (typeof DRY_CLEANING_STATUSES)[number];
 

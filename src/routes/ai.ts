@@ -11,6 +11,7 @@ import {
   OCCASION_TAGS,
   FABRIC_TYPES,
   WORK_TYPES,
+  PRIMARY_COLOURS,
 } from "../types/listings.js";
 import type {
   AIAnalysisResponse,
@@ -240,9 +241,13 @@ ai.post("/analyze", clerkMiddleware, async (c) => {
     };
   });
 
+  // Categories: strip "Other" so the model has to pick a specific category
+  // rather than fall back to the generic bucket. Users can manually choose
+  // "Other" on the form if the AI returns a low-confidence guess.
+  const aiCategoryOptions = LISTING_CATEGORIES.filter((c) => c !== "Other");
   const prompt = `Analyze these photos of a South Asian fashion item for a preloved marketplace listing.
 Return a JSON object with these fields:
-- category: one of [Lehenga, Saree, Suit/Salwar, Anarkali, Indowestern, Sharara, Jewellery, Dupatta, Blouse, Menswear, Kidswear, Footwear, Other]
+- category: one of [${aiCategoryOptions.join(", ")}]. Pick the most specific category that fits — do NOT return any value outside this list.
 - category_confidence: confidence score 0-100
 - title: a descriptive marketplace title (max 200 chars)
 - title_confidence: confidence score 0-100
@@ -250,11 +255,11 @@ Return a JSON object with these fields:
 - description_confidence: confidence score 0-100
 - suggested_price: price in AUD cents (integer), based on typical preloved prices for this category and apparent condition
 - suggested_price_confidence: confidence score 0-100
-- condition: one of [Pre-loved, New without tags, New with tags, New with defects]
+- condition: one of [${LISTING_CONDITIONS.join(", ")}]
 - condition_confidence: confidence score 0-100
-- colors: array of 1-4 dominant colors from [Black, Grey, White, Brown, Tan, Cream, Yellow, Red, Burgundy, Orange, Pink, Purple, Blue, Navy, Green, Khaki, Multi, Silver, Gold, Other]
+- colors: array of 1-4 dominant colors from [${PRIMARY_COLOURS.join(", ")}]
 - colors_confidence: confidence score 0-100
-- occasion_tags: array from [Bridal, Casual, Festive, Groom, Pre-wedding event (bride/groom), Pre-wedding event (guest), Wedding party, Wedding guest]
+- occasion_tags: array from [${OCCASION_TAGS.join(", ")}]
 - occasion_tags_confidence: confidence score 0-100
 - photo_quality: array of objects for each photo, each with:
   - index: photo index (0-based)
@@ -371,6 +376,15 @@ function mapGeminiResponse(raw: Record<string, unknown>): AIAnalysisResponse {
     OCCASION_TAGS.includes(tag as any)
   );
 
+  // Validate colors against the canonical 20-color palette. Anything Gemini
+  // hallucinates (e.g. "Mauve", "Champagne") gets dropped so the frontend
+  // never has to render a color it doesn't have a swatch for.
+  const rawColors = Array.isArray(raw.colors) ? raw.colors : [];
+  const validColors = rawColors
+    .map(String)
+    .filter((c: string) => (PRIMARY_COLOURS as readonly string[]).includes(c))
+    .slice(0, 4);
+
   // Parse photo quality assessments
   const rawPhotoQuality = Array.isArray(raw.photo_quality) ? raw.photo_quality : [];
   const photoQuality: PhotoQualityAssessment[] = rawPhotoQuality.map((pq: any, i: number) => ({
@@ -395,7 +409,10 @@ function mapGeminiResponse(raw: Record<string, unknown>): AIAnalysisResponse {
 
   return {
     category: {
-      value: String(raw.category || "Other"),
+      // Drop invalid/hallucinated values entirely — empty string + confidence 0
+      // signals to the frontend that no AI suggestion is available, instead of
+      // leaking "Anarkali" or other categories that don't exist on the platform.
+      value: categoryValid ? String(raw.category) : "",
       confidence: categoryValid ? toConfidence(raw.category_confidence) : 0,
     },
     title: {
@@ -411,14 +428,13 @@ function mapGeminiResponse(raw: Record<string, unknown>): AIAnalysisResponse {
       confidence: toConfidence(raw.suggested_price_confidence),
     },
     condition: {
-      value: String(raw.condition || "Good"),
+      // Same hardening — never surface a condition that's not in our enum.
+      value: conditionValid ? String(raw.condition) : "",
       confidence: conditionValid ? toConfidence(raw.condition_confidence) : 0,
     },
     colors: {
-      value: Array.isArray(raw.colors)
-        ? raw.colors.map(String).slice(0, 4)
-        : [],
-      confidence: toConfidence(raw.colors_confidence),
+      value: validColors,
+      confidence: validColors.length > 0 ? toConfidence(raw.colors_confidence) : 0,
     },
     occasion_tags: {
       value: validTags.map(String),

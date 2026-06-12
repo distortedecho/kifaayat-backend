@@ -40,6 +40,10 @@ const paymentIntentSchema = z.object({
   offer_id: z.string().uuid("offer_id must be a valid UUID").optional(),
   referral_code: z.string().max(20).optional(),
   voucher_id: z.string().uuid("voucher_id must be a valid UUID").optional(),
+  // Optional note from buyer to seller, shown on the seller's order detail
+  // (e.g. shipping requests). Frontend should treat this as one-shot —
+  // there's no chat until the seller accepts the order.
+  buyer_note: z.string().max(500).nullish(),
 });
 
 const boostPaymentIntentSchema = z.object({
@@ -191,7 +195,7 @@ stripeRoutes.post("/payment-intent", optionalClerkMiddleware, async (c) => {
     );
   }
 
-  const { listing_id, offer_id, referral_code, voucher_id } = parsed.data;
+  const { listing_id, offer_id, referral_code, voucher_id, buyer_note } = parsed.data;
   let buyer_email = parsed.data.buyer_email;
 
   // Resolve buyer identity
@@ -336,6 +340,9 @@ stripeRoutes.post("/payment-intent", optionalClerkMiddleware, async (c) => {
       commission_amount: String(commission),
       seller_payout: String(sellerPayout),
       voucher_discount: String(voucherDiscount),
+      // Optional buyer-to-seller note shown on the seller's order detail.
+      // Stripe metadata values must be strings; empty string = no note.
+      buyer_note: buyer_note || "",
     },
   };
 
@@ -885,6 +892,8 @@ stripeRoutes.post("/webhook", async (c) => {
     const sellerPayout = metadata.seller_payout
       ? parseInt(metadata.seller_payout, 10)
       : itemAmount - commissionAmount + shippingAmount;
+    // Optional buyer note from checkout. Empty string in metadata = no note.
+    const buyerNote = metadata.buyer_note ? metadata.buyer_note : null;
 
     logger.info("stripe.single_item_commission_calculated", {
       amount,
@@ -924,6 +933,7 @@ stripeRoutes.post("/webhook", async (c) => {
         item_amount: itemAmount,
         shipping_amount: shippingAmount,
         voucher_discount: voucherDiscount,
+        buyer_note: buyerNote,
         currency,
         commission_rate: commissionRate,
         commission_amount: commissionAmount,

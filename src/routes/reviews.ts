@@ -332,10 +332,39 @@ reviews.get("/order/:orderId", clerkMiddleware, async (c) => {
     return c.json({ error: "Failed to fetch reviews" }, 500);
   }
 
-  const blindResult = applyBlindLogic(
-    (reviewRows as Review[]) || [],
-    profile.id
-  );
+  // Enrich each review row with reviewer name + avatar so the frontend can
+  // render a real name/photo instead of falling back to "Buyer"/"Seller".
+  // The enrichment is applied BEFORE applyBlindLogic, so blinded stubs
+  // (which only pick { id, submitted, blinded }) automatically exclude
+  // these fields — the double-blind contract stays intact.
+  const reviewsList = (reviewRows as Review[]) || [];
+  const reviewerIds = Array.from(new Set(reviewsList.map((r) => r.reviewer_id)));
+  let profilesMap: Record<string, { display_name: string | null; avatar_url: string | null }> = {};
+  if (reviewerIds.length > 0) {
+    const { data: reviewerProfiles } = await supabase
+      .from("profiles")
+      .select("id, display_name, avatar_url")
+      .in("id", reviewerIds);
+    profilesMap = Object.fromEntries(
+      (reviewerProfiles || []).map((p) => [
+        p.id as string,
+        {
+          display_name: (p.display_name as string | null) ?? null,
+          avatar_url: (p.avatar_url as string | null) ?? null,
+        },
+      ])
+    );
+  }
+  const enrichedReviews = reviewsList.map((r) => {
+    const prof = profilesMap[r.reviewer_id];
+    return {
+      ...r,
+      reviewer_name: prof?.display_name ?? null,
+      reviewer_avatar_url: prof?.avatar_url ?? null,
+    };
+  });
+
+  const blindResult = applyBlindLogic(enrichedReviews, profile.id);
 
   // Calculate review window info
   let daysRemaining = 0;

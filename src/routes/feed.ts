@@ -24,6 +24,7 @@ interface ListingSummary {
   estimated_size: string | null;
   size_type: string | null;
   designer_name: string | null;
+  international_shipping: boolean;
   cover_photo_url: string | null;
   seller_name: string | null;
   seller_location: string | null;
@@ -74,8 +75,11 @@ interface CategoryCount {
 // Constants
 // ============================================================
 
+// international_shipping is pulled so we can include "ships globally" listings
+// in non-local feeds AND so the frontend can render a "Ships internationally"
+// badge on each card.
 const LISTING_SELECT =
-  "id, title, price_amount, price_currency, original_price_amount, category, condition, estimated_size, size_type, designer_name, created_at, listing_photos(url, position), profiles!listings_seller_id_fkey(display_name, location, trust_tier)";
+  "id, title, price_amount, price_currency, original_price_amount, category, condition, estimated_size, size_type, designer_name, international_shipping, created_at, listing_photos(url, position), profiles!listings_seller_id_fkey(display_name, location, trust_tier)";
 
 // ============================================================
 // Helpers
@@ -160,6 +164,7 @@ function toListingSummary(
     estimated_size: (row.estimated_size as string | null) ?? null,
     size_type: (row.size_type as string | null) ?? null,
     designer_name: (row.designer_name as string | null) ?? null,
+    international_shipping: row.international_shipping === true,
     cover_photo_url: coverUrl,
     seller_name: profiles
       ? (profiles.display_name as string | null)
@@ -185,15 +190,34 @@ function toListingSummary(
  * Supabase embedded filters on joins can return rows with null profiles;
  * this post-filter removes them.
  */
+/**
+ * Filter listings to those visible in `market`: seller is local to that market
+ * OR the listing offers international shipping. Local-first sorting is applied
+ * afterward so the home feed leads with nearby sellers and fills out with
+ * international inventory only when local is sparse.
+ */
 function filterByMarket(
   rows: Record<string, unknown>[],
   market: string
 ): Record<string, unknown>[] {
-  return rows.filter((row) => {
+  const filtered = rows.filter((row) => {
     const profiles = row.profiles as Record<string, unknown> | null;
     if (!profiles) return false;
-    // Include sellers whose location matches OR who haven't set a location yet
-    return profiles.location === market || !profiles.location;
+    const sellerMarket = profiles.location as string | null | undefined;
+    const intlShipping = row.international_shipping === true;
+    return sellerMarket === market || !sellerMarket || intlShipping;
+  });
+
+  // Local-first sort: same-market sellers bubble to the top, then by recency.
+  return filtered.sort((a, b) => {
+    const aLocal =
+      (a.profiles as Record<string, unknown> | null)?.location === market ? 0 : 1;
+    const bLocal =
+      (b.profiles as Record<string, unknown> | null)?.location === market ? 0 : 1;
+    if (aLocal !== bLocal) return aLocal - bLocal;
+    const aDate = String(a.created_at || "");
+    const bDate = String(b.created_at || "");
+    return bDate.localeCompare(aDate);
   });
 }
 
@@ -253,44 +277,45 @@ feed.get("/", optionalClerkMiddleware, async (c) => {
     topWardrobesResult,
     isoPostsResult,
   ] = await Promise.all([
-    // 1. New Arrivals: 10 most recent active listings in this market
+    // 1. New Arrivals: 10 most recent listings visible in this market.
+    // No DB-level market filter — filterByMarket() handles "local OR ships
+    // internationally" downstream so non-local sellers offering international
+    // shipping reach buyers in smaller markets.
     supabase
       .from("listings")
       .select(LISTING_SELECT)
       .eq("status", "active")
-      .eq("profiles.location", market)
       .order("created_at", { ascending: false })
-      .limit(20), // Over-fetch to account for post-filter
+      .limit(40),
 
-    // 2. Trending: use fallback approach (most recent, market-filtered)
-    // Skip RPC since it doesn't support market filtering
+    // 2. Trending: most recent (fallback). Same market logic as above.
     supabase
       .from("listings")
       .select(LISTING_SELECT)
       .eq("status", "active")
-      .eq("profiles.location", market)
       .order("created_at", { ascending: false })
-      .limit(16), // Over-fetch for post-filter
+      .limit(40),
 
-    // 3. Category counts for this market
+    // 3. Category counts: include international here too so a buyer browsing
+    // categories sees categories that have ANY shoppable inventory for them.
     supabase
       .from("listings")
-      .select("category, profiles!listings_seller_id_fkey(location)")
-      .eq("status", "active")
-      .eq("profiles.location", market),
+      .select("category, international_shipping, profiles!listings_seller_id_fkey(location)")
+      .eq("status", "active"),
 
-    // 4. In Your Size (only if user has bust measurement)
+    // 4. In Your Size — drop DB market filter; filterByMarket + bust filter
+    // both run in JS. Over-fetch to leave room for both filters to drop rows.
     userBustSize !== null
       ? supabase
           .from("listings")
           .select(LISTING_SELECT + ", measurements")
           .eq("status", "active")
-          .eq("profiles.location", market)
-          .limit(30) // Over-fetch for post-filter + bust filter
+          .limit(60)
       : Promise.resolve({ data: null as null, error: null as null }),
 
-    // 5. Top Wardrobes: sellers with 10+ active listings in this market
-    // Step 1: get seller counts
+    // 5. Top Wardrobes: sellers with 10+ active listings IN this market.
+    // Intentionally local-only — this section spotlights local talent, not
+    // international inventory. Keep the strict market filter.
     supabase
       .from("listings")
       .select("seller_id, profiles!listings_seller_id_fkey(id, display_name, avatar_url, location)")
@@ -593,15 +618,16 @@ feed.get("/category/:category", optionalClerkMiddleware, async (c) => {
   const catMedians: Record<string, number> =
     (catSettingsRow?.category_medians as Record<string, number>) ?? {};
 
-  // Over-fetch to account for post-filter on market
-  const overFetchLimit = (limit + 1) * 3;
+  // Over-fetch to account for post-filter on market (filterByMarket handles
+  // local + international shipping). Bumped multiplier vs the old strict
+  // market filter since we're now filtering across all markets in JS.
+  const overFetchLimit = (limit + 1) * 4;
 
   let query = supabase
     .from("listings")
     .select(LISTING_SELECT)
     .eq("status", "active")
     .eq("category", category)
-    .eq("profiles.location", market)
     .order("created_at", { ascending: false })
     .order("id", { ascending: false })
     .limit(overFetchLimit);
