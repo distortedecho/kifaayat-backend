@@ -11,6 +11,7 @@ import {
 } from "../types/transactions.js";
 import { createNotification, orderPaidNotification } from "../lib/notifications.js";
 import { getAvailableCreditBalance, redeemCredits } from "../lib/referrals.js";
+import { createPayoutLedger } from "../services/payoutService.js";
 
 // ============================================================
 // Stripe singleton (mirrors stripe.ts pattern)
@@ -662,23 +663,21 @@ cart.post("/checkout", clerkMiddleware, requireProfile, async (c) => {
           .update({ status: "sold" })
           .in("id", group.listing_ids);
 
-        // Create Stripe Transfer for seller payout (shipping charges still need to be transferred)
-        if (group.stripe_account_id && group.seller_payout > 0) {
-          try {
-            await getStripe().transfers.create({
-              amount: group.seller_payout,
-              currency: currency.toLowerCase(),
-              destination: group.stripe_account_id,
-              transfer_group: `cart_${cartCheckoutId}`,
-              metadata: {
-                order_number: orderNumber,
-                seller_id: group.seller_id,
-                zero_charge: "true",
-              },
-            });
-          } catch (transferError) {
-            console.error(`Transfer failed for zero-charge order seller ${group.seller_id}:`, transferError);
-          }
+        // Escrow ledger row — disbursement happens on delivery confirmation,
+        // not at order-creation time. Cart is Stripe-Connect-only for now.
+        if (order && group.seller_payout > 0) {
+          await createPayoutLedger({
+            sellerId: group.seller_id,
+            orderId: order.id as string,
+            amountCents: group.seller_payout,
+            currency,
+            method: "stripe",
+          }).catch((err) =>
+            console.error(
+              `Failed to create zero-charge payout ledger for seller ${group.seller_id}:`,
+              err
+            )
+          );
         }
 
         // Notify seller

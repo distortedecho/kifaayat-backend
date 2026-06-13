@@ -67,7 +67,8 @@ const updateProfileSchema = z.object({
   onesignal_player_id: z.string().optional(),
   user_intents: z.array(z.enum(["buy", "sell"])).optional(),
   wishlist_public: z.boolean().optional(),
-  payout_method: z.enum(["stripe", "kifaayat_wallet"]).optional(),
+  // payout_method is no longer settable via the generic /me PUT — it now
+  // has its own endpoint that takes method-specific details (PUT /me/payout-method).
   bio: z.string().max(500).nullish(),
 });
 
@@ -231,6 +232,191 @@ profiles.put("/me", clerkMiddleware, async (c) => {
   }
 
   return c.json({ profile: updatedProfile });
+});
+
+// ============================================================
+// Payout method — multi-method (Stripe / Wise / PayPal)
+// ============================================================
+
+// Discriminated union so each method validates its own required fields.
+// Stripe path needs no body fields here — onboarding happens via the
+// dedicated Stripe Connect flow (POST /api/stripe/create-account etc).
+const payoutMethodSchema = z.discriminatedUnion("payout_method", [
+  z.object({
+    payout_method: z.literal("stripe"),
+  }),
+  z.object({
+    payout_method: z.literal("wise"),
+    wise_account_holder: z.string().min(1).max(200),
+    wise_bank_country: z.enum(["AU", "UK", "US", "CA", "NZ"]),
+    wise_bank_currency: z.enum(["AUD", "GBP", "USD", "CAD", "NZD"]),
+    wise_routing_code: z.string().min(1).max(50),
+    wise_account_number: z.string().min(1).max(50),
+    wise_account_type: z.enum(["checking", "savings"]).optional(),
+  }),
+  z.object({
+    payout_method: z.literal("paypal"),
+    paypal_email: z.string().email(),
+  }),
+]);
+
+/**
+ * PUT /api/profiles/me/payout-method
+ * Seller picks one of the three payout methods and submits the
+ * relevant details. Stripe Connect uses the existing onboarding flow
+ * (no extra fields). Wise / PayPal store bank / email details that
+ * the admin uses to manually disburse on delivery confirmation.
+ *
+ * Only updates fields for the chosen method — leaves the others
+ * alone so a seller switching methods doesn't have to re-enter old
+ * details if they switch back.
+ */
+profiles.put("/me/payout-method", clerkMiddleware, async (c) => {
+  const clerkUserId = c.get("clerkUserId");
+  const supabase = createSupabaseAdmin();
+
+  const body = await c.req.json();
+  const parsed = payoutMethodSchema.safeParse(body);
+  if (!parsed.success) {
+    return c.json(
+      {
+        error: "Validation failed",
+        details: parsed.error.flatten().fieldErrors,
+      },
+      400
+    );
+  }
+
+  const data = parsed.data;
+
+  // For Stripe, gate-check that onboarding is already complete — otherwise
+  // the seller can't actually receive money via this method. Avoids the UI
+  // letting them "pick Stripe" without first running through AccountLink.
+  if (data.payout_method === "stripe") {
+    const { data: stripeProfile } = await supabase
+      .from("profiles")
+      .select("stripe_account_id, stripe_onboarding_complete")
+      .eq("clerk_id", clerkUserId)
+      .single();
+
+    if (!stripeProfile?.stripe_account_id || !stripeProfile.stripe_onboarding_complete) {
+      return c.json(
+        {
+          error:
+            "Complete Stripe Connect onboarding before selecting Stripe as your payout method.",
+        },
+        400
+      );
+    }
+  }
+
+  // Build update payload — only set fields relevant to the chosen method.
+  const updatePayload: Record<string, unknown> = {
+    payout_method: data.payout_method,
+  };
+  if (data.payout_method === "wise") {
+    updatePayload.wise_account_holder = data.wise_account_holder;
+    updatePayload.wise_bank_country = data.wise_bank_country;
+    updatePayload.wise_bank_currency = data.wise_bank_currency;
+    updatePayload.wise_routing_code = data.wise_routing_code;
+    updatePayload.wise_account_number = data.wise_account_number;
+    updatePayload.wise_account_type = data.wise_account_type ?? null;
+  } else if (data.payout_method === "paypal") {
+    updatePayload.paypal_email = data.paypal_email;
+  }
+
+  const { data: updatedProfile, error: updateError } = await supabase
+    .from("profiles")
+    .update(updatePayload)
+    .eq("clerk_id", clerkUserId)
+    .select(
+      "id, payout_method, stripe_account_id, stripe_onboarding_complete, " +
+        "wise_account_holder, wise_bank_country, wise_bank_currency, " +
+        "wise_routing_code, wise_account_number, wise_account_type, paypal_email"
+    )
+    .single();
+
+  if (updateError) {
+    console.error("Error updating payout method:", updateError);
+    return c.json({ error: "Failed to update payout method" }, 500);
+  }
+
+  return c.json({ profile: updatedProfile });
+});
+
+/**
+ * GET /api/profiles/me/payouts
+ * Seller's payout history — every owed disbursement, status, and
+ * external reference if the admin has already paid them out.
+ */
+profiles.get("/me/payouts", clerkMiddleware, async (c) => {
+  const clerkUserId = c.get("clerkUserId");
+  const supabase = createSupabaseAdmin();
+
+  const { data: profile } = await supabase
+    .from("profiles")
+    .select("id")
+    .eq("clerk_id", clerkUserId)
+    .single();
+
+  if (!profile) {
+    return c.json({ error: "Profile not found" }, 404);
+  }
+
+  const limitParam = c.req.query("limit");
+  const limit = Math.min(
+    Math.max(parseInt(limitParam || "50", 10) || 50, 1),
+    200
+  );
+  const cursor = c.req.query("cursor");
+
+  let query = supabase
+    .from("seller_payouts")
+    .select(
+      "id, order_id, amount_cents, currency, method, status, stripe_transfer_id, external_reference, failure_reason, paid_at, sent_at, created_at, updated_at, orders!seller_payouts_order_id_fkey(order_number, listing_id)"
+    )
+    .eq("seller_id", profile.id)
+    .order("created_at", { ascending: false })
+    .limit(limit);
+
+  if (cursor) {
+    query = query.lt("created_at", cursor);
+  }
+
+  const { data: payouts, error } = await query;
+
+  if (error) {
+    console.error("Error fetching payouts:", error);
+    return c.json({ error: "Failed to fetch payouts" }, 500);
+  }
+
+  const items = (payouts || []).map((row: Record<string, unknown>) => {
+    const orderRaw = row.orders as Record<string, unknown> | null;
+    return {
+      id: row.id,
+      order_id: row.order_id,
+      order_number: orderRaw ? orderRaw.order_number : null,
+      listing_id: orderRaw ? orderRaw.listing_id : null,
+      amount_cents: row.amount_cents,
+      currency: row.currency,
+      method: row.method,
+      status: row.status,
+      stripe_transfer_id: row.stripe_transfer_id,
+      external_reference: row.external_reference,
+      failure_reason: row.failure_reason,
+      paid_at: row.paid_at,
+      sent_at: row.sent_at,
+      created_at: row.created_at,
+      updated_at: row.updated_at,
+    };
+  });
+
+  const nextCursor =
+    items.length === limit
+      ? (items[items.length - 1].created_at as string)
+      : null;
+
+  return c.json({ items, next_cursor: nextCursor });
 });
 
 /**

@@ -157,7 +157,9 @@ export async function autoRejectOrder(orderId: string): Promise<void> {
       })
       .eq("id", orderId);
 
-    // Attempt Stripe refund (fire-and-forget, log on failure)
+    // Attempt Stripe refund (fire-and-forget, log on failure). With escrow
+    // the funds are sitting in Kifaayat's balance, so this is a clean
+    // refund — no seller-side clawback required.
     if (order.stripe_payment_intent_id) {
       try {
         await getStripe().refunds.create({
@@ -170,6 +172,15 @@ export async function autoRejectOrder(orderId: string): Promise<void> {
           refundErr
         );
       }
+    }
+
+    // Tombstone the payout ledger row so the admin dashboard doesn't
+    // surface this as a pending disbursement.
+    try {
+      const { cancelPayoutForOrder } = await import("../services/payoutService.js");
+      await cancelPayoutForOrder(orderId, "Auto-rejected: seller did not respond within 48 hours");
+    } catch (err) {
+      console.error(`[job] autoRejectOrder: payout cancel failed for ${orderId}:`, err);
     }
 
     // Notify buyer

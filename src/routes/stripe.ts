@@ -17,6 +17,12 @@ import { redeemCredits, recordReferralAndAwardVoucher } from "../lib/referrals.j
 import { logger } from "../lib/logger.js";
 import { getStripe } from "../lib/stripeClient.js";
 import { enqueueDelayed, JOB_AUTO_REJECT_ORDER } from "../lib/jobs.js";
+import {
+  SELLER_PAYOUT_PROFILE_FIELDS,
+  createPayoutLedger,
+  resolveSellerPayoutMethod,
+  type SellerPayoutProfile,
+} from "../services/payoutService.js";
 
 const stripeRoutes = new Hono();
 
@@ -288,15 +294,25 @@ stripeRoutes.post("/payment-intent", optionalClerkMiddleware, async (c) => {
     paymentAmount = offer.amount;
   }
 
-  // Look up seller's Stripe account and payout method
+  // Look up seller's payout configuration (all methods in one shot)
   const { data: sellerProfile } = await supabase
     .from("profiles")
-    .select("stripe_account_id, stripe_onboarding_complete, payout_method")
+    .select(SELLER_PAYOUT_PROFILE_FIELDS)
     .eq("id", listing.seller_id)
-    .single();
+    .single<SellerPayoutProfile>();
 
-  const sellerStripeAccountId = sellerProfile?.stripe_account_id || null;
-  const sellerOnboardingComplete = sellerProfile?.stripe_onboarding_complete ?? false;
+  // ESCROW: regardless of which method the seller picked, the buyer's
+  // payment always lands in Kifaayat's Stripe balance. Disbursement
+  // happens on delivery confirmation — see services/payoutService.ts.
+  // We still need to verify the seller has a usable method up-front so
+  // we don't take money for a payee we can't pay.
+  const resolvedMethod = resolveSellerPayoutMethod(sellerProfile);
+  if (!resolvedMethod) {
+    return c.json(
+      { error: "This seller has not completed payment setup. Please contact the seller." },
+      400
+    );
+  }
 
   // Item amount = either offer amount or listing price (negotiated price excludes shipping).
   // Shipping is added on top, charged to the buyer, and passes through to the seller.
@@ -323,7 +339,8 @@ stripeRoutes.post("/payment-intent", optionalClerkMiddleware, async (c) => {
   // What Stripe actually charges the buyer.
   const chargeAmount = itemAmount + shippingAmount - voucherDiscount;
 
-  // Build PaymentIntent params
+  // Build PaymentIntent params — no transfer_data, no application_fee_amount.
+  // Funds land fully in Kifaayat's balance; we move them on delivery.
   const intentParams: Stripe.PaymentIntentCreateParams = {
     amount: chargeAmount,
     currency: listing.price_currency.toLowerCase(),
@@ -331,6 +348,7 @@ stripeRoutes.post("/payment-intent", optionalClerkMiddleware, async (c) => {
       listing_id,
       buyer_email: buyer_email || "",
       buyer_profile_id: buyerProfileId || "",
+      seller_id: listing.seller_id,
       offer_id: offer_id || "",
       referral_code: referral_code ? referral_code.toUpperCase().trim() : "",
       voucher_id: voucher_id || "",
@@ -340,6 +358,10 @@ stripeRoutes.post("/payment-intent", optionalClerkMiddleware, async (c) => {
       commission_amount: String(commission),
       seller_payout: String(sellerPayout),
       voucher_discount: String(voucherDiscount),
+      // Resolved at intent-creation time so the webhook can write the
+      // payout ledger without re-deriving from a profile that may
+      // have changed mid-checkout.
+      payout_method: resolvedMethod,
       // Optional buyer-to-seller note shown on the seller's order detail.
       // Stripe metadata values must be strings; empty string = no note.
       buyer_note: buyer_note || "",
@@ -349,24 +371,6 @@ stripeRoutes.post("/payment-intent", optionalClerkMiddleware, async (c) => {
   // Add receipt_email if we have one
   if (buyer_email) {
     intentParams.receipt_email = buyer_email;
-  }
-
-  // Determine payout routing based on seller's chosen method
-  const sellerPayoutMethod: string | null = sellerProfile?.payout_method ?? null;
-
-  if (sellerStripeAccountId && sellerOnboardingComplete) {
-    // Direct Stripe payouts via destination charges
-    intentParams.application_fee_amount = commission;
-    intentParams.transfer_data = {
-      destination: sellerStripeAccountId,
-    };
-  } else if (sellerPayoutMethod === "kifaayat_wallet") {
-    // Platform-managed: payment goes to Kifaayat's account, tracked for later payout
-    intentParams.metadata!.payout_method = "kifaayat_wallet";
-    intentParams.metadata!.seller_id = listing.seller_id;
-    intentParams.metadata!.commission_amount = String(commission);
-  } else {
-    return c.json({ error: "This seller has not completed payment setup. Please contact the seller." }, 400);
   }
 
   try {
@@ -500,7 +504,17 @@ h1{color:#d97706;font-size:1.5rem}p{color:#6b7280;margin-top:0.5rem}</style></he
  */
 stripeRoutes.get("/account-status", clerkMiddleware, requireProfile, async (c) => {
   const profile = c.get("profile");
-  const payoutMethod: string | null = profile.payout_method ?? null;
+  const supabase = createSupabaseAdmin();
+
+  // Resolve the full payout method set so we can return a unified
+  // `payout_ready` flag covering Stripe Connect, Wise, and PayPal.
+  const { data: fullProfile } = await supabase
+    .from("profiles")
+    .select(SELLER_PAYOUT_PROFILE_FIELDS)
+    .eq("id", profile.id)
+    .single<SellerPayoutProfile>();
+  const payoutMethod: string | null = fullProfile?.payout_method ?? null;
+  const resolvedMethod = resolveSellerPayoutMethod(fullProfile);
 
   if (!profile.stripe_account_id) {
     const response = {
@@ -509,7 +523,7 @@ stripeRoutes.get("/account-status", clerkMiddleware, requireProfile, async (c) =
       charges_enabled: false,
       payouts_enabled: false,
       payout_method: payoutMethod,
-      payout_ready: payoutMethod === "kifaayat_wallet",
+      payout_ready: resolvedMethod !== null,
     };
     return c.json(response);
   }
@@ -520,7 +534,6 @@ stripeRoutes.get("/account-status", clerkMiddleware, requireProfile, async (c) =
     );
 
     const status = mapAccountToStatus(account);
-    const stripeVerified = status === "verified";
 
     const response = {
       status,
@@ -528,7 +541,7 @@ stripeRoutes.get("/account-status", clerkMiddleware, requireProfile, async (c) =
       charges_enabled: account.charges_enabled ?? false,
       payouts_enabled: account.payouts_enabled ?? false,
       payout_method: payoutMethod,
-      payout_ready: stripeVerified || payoutMethod === "kifaayat_wallet",
+      payout_ready: resolvedMethod !== null,
     };
 
     return c.json(response);
@@ -763,33 +776,23 @@ stripeRoutes.post("/webhook", async (c) => {
 
         logger.info("stripe.listings_marked_reserved", { listing_ids: group.listing_ids });
 
-        // 3. Create Stripe Transfer to seller
-        if (group.stripe_account_id) {
-          try {
-            logger.info("stripe.transfer_creating", {
-              seller_id: group.seller_id,
-              stripe_account_id: group.stripe_account_id,
-              payout_amount: group.seller_payout,
-              currency,
-            });
-            await getStripe().transfers.create({
-              amount: group.seller_payout,
-              currency: currency.toLowerCase(),
-              destination: group.stripe_account_id,
-              transfer_group: `cart_${cartCheckoutId}`,
-              metadata: {
-                order_number: orderNumber,
-                seller_id: group.seller_id,
-              },
-            });
-            logger.info("stripe.transfer_created", { seller_id: group.seller_id, order_number: orderNumber });
-          } catch (transferError) {
+        // 3. Escrow ledger row — disbursement happens on delivery.
+        // Cart checkout is currently restricted to Stripe Connect sellers
+        // (see routes/cart.ts validation), so method is hardcoded here.
+        // When cart support for Wise/PayPal lands, resolve per-seller.
+        if (order) {
+          await createPayoutLedger({
+            sellerId: group.seller_id,
+            orderId: order.id as string,
+            amountCents: group.seller_payout,
+            currency,
+            method: "stripe",
+          }).catch((err) =>
             console.error(
-              `Transfer failed for seller ${group.seller_id}:`,
-              transferError
-            );
-            // Payment already collected -- log for manual resolution
-          }
+              `Failed to create cart payout ledger for seller ${group.seller_id}:`,
+              err
+            )
+          );
         }
 
         // 4. Send notification to seller + enqueue auto-reject job
@@ -969,6 +972,25 @@ stripeRoutes.post("/webhook", async (c) => {
     if (order) {
       enqueueDelayed(JOB_AUTO_REJECT_ORDER, { orderId: order.id }, 48 * 60 * 60).catch(
         (err) => console.error("Failed to enqueue auto-reject job:", err)
+      );
+    }
+
+    // Escrow ledger: record what we owe the seller. Disbursement happens
+    // later on buyer-confirmed delivery (auto for Stripe Connect, manual
+    // for Wise/PayPal). The method is resolved at payment-intent creation
+    // time so we don't get bitten by mid-checkout profile edits.
+    if (order) {
+      const methodFromMetadata =
+        (metadata.payout_method as "stripe" | "wise" | "paypal" | undefined) ||
+        "stripe"; // safe fallback — pre-escrow intents are all Stripe Connect
+      await createPayoutLedger({
+        sellerId: listing.seller_id,
+        orderId: order.id,
+        amountCents: sellerPayout,
+        currency,
+        method: methodFromMetadata,
+      }).catch((err) =>
+        console.error("Failed to create payout ledger row:", err)
       );
     }
 

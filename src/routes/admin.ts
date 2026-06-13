@@ -32,6 +32,7 @@ import {
   type TierThreshold,
 } from "../types/trust.js";
 import { NOTIFICATION_TYPES } from "../types/transactions.js";
+import { resolveSellerPayoutMethod } from "../services/payoutService.js";
 
 const admin = new Hono();
 
@@ -123,6 +124,8 @@ admin.use("/referrals/*", adminAuthMiddleware);
 admin.use("/analytics/*", adminAuthMiddleware);
 admin.use("/moderation/*", adminAuthMiddleware);
 admin.use("/config/*", adminAuthMiddleware);
+admin.use("/payouts", adminAuthMiddleware);
+admin.use("/payouts/*", adminAuthMiddleware);
 admin.use("/notification-toggles", adminAuthMiddleware);
 admin.use("/notification-toggles/*", adminAuthMiddleware);
 admin.use("/sellers/*", adminAuthMiddleware);
@@ -288,7 +291,11 @@ admin.get("/listings/pending", async (c) => {
   const { data: listings, error, count } = await supabase
     .from("listings")
     .select(
-      "*, listing_photos(*), profiles!listings_seller_id_fkey(display_name, avatar_url, location, stripe_account_id, stripe_onboarding_complete)",
+      "*, listing_photos(*), profiles!listings_seller_id_fkey(" +
+        "display_name, avatar_url, location, payout_method, " +
+        "stripe_account_id, stripe_onboarding_complete, " +
+        "wise_account_holder, wise_bank_country, wise_bank_currency, " +
+        "wise_routing_code, wise_account_number, wise_account_type, paypal_email)",
       { count: "exact" }
     )
     .eq("status", "pending_review")
@@ -300,15 +307,37 @@ admin.get("/listings/pending", async (c) => {
     return c.json({ error: "Failed to fetch pending listings" }, 500);
   }
 
-  const result = (listings || []).map((listing) => ({
-    ...listing,
-    photos: (listing.listing_photos || []).sort(
-      (a: { position: number }, b: { position: number }) => a.position - b.position
-    ),
-    seller: listing.profiles || null,
-    listing_photos: undefined,
-    profiles: undefined,
-  }));
+  const result = ((listings || []) as unknown as Array<Record<string, unknown>>).map((listing) => {
+    const sellerRaw = (listing.profiles as Record<string, unknown> | null) || null;
+    // Resolve which method the seller can actually be paid with, so the admin
+    // UI can display "Stripe / Wise / PayPal / Not connected" without
+    // re-implementing the precedence rules. null = nothing configured.
+    const resolved = sellerRaw
+      ? resolveSellerPayoutMethod({
+          payout_method: (sellerRaw.payout_method as string | null) ?? null,
+          stripe_account_id: (sellerRaw.stripe_account_id as string | null) ?? null,
+          stripe_onboarding_complete:
+            (sellerRaw.stripe_onboarding_complete as boolean | null) ?? null,
+          wise_account_holder: (sellerRaw.wise_account_holder as string | null) ?? null,
+          wise_bank_country: (sellerRaw.wise_bank_country as string | null) ?? null,
+          wise_bank_currency: (sellerRaw.wise_bank_currency as string | null) ?? null,
+          wise_routing_code: (sellerRaw.wise_routing_code as string | null) ?? null,
+          wise_account_number: (sellerRaw.wise_account_number as string | null) ?? null,
+          paypal_email: (sellerRaw.paypal_email as string | null) ?? null,
+        })
+      : null;
+    const seller = sellerRaw
+      ? { ...sellerRaw, payout_method_resolved: resolved }
+      : null;
+    const photos = (listing.listing_photos as Array<{ position: number }> | null) || [];
+    return {
+      ...listing,
+      photos: photos.sort((a, b) => a.position - b.position),
+      seller,
+      listing_photos: undefined,
+      profiles: undefined,
+    };
+  });
 
   return c.json({
     items: result,
@@ -451,25 +480,52 @@ admin.post("/listings/batch", async (c) => {
 
   for (const id of listing_ids) {
     try {
-      const { data: listing, error: fetchError } = await supabase
+      // PostgREST collapses big embedded selects to a bag-of-strings type,
+      // so we narrow manually after the .single() call.
+      type ListingRow = {
+        status: string;
+        title: string;
+        profiles: {
+          id: string;
+          clerk_id: string;
+          display_name: string;
+          avatar_url: string;
+          payout_method: string | null;
+          stripe_account_id: string | null;
+          stripe_onboarding_complete: boolean | null;
+          wise_account_holder: string | null;
+          wise_bank_country: string | null;
+          wise_bank_currency: string | null;
+          wise_routing_code: string | null;
+          wise_account_number: string | null;
+          paypal_email: string | null;
+        } | null;
+      };
+      const { data: listingRaw, error: fetchError } = await supabase
         .from("listings")
-        .select("*, profiles!listings_seller_id_fkey(id, clerk_id, display_name, avatar_url, stripe_account_id, stripe_onboarding_complete)")
+        .select(
+          "*, profiles!listings_seller_id_fkey(id, clerk_id, display_name, avatar_url, " +
+            "payout_method, stripe_account_id, stripe_onboarding_complete, " +
+            "wise_account_holder, wise_bank_country, wise_bank_currency, " +
+            "wise_routing_code, wise_account_number, paypal_email)"
+        )
         .eq("id", id)
         .single();
 
-      if (fetchError || !listing) {
+      if (fetchError || !listingRaw) {
         results.push({ id, success: false, error: "Listing not found" });
         continue;
       }
+      const listing = listingRaw as unknown as ListingRow;
 
       if (listing.status !== "pending_review") {
         results.push({ id, success: false, error: `Status is '${listing.status}', not pending_review` });
         continue;
       }
 
-      const seller = listing.profiles as { id: string; clerk_id: string; display_name: string; avatar_url: string; stripe_account_id: string | null; stripe_onboarding_complete: boolean } | null;
-      if (action === "approve" && !seller?.stripe_onboarding_complete) {
-        results.push({ id, success: false, error: "Seller has not completed Stripe onboarding" });
+      const seller = listing.profiles;
+      if (action === "approve" && !resolveSellerPayoutMethod(seller)) {
+        results.push({ id, success: false, error: "Seller has not set up a payout method (Stripe / Wise / PayPal)" });
         continue;
       }
 
@@ -2977,6 +3033,317 @@ admin.post("/sellers/:id/refresh-stripe", async (c) => {
     console.error("Error retrieving Stripe account:", err);
     return c.json({ error: "Failed to retrieve Stripe account status" }, 500);
   }
+});
+
+// ============================================================
+// Payouts — admin dashboard for manual Wise / PayPal disbursement
+// ============================================================
+
+/**
+ * GET /api/admin/payouts
+ * List seller_payouts rows. Filter by status (?status=ready_for_payout
+ * by default — what the admin actually needs to act on). Inlines the
+ * seller's name + relevant payout details so the admin can copy-paste
+ * into Wise / PayPal without leaving the page.
+ *
+ * Query params:
+ *   status  — pending | ready_for_payout | sent | paid | failed | cancelled
+ *             (default: ready_for_payout)
+ *   method  — stripe | wise | paypal (optional filter)
+ *   limit   — page size (default 50, max 200)
+ *   cursor  — created_at ISO string for pagination
+ */
+admin.get("/payouts", async (c) => {
+  const supabase = createSupabaseAdmin();
+
+  const status = c.req.query("status") || "ready_for_payout";
+  const method = c.req.query("method");
+  const limit = Math.min(
+    Math.max(parseInt(c.req.query("limit") || "50", 10) || 50, 1),
+    200
+  );
+  const cursor = c.req.query("cursor");
+
+  const validStatuses = ["pending", "ready_for_payout", "sent", "paid", "failed", "cancelled"];
+  if (!validStatuses.includes(status)) {
+    return c.json({ error: `Invalid status. Allowed: ${validStatuses.join(", ")}` }, 400);
+  }
+
+  let query = supabase
+    .from("seller_payouts")
+    .select(
+      "id, seller_id, order_id, amount_cents, currency, method, status, " +
+        "stripe_transfer_id, external_reference, failure_reason, paid_at, sent_at, created_at, updated_at, " +
+        "orders!seller_payouts_order_id_fkey(order_number, listing_id, completed_at), " +
+        "seller:profiles!seller_payouts_seller_id_fkey(id, display_name, payout_method, " +
+        "stripe_account_id, wise_account_holder, wise_bank_country, wise_bank_currency, " +
+        "wise_routing_code, wise_account_number, wise_account_type, paypal_email)"
+    )
+    .eq("status", status)
+    .order("created_at", { ascending: false })
+    .limit(limit);
+
+  if (method) {
+    if (!["stripe", "wise", "paypal"].includes(method)) {
+      return c.json({ error: "Invalid method. Allowed: stripe, wise, paypal" }, 400);
+    }
+    query = query.eq("method", method);
+  }
+
+  if (cursor) {
+    query = query.lt("created_at", cursor);
+  }
+
+  const { data: payouts, error } = await query;
+
+  if (error) {
+    console.error("Error fetching admin payouts:", error);
+    return c.json({ error: "Failed to fetch payouts" }, 500);
+  }
+
+  const items = (payouts || []) as unknown as Array<Record<string, unknown>>;
+  const nextCursor =
+    items.length === limit
+      ? (items[items.length - 1].created_at as string)
+      : null;
+
+  return c.json({ items, next_cursor: nextCursor });
+});
+
+/**
+ * GET /api/admin/payouts/summary
+ * Aggregate counts + amounts by status so the dashboard can show
+ * "12 ready for payout / $5,432 owed" without paging through everything.
+ */
+admin.get("/payouts/summary", async (c) => {
+  const supabase = createSupabaseAdmin();
+
+  const { data: rows, error } = await supabase
+    .from("seller_payouts")
+    .select("status, method, amount_cents, currency");
+
+  if (error) {
+    console.error("Error fetching payouts summary:", error);
+    return c.json({ error: "Failed to fetch summary" }, 500);
+  }
+
+  const summary: Record<string, { count: number; totals: Record<string, number> }> = {};
+  for (const row of rows || []) {
+    const status = row.status as string;
+    const currency = row.currency as string;
+    if (!summary[status]) summary[status] = { count: 0, totals: {} };
+    summary[status].count += 1;
+    summary[status].totals[currency] =
+      (summary[status].totals[currency] || 0) + (row.amount_cents as number);
+  }
+
+  return c.json({ summary });
+});
+
+const markSentSchema = z.object({
+  external_reference: z.string().min(1).max(200),
+});
+
+/**
+ * POST /api/admin/payouts/:id/mark-sent
+ * Admin manually disbursed this payout via Wise or PayPal — record the
+ * external transaction id and flip status. For Stripe payouts this
+ * endpoint refuses (those are automated via stripe.transfers.create).
+ */
+admin.post("/payouts/:id/mark-sent", async (c) => {
+  const payoutId = c.req.param("id");
+  const supabase = createSupabaseAdmin();
+
+  const body = await c.req.json();
+  const parsed = markSentSchema.safeParse(body);
+  if (!parsed.success) {
+    return c.json(
+      { error: "Validation failed", details: parsed.error.flatten().fieldErrors },
+      400
+    );
+  }
+
+  const { data: payout, error: fetchError } = await supabase
+    .from("seller_payouts")
+    .select("id, method, status")
+    .eq("id", payoutId)
+    .single();
+
+  if (fetchError || !payout) {
+    return c.json({ error: "Payout not found" }, 404);
+  }
+
+  if (payout.method === "stripe") {
+    return c.json(
+      { error: "Stripe payouts are sent automatically via Transfers API — do not mark manually." },
+      400
+    );
+  }
+
+  if (payout.status !== "ready_for_payout") {
+    return c.json(
+      { error: `Cannot mark sent — payout is in '${payout.status}' status.` },
+      400
+    );
+  }
+
+  const now = new Date().toISOString();
+  const { data: updated, error: updateError } = await supabase
+    .from("seller_payouts")
+    .update({
+      status: "paid",
+      external_reference: parsed.data.external_reference,
+      sent_at: now,
+      paid_at: now,
+    })
+    .eq("id", payoutId)
+    .eq("status", "ready_for_payout")
+    .select()
+    .single();
+
+  if (updateError) {
+    console.error("Error marking payout sent:", updateError);
+    return c.json({ error: "Failed to mark payout sent" }, 500);
+  }
+
+  return c.json({ payout: updated });
+});
+
+const markFailedSchema = z.object({
+  failure_reason: z.string().min(1).max(1000),
+});
+
+/**
+ * POST /api/admin/payouts/:id/mark-failed
+ * Admin couldn't disburse via Wise / PayPal (bank details wrong, account
+ * frozen, etc). Records the reason and flips status — the seller can be
+ * contacted to fix their details, then we retry by flipping back to
+ * ready_for_payout (not yet automated; do it manually for now).
+ */
+admin.post("/payouts/:id/mark-failed", async (c) => {
+  const payoutId = c.req.param("id");
+  const supabase = createSupabaseAdmin();
+
+  const body = await c.req.json();
+  const parsed = markFailedSchema.safeParse(body);
+  if (!parsed.success) {
+    return c.json(
+      { error: "Validation failed", details: parsed.error.flatten().fieldErrors },
+      400
+    );
+  }
+
+  const { data: payout, error: fetchError } = await supabase
+    .from("seller_payouts")
+    .select("id, status")
+    .eq("id", payoutId)
+    .single();
+
+  if (fetchError || !payout) {
+    return c.json({ error: "Payout not found" }, 404);
+  }
+
+  if (payout.status !== "ready_for_payout" && payout.status !== "pending") {
+    return c.json(
+      { error: `Cannot mark failed — payout is in '${payout.status}' status.` },
+      400
+    );
+  }
+
+  const { data: updated, error: updateError } = await supabase
+    .from("seller_payouts")
+    .update({
+      status: "failed",
+      failure_reason: parsed.data.failure_reason,
+    })
+    .eq("id", payoutId)
+    .select()
+    .single();
+
+  if (updateError) {
+    console.error("Error marking payout failed:", updateError);
+    return c.json({ error: "Failed to mark payout failed" }, 500);
+  }
+
+  return c.json({ payout: updated });
+});
+
+const retrySchema = z.object({});
+
+/**
+ * POST /api/admin/payouts/:id/retry
+ * Move a failed payout back to ready_for_payout so the admin can try
+ * disbursing again (e.g. after the seller fixed their Wise details).
+ */
+admin.post("/payouts/:id/retry", async (c) => {
+  const payoutId = c.req.param("id");
+  const supabase = createSupabaseAdmin();
+
+  // Body validation kept for shape consistency; no fields needed today.
+  await c.req.json().catch(() => ({}));
+  retrySchema.safeParse({});
+
+  const { data: payout, error: fetchError } = await supabase
+    .from("seller_payouts")
+    .select("id, method, status")
+    .eq("id", payoutId)
+    .single();
+
+  if (fetchError || !payout) {
+    return c.json({ error: "Payout not found" }, 404);
+  }
+
+  if (payout.status !== "failed") {
+    return c.json(
+      { error: `Cannot retry — payout is in '${payout.status}' status, not 'failed'.` },
+      400
+    );
+  }
+
+  // For Stripe, retrying = re-invoking the Transfers API. For Wise/PayPal,
+  // retrying just flips back to ready_for_payout for the admin to redo.
+  if (payout.method === "stripe") {
+    const { releasePayoutForOrder } = await import("../services/payoutService.js");
+    // First reset to pending so releasePayoutForOrder will act on it.
+    const { error: resetError } = await supabase
+      .from("seller_payouts")
+      .update({ status: "pending", failure_reason: null })
+      .eq("id", payoutId)
+      .eq("status", "failed");
+    if (resetError) {
+      console.error("Error resetting failed stripe payout:", resetError);
+      return c.json({ error: "Failed to reset payout" }, 500);
+    }
+    const { data: rowForOrder } = await supabase
+      .from("seller_payouts")
+      .select("order_id")
+      .eq("id", payoutId)
+      .single();
+    if (rowForOrder?.order_id) {
+      await releasePayoutForOrder(rowForOrder.order_id as string);
+    }
+    const { data: refreshed } = await supabase
+      .from("seller_payouts")
+      .select("*")
+      .eq("id", payoutId)
+      .single();
+    return c.json({ payout: refreshed });
+  }
+
+  const { data: updated, error: updateError } = await supabase
+    .from("seller_payouts")
+    .update({ status: "ready_for_payout", failure_reason: null })
+    .eq("id", payoutId)
+    .eq("status", "failed")
+    .select()
+    .single();
+
+  if (updateError) {
+    console.error("Error retrying payout:", updateError);
+    return c.json({ error: "Failed to retry payout" }, 500);
+  }
+
+  return c.json({ payout: updated });
 });
 
 export default admin;

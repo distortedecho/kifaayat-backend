@@ -182,16 +182,43 @@ export async function approveListing(
 ): Promise<ApproveListingResult> {
   const supabase = createSupabaseAdmin();
 
-  const { data: listing, error: fetchError } = await supabase
+  // PostgREST's inferred type for big embedded selects collapses to a
+  // bag-of-strings, so we narrow manually after the .single() call.
+  type ListingRow = {
+    status: string;
+    title: string;
+    profiles: {
+      id: string;
+      clerk_id: string;
+      display_name: string;
+      avatar_url: string;
+      payout_method: string | null;
+      stripe_account_id: string | null;
+      stripe_onboarding_complete: boolean | null;
+      wise_account_holder: string | null;
+      wise_bank_country: string | null;
+      wise_bank_currency: string | null;
+      wise_routing_code: string | null;
+      wise_account_number: string | null;
+      paypal_email: string | null;
+    };
+  };
+
+  const { data: listingRaw, error: fetchError } = await supabase
     .from("listings")
     .select(
-      "*, profiles!listings_seller_id_fkey(id, clerk_id, display_name, avatar_url, stripe_account_id, stripe_onboarding_complete)"
+      "*, profiles!listings_seller_id_fkey(id, clerk_id, display_name, avatar_url, " +
+        "payout_method, stripe_account_id, stripe_onboarding_complete, " +
+        "wise_account_holder, wise_bank_country, wise_bank_currency, " +
+        "wise_routing_code, wise_account_number, paypal_email)"
     )
     .eq("id", listingId)
     .single();
-  if (fetchError || !listing) {
+  if (fetchError || !listingRaw) {
     throw new AdminServiceError("Listing not found", 404);
   }
+  const listing = listingRaw as unknown as ListingRow;
+
   if (listing.status !== "pending_review") {
     throw new AdminServiceError(
       `Cannot approve listing with status '${listing.status}'`,
@@ -199,17 +226,14 @@ export async function approveListing(
     );
   }
 
-  const seller = listing.profiles as {
-    id: string;
-    clerk_id: string;
-    display_name: string;
-    avatar_url: string;
-    stripe_account_id: string | null;
-    stripe_onboarding_complete: boolean;
-  } | null;
-  if (!seller?.stripe_onboarding_complete) {
+  const seller = listing.profiles;
+
+  // Any usable payout method qualifies — Stripe Connect, Wise, or PayPal.
+  // See services/payoutService.ts for what "usable" means per method.
+  const { resolveSellerPayoutMethod } = await import("./payoutService.js");
+  if (!resolveSellerPayoutMethod(seller)) {
     throw new AdminServiceError(
-      "Cannot approve: seller has not completed Stripe onboarding",
+      "Cannot approve: seller has not set up a payout method (Stripe / Wise / PayPal)",
       400
     );
   }

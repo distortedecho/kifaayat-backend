@@ -23,6 +23,10 @@ import {
 import { isFirstCompletedOrder, awardReferralCredits } from "../lib/referrals.js";
 import { createOrder, OrderServiceError } from "../services/orderService.js";
 import { getStripe } from "../lib/stripeClient.js";
+import {
+  releasePayoutForOrder,
+  cancelPayoutForOrder,
+} from "../services/payoutService.js";
 
 const orders = new Hono();
 
@@ -800,6 +804,15 @@ orders.post("/:id/confirm-received", clerkMiddleware, requireProfile, async (c) 
     return c.json({ error: "Failed to confirm receipt" }, 500);
   }
 
+  // Release escrow funds to the seller. Stripe Connect sellers get an
+  // automatic transfer; Wise/PayPal sellers flip to ready_for_payout
+  // for the admin to disburse manually. Fire-and-forget — disbursement
+  // failures land in the payout row (status='failed'), they don't
+  // unwind the order completion.
+  releasePayoutForOrder(orderId).catch((err) =>
+    console.error("Failed to release payout on confirm-received:", err)
+  );
+
   const listing = order.listings as Record<string, unknown>;
 
   // If we skipped the explicit delivered transition, still fire the
@@ -921,6 +934,11 @@ orders.patch("/:id/complete", clerkMiddleware, requireProfile, async (c) => {
     console.error("Error completing order:", updateError);
     return c.json({ error: "Failed to complete order" }, 500);
   }
+
+  // Release escrow funds — same dispatch as confirm-received.
+  releasePayoutForOrder(orderId).catch((err) =>
+    console.error("Failed to release payout on complete:", err)
+  );
 
   // Notify both parties
   const listing = order.listings as Record<string, unknown>;
@@ -1107,12 +1125,19 @@ orders.post("/:id/reject", clerkMiddleware, requireProfile, async (c) => {
     return c.json({ error: "Failed to reject order" }, 500);
   }
 
-  // Attempt Stripe refund (fire-and-forget)
+  // Attempt Stripe refund (fire-and-forget). With escrow this is a clean
+  // refund from Kifaayat's balance — no clawback from a seller's Connect
+  // account, no negative-balance risk on their side.
   if (order.stripe_payment_intent_id) {
     getStripe().refunds.create({ payment_intent: order.stripe_payment_intent_id }).catch(
       (err) => console.error(`Stripe refund failed for order ${orderId}:`, err)
     );
   }
+
+  // Tombstone the payout ledger row so it doesn't sit pending forever.
+  cancelPayoutForOrder(orderId, reason || "Order rejected by seller").catch(
+    (err) => console.error(`Failed to cancel payout for order ${orderId}:`, err)
+  );
 
   // Notify buyer
   if (order.buyer_id) {
@@ -1185,6 +1210,13 @@ orders.post("/cron/auto-complete", async (c) => {
     }
 
     completedCount++;
+
+    // Release escrow funds for this auto-completed order. Fire-and-forget
+    // so a single Stripe transfer failure doesn't block the rest of the
+    // overdue batch from completing.
+    releasePayoutForOrder(order.id).catch((err) =>
+      console.error(`Failed to release payout on auto-complete for order ${order.id}:`, err)
+    );
 
     const listingRaw = order.listings as unknown;
     const listing = Array.isArray(listingRaw) ? listingRaw[0] as Record<string, unknown> | undefined : listingRaw as Record<string, unknown> | null;
