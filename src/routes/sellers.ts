@@ -171,7 +171,7 @@ sellers.get("/:id/wishlist", optionalClerkMiddleware, async (c) => {
   const { data: wishlistRows } = await supabase
     .from("wishlists")
     .select(
-      "listing_id, created_at, listings!wishlists_listing_id_fkey(id, title, price_amount, price_currency, original_price_amount, category, condition, estimated_size, size_type, designer_name, seller_id, listing_photos(url, position), profiles!listings_seller_id_fkey(display_name, location))"
+      "listing_id, created_at, listings!wishlists_listing_id_fkey(id, title, price_amount, price_currency, original_price_amount, category, condition, estimated_size, size_type, designer_name, seller_id, listing_photos(url, position, photo_type), profiles!listings_seller_id_fkey(display_name, location))"
     )
     .eq("user_id", sellerId)
     .order("created_at", { ascending: false })
@@ -180,10 +180,15 @@ sellers.get("/:id/wishlist", optionalClerkMiddleware, async (c) => {
   const items = (wishlistRows || [])
     .filter((row) => row.listings != null)
     .map((row) => {
-      const l = row.listings as Record<string, unknown>;
+      const l = row.listings as unknown as Record<string, unknown>;
       const photos = l.listing_photos as Array<Record<string, unknown>> | null;
-      const cover = photos?.find((p) => p.position === 0) || photos?.[0];
-      const sellerProf = l.profiles as Record<string, unknown> | null;
+      // Cover must be a 'product' photo only — brand_tag / receipt photos
+      // are seller-side authenticity proofs, not gallery images.
+      const productPhotos =
+        photos?.filter((p) => (p.photo_type ?? "product") === "product") ?? [];
+      const cover =
+        productPhotos.find((p) => p.position === 0) || productPhotos[0];
+      const sellerProf = l.profiles as unknown as Record<string, unknown> | null;
 
       return {
         id: l.id as string,
@@ -297,16 +302,25 @@ sellers.get("/:id", optionalClerkMiddleware, async (c) => {
   let coverPhotos: Record<string, string> = {};
 
   if (listingIds.length > 0) {
+    // Pull product photos only — brand_tag / receipt photos are
+    // seller-side authenticity proofs and must never appear as a public
+    // cover image. Order by position so we pick the lowest-numbered
+    // product photo per listing (typically position 0, but fall back
+    // gracefully if a listing has no product at position 0 specifically).
     const { data: photos } = await supabase
       .from("listing_photos")
-      .select("listing_id, url")
+      .select("listing_id, url, position")
       .in("listing_id", listingIds)
-      .eq("position", 0);
+      .eq("photo_type", "product")
+      .order("position", { ascending: true });
 
     if (photos) {
-      coverPhotos = Object.fromEntries(
-        photos.map((p) => [p.listing_id, p.url])
-      );
+      // Keep the first (lowest-position) product photo per listing.
+      for (const p of photos) {
+        if (!(p.listing_id in coverPhotos)) {
+          coverPhotos[p.listing_id as string] = p.url as string;
+        }
+      }
     }
   }
 

@@ -19,9 +19,39 @@ build/
 # Debug
 npm-debug.log*
 
+# Client-provided reference docs (not for the repo)
 Kifaayat_3.0_Schema_Migration.docx
 Kifaayat_3.0_tables.pdf
 Kifaayat_3.pdf
 Kifaayat_3.0_tables.txt
 Kifaayat_3.txt
 Kifayat.csv
+
+# Migration / Sharetribe source data (large, contains real or synthetic user data)
+rawdata_synthetic.json
+rawdata_synthetic_new.json
+designer_full_export.csv
+designer_full_export.json
+
+# Database dumps (real prod data, never commit)
+/main_data.sql
+/old_db_dump.sql
+*.sql.bak
+*.sql.dump
+
+# Photo samples / bundles (binary, large)
+sample-da/
+photo-bundle/
+bundle-report.json
+
+# Screenshots / scratch images in repo root
+/*.png
+/*.jpg
+/*.jpeg
+/*.heic
+/*.webp
+
+# Editor / tooling
+.vscode/
+.idea/
+*.swp

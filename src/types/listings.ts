@@ -13,11 +13,21 @@
 //   Kidswear     = kids
 //   Footwear     = footwear
 //   Other        = other
+// Categories the app supports as filter values, listing-create options,
+// and feed sections. Real Sharetribe categories only — Anarkali / Sharara
+// / Dupatta were AI hallucinations the client flagged and we dropped.
+// `Jewellery` covers the Sharetribe jewellery sub-categories (necklace,
+// earrings, bangles, etc., ~576 migrated listings).
+//
+// The DB `listings_category_check` constraint (schema-09.sql) still
+// permits the dropped 3 values for backwards-compat — harmless, just
+// never used by importer or new listings.
 export const LISTING_CATEGORIES = [
   "Lehenga",
   "Saree",
   "Suit/Salwar",
   "Indowestern",
+  "Jewellery",
   "Blouse",
   "Menswear",
   "Kidswear",
@@ -296,6 +306,9 @@ export const CATEGORY_SIZE_TYPE: Record<ListingCategory, SizeType | null> = {
   Menswear: "menswear_kidswear",
   Kidswear: "menswear_kidswear",
   Footwear: "footwear",
+  // Jewellery has no sizing — necklaces / earrings / bangles don't follow
+  // clothing-size conventions.
+  Jewellery: null,
   Other: "womens",
 };
 
@@ -358,6 +371,9 @@ export const LISTING_CATEGORY_CONFIG: Record<ListingCategory, CategoryFieldConfi
   Menswear:      { size_type: "menswear_kidswear", shows_items_included: true,  shows_fabric: true,  shows_dry_cleaning: true,  shows_measurements: true,  shows_alteration: true,  required_fields: WITH_SIZE },
   Kidswear:      { size_type: "menswear_kidswear", shows_items_included: false, shows_fabric: true,  shows_dry_cleaning: true,  shows_measurements: true,  shows_alteration: true,  required_fields: WITH_SIZE },
   Footwear:      { size_type: "footwear",          shows_items_included: false, shows_fabric: false, shows_dry_cleaning: false, shows_measurements: false, shows_alteration: false, required_fields: WITH_SIZE },
+  // Jewellery is sizeless — no estimated_size required; no fabric / dry-cleaning
+  // / measurements / alteration apply to jewellery items.
+  Jewellery:     { size_type: null,                shows_items_included: false, shows_fabric: false, shows_dry_cleaning: false, shows_measurements: false, shows_alteration: false, required_fields: [...UNIVERSAL_REQUIRED] },
   Other:         { size_type: "womens",            shows_items_included: false, shows_fabric: false, shows_dry_cleaning: false, shows_measurements: false, shows_alteration: false, required_fields: WITH_SIZE },
 };
 
@@ -392,6 +408,7 @@ export const REQUIRED_MEASUREMENTS: Record<
   Menswear: ["chest", "waist", "length", "sleeve_length"],
   Kidswear: ["chest", "length", "age_range"],
   Footwear: [],
+  Jewellery: [],
   Other: [],
 };
 

@@ -230,7 +230,7 @@ stripeRoutes.post("/payment-intent", optionalClerkMiddleware, async (c) => {
   // Validate listing exists and is purchasable
   const { data: listing, error: listingError } = await supabase
     .from("listings")
-    .select("id, title, seller_id, price_amount, price_currency, status, negotiable, shipping_cost_amount, free_shipping")
+    .select("id, title, seller_id, price_amount, price_currency, status, negotiable, shipping_cost_amount, international_shipping_cost_amount, free_shipping")
     .eq("id", listing_id)
     .single();
 
@@ -317,7 +317,37 @@ stripeRoutes.post("/payment-intent", optionalClerkMiddleware, async (c) => {
   // Item amount = either offer amount or listing price (negotiated price excludes shipping).
   // Shipping is added on top, charged to the buyer, and passes through to the seller.
   const itemAmount = paymentAmount; // already in cents
-  const shippingAmount = (listing.free_shipping ? 0 : (listing.shipping_cost_amount as number | null) ?? 0);
+
+  // Pick the right shipping cost based on buyer-vs-seller country.
+  // When both countries are known AND differ AND the seller has set
+  // a separate international cost, use that. Otherwise fall back to
+  // the regular shipping_cost_amount.
+  //
+  // Guest buyers / unknown countries → assumed domestic (safer default
+  // for the buyer; seller absorbs any short-fall on the rare guest
+  // international order).
+  // sellerProfile was loaded with SELLER_PAYOUT_PROFILE_FIELDS which doesn't
+  // include `location`, so pull it in a single extra round-trip alongside
+  // the buyer's. Could be optimised by adding location to the earlier
+  // select, but keeping the change isolated for now.
+  const [{ data: buyerRow }, { data: sellerRow }] = await Promise.all([
+    buyerProfileId
+      ? supabase.from("profiles").select("location").eq("id", buyerProfileId).single()
+      : Promise.resolve({ data: null as { location: string | null } | null }),
+    supabase.from("profiles").select("location").eq("id", listing.seller_id).single(),
+  ]);
+  const buyerCountry = (buyerRow?.location as string | null) ?? null;
+  const sellerCountry = (sellerRow?.location as string | null) ?? null;
+
+  const isInternationalSale =
+    !!buyerCountry && !!sellerCountry && buyerCountry !== sellerCountry;
+  const intlCost = listing.international_shipping_cost_amount as number | null;
+  const domesticCost = (listing.shipping_cost_amount as number | null) ?? 0;
+  const shippingAmount = listing.free_shipping
+    ? 0
+    : isInternationalSale && intlCost != null
+    ? intlCost
+    : domesticCost;
 
   // Commission is computed on the ITEM only — shipping is not Kifaayat's revenue,
   // it's a passthrough so the seller can pay for postage.

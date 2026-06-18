@@ -1,0 +1,13 @@
+{
+  "name": "kifaayat-bundle-verifier",
+  "version": "1.0.0",
+  "description": "Pure local scan of a photo bundle. No internet, no uploads.",
+  "type": "module",
+  "scripts": {
+    "verify": "node verify-bundle.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "private": true
+}

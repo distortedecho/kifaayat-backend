@@ -34,30 +34,45 @@ async function fetchFollowCounts(
 }
 
 /**
- * Lookup a Clerk user's primary email via the Clerk backend SDK.
- * Returns lower-cased + trimmed for case-insensitive matching.
- * Returns null if the user has no verified primary email (very rare).
+ * Lookup a Clerk user's primary email + verified phone (if any) via
+ * the Clerk backend SDK. Email is lower-cased + trimmed for
+ * case-insensitive matching. Phone is returned in its raw E.164 form
+ * (e.g. `+61412345678`). Either or both may be null depending on
+ * which verification methods the user completed during signup.
  */
-async function fetchClerkPrimaryEmail(clerkUserId: string): Promise<string | null> {
+async function fetchClerkContactInfo(
+  clerkUserId: string
+): Promise<{ email: string | null; phone: string | null }> {
   try {
     const { createClerkClient } = await import("@clerk/backend");
     const clerk = createClerkClient({
       secretKey: process.env.CLERK_SECRET_KEY || "",
     });
     const user = await clerk.users.getUser(clerkUserId);
-    // primaryEmailAddressId points at the active email; resolve it.
-    const primary = user.emailAddresses.find(
+
+    const primaryEmail = user.emailAddresses.find(
       (e) => e.id === user.primaryEmailAddressId
     );
-    const email = (primary?.emailAddress || user.emailAddresses[0]?.emailAddress || "")
+    const email = (primaryEmail?.emailAddress || user.emailAddresses[0]?.emailAddress || "")
       .toLowerCase()
-      .trim();
-    return email || null;
+      .trim() || null;
+
+    // Phone is optional — only present if the user added + verified one.
+    // primaryPhoneNumberId points at the active phone; resolve to E.164.
+    const primaryPhone = user.phoneNumbers?.find(
+      (p) => p.id === user.primaryPhoneNumberId
+    );
+    const phone =
+      (primaryPhone?.phoneNumber || user.phoneNumbers?.[0]?.phoneNumber || "").trim() ||
+      null;
+
+    return { email, phone };
   } catch (err) {
-    console.error("Error fetching Clerk user email:", err);
-    return null;
+    console.error("Error fetching Clerk user contact info:", err);
+    return { email: null, phone: null };
   }
 }
+
 
 /**
  * Sharetribe-migration claim flow.
@@ -80,7 +95,7 @@ async function tryClaimLegacyProfile(
   supabase: ReturnType<typeof createSupabaseAdmin>,
   clerkUserId: string
 ): Promise<Record<string, unknown> | null> {
-  const email = await fetchClerkPrimaryEmail(clerkUserId);
+  const { email, phone: clerkPhone } = await fetchClerkContactInfo(clerkUserId);
   if (!email) return null;
 
   // Find a pre-migrated profile (clerk_id null, email matches, legacy id set).
@@ -96,11 +111,21 @@ async function tryClaimLegacyProfile(
 
   if (lookupError || !legacy) return null;
 
+  // Backfill phone from Clerk if the migrated profile didn't have one
+  // (a lot of Sharetribe users left phone blank). If they did have a
+  // phone from Sharetribe, keep it — that's the one they explicitly
+  // provided on the old app; Clerk's might differ for legitimate
+  // reasons (different number, partner's account, etc.).
+  const updatePayload: Record<string, unknown> = { clerk_id: clerkUserId };
+  if (!legacy.phone && clerkPhone) {
+    updatePayload.phone = clerkPhone;
+  }
+
   // Claim it — guarded by `clerk_id IS NULL` so a concurrent claim can't
   // double-stamp the same row.
   const { data: claimed, error: updateError } = await supabase
     .from("profiles")
-    .update({ clerk_id: clerkUserId })
+    .update(updatePayload)
     .eq("id", legacy.id)
     .is("clerk_id", null)
     .select()
@@ -175,6 +200,11 @@ const updateProfileSchema = z.object({
   onesignal_player_id: z.string().optional(),
   user_intents: z.array(z.enum(["buy", "sell"])).optional(),
   wishlist_public: z.boolean().optional(),
+  // Toggles AI-powered listing help (description/category suggestions,
+  // background removal etc.). Default TRUE; gating happens on the FE
+  // (hides AI assist buttons when off) — backend AI endpoints aren't
+  // server-side gated.
+  ai_assist_enabled: z.boolean().optional(),
   // payout_method is no longer settable via the generic /me PUT — it now
   // has its own endpoint that takes method-specific details (PUT /me/payout-method).
   bio: z.string().max(500).nullish(),
@@ -226,9 +256,19 @@ profiles.get("/me", clerkMiddleware, async (c) => {
   }
 
   // No legacy match either — create a fresh profile.
+  // If Clerk has a verified primary phone/email (e.g. the new app's
+  // phone-OTP signup flow), pre-fill them so the onboarding screen
+  // can display them as defaults.
+  const { email: clerkEmail, phone: clerkPhone } = await fetchClerkContactInfo(
+    clerkUserId
+  );
+  const freshInsert: Record<string, unknown> = { clerk_id: clerkUserId };
+  if (clerkEmail) freshInsert.email = clerkEmail;
+  if (clerkPhone) freshInsert.phone = clerkPhone;
+
   const { data: newProfile, error: insertError } = await supabase
     .from("profiles")
-    .insert({ clerk_id: clerkUserId })
+    .insert(freshInsert)
     .select()
     .single();
 

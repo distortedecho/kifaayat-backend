@@ -91,6 +91,9 @@ const createListingSchema = z.object({
   pickup_available: z.boolean().optional(),
   pickup_location: z.string().max(500).optional(),
   international_shipping: z.boolean().optional(),
+  // Optional separate price for international orders. If null/omitted,
+  // shipping_cost_amount is used regardless of buyer country.
+  international_shipping_cost_amount: z.number().int().nonnegative().nullable().optional(),
 
   // Video
   video_url: z.string().url().optional(),
@@ -148,6 +151,7 @@ const updateListingSchema = z.object({
   pickup_available: z.boolean().optional(),
   pickup_location: z.string().max(500).nullable().optional(),
   international_shipping: z.boolean().optional(),
+  international_shipping_cost_amount: z.number().int().nonnegative().nullable().optional(),
 
   // Video
   video_url: z.string().url().nullable().optional(),
@@ -433,6 +437,7 @@ listings.post("/", clerkMiddleware, requireProfile, async (c) => {
       pickup_available: input.pickup_available || false,
       pickup_location: input.pickup_location || null,
       international_shipping: input.international_shipping || false,
+      international_shipping_cost_amount: input.international_shipping_cost_amount ?? null,
 
       // Video
       video_url: input.video_url || null,
@@ -671,6 +676,9 @@ listings.put("/:id", clerkMiddleware, requireProfile, async (c) => {
   if (input.pickup_available !== undefined) updateData.pickup_available = input.pickup_available;
   if (input.pickup_location !== undefined) updateData.pickup_location = input.pickup_location;
   if (input.international_shipping !== undefined) updateData.international_shipping = input.international_shipping;
+  if (input.international_shipping_cost_amount !== undefined) {
+    updateData.international_shipping_cost_amount = input.international_shipping_cost_amount;
+  }
 
   // Video
   if (input.video_url !== undefined) updateData.video_url = input.video_url;
