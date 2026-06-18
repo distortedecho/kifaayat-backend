@@ -3,6 +3,7 @@ import { z } from "zod";
 import crypto from "node:crypto";
 import { clerkMiddleware, optionalClerkMiddleware } from "../middleware/clerk.js";
 import { createSupabaseAdmin } from "../lib/supabase.js";
+import { createNotification, welcomeBackNotification } from "../lib/notifications.js";
 
 const profiles = new Hono();
 
@@ -30,6 +31,113 @@ async function fetchFollowCounts(
     follower_count: followerCount || 0,
     following_count: followingCount || 0,
   };
+}
+
+/**
+ * Lookup a Clerk user's primary email via the Clerk backend SDK.
+ * Returns lower-cased + trimmed for case-insensitive matching.
+ * Returns null if the user has no verified primary email (very rare).
+ */
+async function fetchClerkPrimaryEmail(clerkUserId: string): Promise<string | null> {
+  try {
+    const { createClerkClient } = await import("@clerk/backend");
+    const clerk = createClerkClient({
+      secretKey: process.env.CLERK_SECRET_KEY || "",
+    });
+    const user = await clerk.users.getUser(clerkUserId);
+    // primaryEmailAddressId points at the active email; resolve it.
+    const primary = user.emailAddresses.find(
+      (e) => e.id === user.primaryEmailAddressId
+    );
+    const email = (primary?.emailAddress || user.emailAddresses[0]?.emailAddress || "")
+      .toLowerCase()
+      .trim();
+    return email || null;
+  } catch (err) {
+    console.error("Error fetching Clerk user email:", err);
+    return null;
+  }
+}
+
+/**
+ * Sharetribe-migration claim flow.
+ *
+ * When a returning user signs up via Clerk with the same email they
+ * used on the old app, the importer's already left a profile row
+ * waiting for them (clerk_id NULL, email set, all their listings/
+ * wishlists/reviews already attached). Stamp the Clerk ID onto that
+ * row and return it as the canonical profile.
+ *
+ * Race-safe: the UPDATE uses `clerk_id IS NULL` as a guard so two
+ * simultaneous claim attempts can't both win. The losing call falls
+ * through to the normal "fresh profile" path and we end up with a
+ * harmless second profile — the original Sharetribe data is still on
+ * the winner.
+ *
+ * Returns the claimed profile row, or null if no match was found.
+ */
+async function tryClaimLegacyProfile(
+  supabase: ReturnType<typeof createSupabaseAdmin>,
+  clerkUserId: string
+): Promise<Record<string, unknown> | null> {
+  const email = await fetchClerkPrimaryEmail(clerkUserId);
+  if (!email) return null;
+
+  // Find a pre-migrated profile (clerk_id null, email matches, legacy id set).
+  // The unique partial index on LOWER(email) WHERE email IS NOT NULL
+  // guarantees there's at most one candidate.
+  const { data: legacy, error: lookupError } = await supabase
+    .from("profiles")
+    .select("*")
+    .ilike("email", email)
+    .is("clerk_id", null)
+    .not("legacy_sharetribe_id", "is", null)
+    .maybeSingle();
+
+  if (lookupError || !legacy) return null;
+
+  // Claim it — guarded by `clerk_id IS NULL` so a concurrent claim can't
+  // double-stamp the same row.
+  const { data: claimed, error: updateError } = await supabase
+    .from("profiles")
+    .update({ clerk_id: clerkUserId })
+    .eq("id", legacy.id)
+    .is("clerk_id", null)
+    .select()
+    .single();
+
+  if (updateError || !claimed) {
+    // Race lost (or DB error) — return null so caller falls through
+    // to the normal create-fresh path.
+    return null;
+  }
+
+  console.log(
+    `[profiles] legacy claim: clerk=${clerkUserId} → profile=${claimed.id} ` +
+      `(legacy_sharetribe_id=${claimed.legacy_sharetribe_id})`
+  );
+
+  // Drop a single welcome-back notification into their inbox so they
+  // land with something rather than an empty notifications screen.
+  // Fire-and-forget — a notification failure must NOT block the claim.
+  // Best-effort first-name extraction from display_name; OK if null.
+  const displayName = (claimed.display_name as string | null) || null;
+  const firstName = displayName ? displayName.split(/\s+/)[0] : null;
+  const template = welcomeBackNotification(firstName);
+  createNotification({
+    user_id: claimed.id as string,
+    type: "welcome_back",
+    title: template.title,
+    body: template.body,
+    data: {
+      role: "buyer",
+      legacy_sharetribe_id: claimed.legacy_sharetribe_id as string,
+    },
+  }).catch((err) =>
+    console.error("Failed to create welcome_back notification:", err)
+  );
+
+  return claimed;
 }
 
 // Zod schema for profile updates
@@ -70,6 +178,9 @@ const updateProfileSchema = z.object({
   // payout_method is no longer settable via the generic /me PUT — it now
   // has its own endpoint that takes method-specific details (PUT /me/payout-method).
   bio: z.string().max(500).nullish(),
+  // Optional contact phone. Loose validation — accept E.164, local, or anything
+  // up to 32 chars. Frontend can do per-country format hints if needed.
+  phone: z.string().max(32).nullish(),
 });
 
 /**
@@ -98,7 +209,23 @@ profiles.get("/me", clerkMiddleware, async (c) => {
     return c.json({ profile: { ...profile, ...counts } });
   }
 
-  // Profile doesn't exist — create one
+  // No profile by clerk_id. Before creating a fresh one, check the
+  // Sharetribe-migration lookup: is there a pre-migrated profile with
+  // this user's email and no clerk_id yet? If so, claim it.
+  //
+  // This is the second half of the email-match-on-Clerk-signup flow.
+  // When a returning user signs up via Clerk with the same email they
+  // had on the old Sharetribe app, their listings/wishlist/reviews etc
+  // are already sitting in the DB attached to a profile row that's
+  // waiting to be claimed. We stamp the Clerk ID onto that row instead
+  // of creating a duplicate.
+  const claimed = await tryClaimLegacyProfile(supabase, clerkUserId);
+  if (claimed) {
+    const counts = await fetchFollowCounts(supabase, claimed.id as string);
+    return c.json({ profile: { ...claimed, ...counts } });
+  }
+
+  // No legacy match either — create a fresh profile.
   const { data: newProfile, error: insertError } = await supabase
     .from("profiles")
     .insert({ clerk_id: clerkUserId })

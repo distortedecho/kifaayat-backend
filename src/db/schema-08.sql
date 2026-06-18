@@ -38,6 +38,10 @@ ALTER TABLE profiles ADD COLUMN IF NOT EXISTS wise_account_type TEXT
 -- PayPal — admin disburses via PayPal Payouts using this email.
 ALTER TABLE profiles ADD COLUMN IF NOT EXISTS paypal_email TEXT;
 
+-- Optional contact phone — kept as TEXT (leading zeros, country codes).
+-- No format validation in the DB; validate at the application layer if needed.
+ALTER TABLE profiles ADD COLUMN IF NOT EXISTS phone TEXT;
+
 
 -- -------------------------
 -- seller_payouts — disbursement ledger

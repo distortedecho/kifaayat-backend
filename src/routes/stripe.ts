@@ -546,6 +546,28 @@ stripeRoutes.get("/account-status", clerkMiddleware, requireProfile, async (c) =
 
     return c.json(response);
   } catch (error) {
+    // `account_invalid` means the stored stripe_account_id doesn't belong
+    // to our Stripe platform account. Happens for:
+    //   1. Migrated Sharetribe users in dev/staging (synthetic acct_XXX
+    //      values that don't exist on our test platform)
+    //   2. Edge case at real cutover where a seller's old account was
+    //      moved off the platform between Sharetribe and our cutover
+    // In both cases, treat it as "not connected" so the UI prompts them
+    // to set up payouts fresh instead of erroring out the whole page.
+    const stripeErr = error as { code?: string; statusCode?: number };
+    if (stripeErr?.code === "account_invalid" || stripeErr?.statusCode === 403) {
+      console.warn(
+        `Stripe account_invalid for profile ${profile.id}, stripe_account_id=${profile.stripe_account_id} — treating as not_connected`
+      );
+      return c.json({
+        status: "not_connected" as const,
+        account_id: null,
+        charges_enabled: false,
+        payouts_enabled: false,
+        payout_method: payoutMethod,
+        payout_ready: resolvedMethod !== null,
+      });
+    }
     console.error("Error retrieving Stripe account:", error);
     return c.json({ error: "Failed to fetch account status" }, 500);
   }

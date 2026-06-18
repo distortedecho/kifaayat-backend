@@ -61,6 +61,7 @@ export const NOTIFICATION_TYPES = [
   "followed_seller_new_listing",
   "listing_comment",
   "comment_reply",
+  "welcome_back",
 ] as const;
 export type NotificationType = (typeof NOTIFICATION_TYPES)[number];
 

@@ -6,7 +6,10 @@
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "start": "tsx src/index.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "typecheck:scripts": "tsc -p tsconfig.scripts.json",
+    "migrate:sharetribe": "tsx scripts/migrate-sharetribe.ts",
+    "migrate:photos": "tsx scripts/migrate-photos.ts"
   },
   "dependencies": {
     "@clerk/backend": "^1.21.0",

@@ -594,6 +594,24 @@ export function followedSellerNewListingNotification(
   };
 }
 
+/**
+ * Fired once when a returning Sharetribe user signs up via Clerk on
+ * the new app and we successfully claim their pre-migrated profile.
+ * Lets them land with a single welcome-back notification rather than
+ * an empty inbox.
+ */
+export function welcomeBackNotification(
+  firstName: string | null
+): NotificationTemplate {
+  const greeting = firstName ? `Welcome back, ${firstName}!` : "Welcome back!";
+  return {
+    title: greeting,
+    body:
+      "Your listings, wishlist, and reviews from the old app are all here. " +
+      "Pick up right where you left off.",
+  };
+}
+
 export function orderAcceptedNotification(
   listingTitle: string
 ): NotificationTemplate {

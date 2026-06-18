@@ -527,6 +527,7 @@ listings.get("/:id", optionalClerkMiddleware, async (c) => {
 
   const result = {
     ...listing,
+    measurements: normaliseMeasurements(listing.measurements),
     photos,
     brand_tag_photo,
     receipt_photo,
@@ -537,6 +538,33 @@ listings.get("/:id", optionalClerkMiddleware, async (c) => {
 
   return c.json({ listing: result });
 });
+
+/**
+ * Coerce all measurement values to strings so the mobile app's
+ * MeasurementBox (which calls .trim() on each value) doesn't crash
+ * on legacy data with numeric values, nor on any other unexpected
+ * shape that might sneak through over time.
+ *
+ * Migrated/legacy listings can have:
+ *   - numeric values (e.g. {bust: 38, length: 40})
+ *   - nested objects/arrays (extremely rare but possible)
+ *   - boolean/null values
+ *
+ * Output is always Record<string, string> with empty values stripped.
+ */
+function normaliseMeasurements(input: unknown): Record<string, string> {
+  if (input === null || input === undefined) return {};
+  if (typeof input !== "object" || Array.isArray(input)) return {};
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(input as Record<string, unknown>)) {
+    if (v === null || v === undefined) continue;
+    if (typeof v === "object") continue; // skip nested objects/arrays
+    const s = String(v).trim();
+    if (s.length === 0) continue;
+    out[k] = s;
+  }
+  return out;
+}
 
 /**
  * PUT /api/listings/:id
