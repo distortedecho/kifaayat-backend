@@ -10,7 +10,7 @@ import profiles from "./routes/profiles.js";
 import feed from "./routes/feed.js";
 import search from "./routes/search.js";
 import wishlists from "./routes/wishlists.js";
-import ai from "./routes/ai.js";
+import ai, { prewarmGemini } from "./routes/ai.js";
 import stripe from "./routes/stripe.js";
 import offers from "./routes/offers.js";
 import orders from "./routes/orders.js";
@@ -277,6 +277,11 @@ const server = serve({
     });
   }
 })();
+
+// Fire a throwaway Gemini call so the SDK + connection are warm
+// before the first real /api/ai/analyze request lands. Fully
+// non-blocking — failures are logged inside prewarmGemini.
+void prewarmGemini();
 
 // ----------------------------------------------------------
 // Graceful shutdown (Phase 2.10)

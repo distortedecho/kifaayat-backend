@@ -44,6 +44,10 @@ export interface AIAnalysisResponse {
   designer_name?: AIField<string | null>;
   fabric_types?: AIField<string[]>;
   work_types?: AIField<string[]>;
+
+  // sub_category null when Gemini was not sure or category has no
+  // sub-categories. Frontend treats null as "blank, seller picks".
+  sub_category?: AIField<string | null>;
 }
 
 /**

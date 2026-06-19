@@ -23,6 +23,7 @@ import {
   resolveSellerPayoutMethod,
   type SellerPayoutProfile,
 } from "../services/payoutService.js";
+import { profileLocationToStripeCountry } from "../services/stripeService.js";
 
 const stripeRoutes = new Hono();
 
@@ -50,6 +51,11 @@ const paymentIntentSchema = z.object({
   // (e.g. shipping requests). Frontend should treat this as one-shot —
   // there's no chat until the seller accepts the order.
   buyer_note: z.string().max(500).nullish(),
+  // Pickup orders skip the shipped/delivered status transitions and
+  // jump straight to complete on the buyer's mark-received call.
+  // Default 'shipping' preserves behaviour for callers that don't
+  // send the field yet.
+  delivery_method: z.enum(["shipping", "pickup"]).optional(),
 });
 
 const boostPaymentIntentSchema = z.object({
@@ -141,6 +147,7 @@ stripeRoutes.post("/boost-payment-intent", clerkMiddleware, requireProfile, asyn
     const paymentIntent = await getStripe().paymentIntents.create({
       amount: boostPriceCents,
       currency: "aud",
+      payment_method_types: ["card"],
       metadata: {
         checkout_type: "boost",
         listing_id,
@@ -202,6 +209,7 @@ stripeRoutes.post("/payment-intent", optionalClerkMiddleware, async (c) => {
   }
 
   const { listing_id, offer_id, referral_code, voucher_id, buyer_note } = parsed.data;
+  const delivery_method = parsed.data.delivery_method ?? "shipping";
   let buyer_email = parsed.data.buyer_email;
 
   // Resolve buyer identity
@@ -230,7 +238,7 @@ stripeRoutes.post("/payment-intent", optionalClerkMiddleware, async (c) => {
   // Validate listing exists and is purchasable
   const { data: listing, error: listingError } = await supabase
     .from("listings")
-    .select("id, title, seller_id, price_amount, price_currency, status, negotiable, shipping_cost_amount, international_shipping_cost_amount, free_shipping")
+    .select("id, title, seller_id, price_amount, price_currency, status, negotiable, shipping_cost_amount, international_shipping_cost_amount, free_shipping, pickup_available")
     .eq("id", listing_id)
     .single();
 
@@ -242,6 +250,17 @@ stripeRoutes.post("/payment-intent", optionalClerkMiddleware, async (c) => {
   if (listing.status !== "active" && listing.status !== "reserved") {
     return c.json(
       { error: `Listing is not available for purchase (status: ${listing.status})` },
+      400
+    );
+  }
+
+  // Pickup is only valid if the seller turned it on for the listing.
+  // Caller picking "pickup" on a shipping-only listing is a frontend
+  // bug — reject so we never write a pickup order against a listing
+  // that has no pickup_location.
+  if (delivery_method === "pickup" && !listing.pickup_available) {
+    return c.json(
+      { error: "This listing does not offer local pickup" },
       400
     );
   }
@@ -343,11 +362,15 @@ stripeRoutes.post("/payment-intent", optionalClerkMiddleware, async (c) => {
     !!buyerCountry && !!sellerCountry && buyerCountry !== sellerCountry;
   const intlCost = listing.international_shipping_cost_amount as number | null;
   const domesticCost = (listing.shipping_cost_amount as number | null) ?? 0;
-  const shippingAmount = listing.free_shipping
-    ? 0
-    : isInternationalSale && intlCost != null
-    ? intlCost
-    : domesticCost;
+  // Pickup orders never charge shipping — buyer collects in person.
+  const shippingAmount =
+    delivery_method === "pickup"
+      ? 0
+      : listing.free_shipping
+      ? 0
+      : isInternationalSale && intlCost != null
+      ? intlCost
+      : domesticCost;
 
   // Commission is computed on the ITEM only — shipping is not Kifaayat's revenue,
   // it's a passthrough so the seller can pay for postage.
@@ -359,10 +382,16 @@ stripeRoutes.post("/payment-intent", optionalClerkMiddleware, async (c) => {
   // never the seller's.
   const sellerPayout = itemAmount - commission + shippingAmount;
 
-  // Voucher discount — applied to item only, never shipping. No cap; on
-  // tier sellers with a commission below VOUCHER_DISCOUNT_RATE, Kifaayat
-  // absorbs the small loss as acquisition cost.
-  const voucherDiscount = voucher_id
+  // Buyer-side discount — applied to item only, never shipping. No cap;
+  // Kifaayat absorbs the 10% out of its commission as acquisition cost.
+  // Triggers on either:
+  //   - voucher_id  (a redeemable voucher the buyer already owns)
+  //   - referral_code (e.g. WELCOME10, or any other user's referral code)
+  // Both have already been validated above — if we reach here they're
+  // both real, so the only question is whether the buyer gets the 10%
+  // off. Seller payout is unchanged either way.
+  const hasBuyerDiscount = !!voucher_id || !!referral_code;
+  const voucherDiscount = hasBuyerDiscount
     ? Math.round(itemAmount * VOUCHER_DISCOUNT_RATE / 100)
     : 0;
 
@@ -371,9 +400,17 @@ stripeRoutes.post("/payment-intent", optionalClerkMiddleware, async (c) => {
 
   // Build PaymentIntent params — no transfer_data, no application_fee_amount.
   // Funds land fully in Kifaayat's balance; we move them on delivery.
+  //
+  // payment_method_types is pinned to "card" so PaymentSheet doesn't
+  // surface redirect-based methods (Klarna, Zip, Afterpay, Link). Those
+  // were getting auto-enabled from the Stripe dashboard defaults and
+  // sending buyers off-app to a hosted page with no return_url wired
+  // up, leaving the checkout screen stuck on the loading state while
+  // the charge actually completed in the background.
   const intentParams: Stripe.PaymentIntentCreateParams = {
     amount: chargeAmount,
     currency: listing.price_currency.toLowerCase(),
+    payment_method_types: ["card"],
     metadata: {
       listing_id,
       buyer_email: buyer_email || "",
@@ -382,6 +419,10 @@ stripeRoutes.post("/payment-intent", optionalClerkMiddleware, async (c) => {
       offer_id: offer_id || "",
       referral_code: referral_code ? referral_code.toUpperCase().trim() : "",
       voucher_id: voucher_id || "",
+      // Carried through to the order row so the fulfilment endpoints
+      // (ship / confirm-received / auto-complete cron) know whether
+      // to apply shipping-flow or pickup-flow rules.
+      delivery_method,
       // Pre-computed split so the webhook doesn't have to re-derive these.
       item_amount: String(itemAmount),
       shipping_amount: String(shippingAmount),
@@ -428,10 +469,24 @@ stripeRoutes.post("/create-account", clerkMiddleware, requireProfile, async (c) 
     return c.json({ account_id: profile.stripe_account_id });
   }
 
+  // Pin the Connect account to the seller's actual country. Without
+  // this Stripe falls back to the platform country (AU), which gave
+  // non-AU sellers an Australian onboarding form regardless of their
+  // profile. A Connect account's country cannot be changed after
+  // creation, so we refuse to create one with an unknown location.
+  const country = profileLocationToStripeCountry(profile.location);
+  if (!country) {
+    return c.json(
+      { error: "Set your country in profile before connecting Stripe" },
+      400
+    );
+  }
+
   try {
     // Create Stripe Express account
     const account = await getStripe().accounts.create({
       type: "express",
+      country,
       capabilities: {
         card_payments: { requested: true },
         transfers: { requested: true },
@@ -634,6 +689,34 @@ stripeRoutes.post("/webhook", async (c) => {
   logger.info("stripe.webhook_received", { event_type: event.type, event_id: event.id });
 
   const supabase = createSupabaseAdmin();
+
+  // Idempotency on event.id. Stripe explicitly warns that webhook
+  // events may be delivered more than once — every receiver is
+  // expected to dedupe on event.id. We INSERT into stripe_events
+  // with a PRIMARY KEY constraint; if it already exists we treat
+  // the event as processed and ack silently. This is what was
+  // double-firing the "You Made a Sale!" push to the seller on
+  // every redelivery of payment_intent.succeeded.
+  const { error: dedupError } = await supabase
+    .from("stripe_events")
+    .insert({ event_id: event.id, event_type: event.type });
+  if (dedupError) {
+    // 23505 = unique_violation in postgres → event was processed
+    // already. Anything else (e.g. table missing, RLS) → log loud
+    // and proceed, since blocking a real event is worse than risking
+    // a duplicate notification.
+    if ((dedupError as { code?: string }).code === "23505") {
+      logger.info("stripe.webhook_duplicate_event_skipped", {
+        event_id: event.id,
+        event_type: event.type,
+      });
+      return c.json({ received: true });
+    }
+    logger.warn("stripe.webhook_dedup_insert_failed", {
+      event_id: event.id,
+      error: dedupError.message,
+    });
+  }
 
   // Handle account.updated event (Stripe Connect onboarding)
   if (event.type === "account.updated") {
@@ -975,6 +1058,8 @@ stripeRoutes.post("/webhook", async (c) => {
     const sellerDeadlineAt = new Date(Date.now() + 48 * 60 * 60 * 1000);
 
     // Create order
+    const deliveryMethod =
+      metadata.delivery_method === "pickup" ? "pickup" : "shipping";
     const { data: order, error: insertError } = await supabase
       .from("orders")
       .insert({
@@ -996,11 +1081,22 @@ stripeRoutes.post("/webhook", async (c) => {
         stripe_payment_intent_id: paymentIntent.id,
         status: "paid" as OrderStatus,
         seller_deadline_at: sellerDeadlineAt.toISOString(),
+        delivery_method: deliveryMethod,
       })
       .select()
       .single();
 
     if (insertError) {
+      // 23505 = orderService got there first (FE confirm path raced
+      // the webhook). The other writer has already fired the seller's
+      // "You Made a Sale!" via the order:created event listener — we
+      // just need to ack and bail without re-firing it here.
+      if ((insertError as { code?: string }).code === "23505") {
+        logger.info("stripe.webhook_order_already_created", {
+          payment_intent_id: paymentIntent.id,
+        });
+        return c.json({ received: true });
+      }
       console.error("Error creating order from webhook:", insertError);
       return c.json({ received: true });
     }

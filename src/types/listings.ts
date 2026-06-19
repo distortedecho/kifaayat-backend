@@ -37,6 +37,53 @@ export const LISTING_CATEGORIES = [
 export type ListingCategory = (typeof LISTING_CATEGORIES)[number];
 
 // ============================================================
+// Sub-categories
+// ============================================================
+// Three parent categories carry a second level so the filter sheet
+// can drill down. Vocabulary is intentionally TS-side (no DB CHECK)
+// so the client can rename labels later without a migration —
+// we'd just update this map and any UI strings, no schema work.
+//
+// Parents not listed here have no sub-categories: their listings
+// must store sub_category = null. The validator in listings.ts
+// enforces this so a Saree never silently gets tagged "Bangles".
+
+export const SUB_CATEGORIES_BY_CATEGORY: Partial<
+  Record<ListingCategory, readonly string[]>
+> = {
+  Jewellery: [
+    "Earrings",
+    "Necklace/Necklace sets",
+    "Earring & Tika Sets",
+    "Bangles",
+    "Other Jewellery",
+  ],
+  Other: ["Bags/Clutches", "Belts", "Other accessories"],
+  Footwear: ["Men's Footwear", "Women's Footwear", "Other"],
+} as const;
+
+/**
+ * Returns true when the (category, sub_category) pair is valid.
+ * - null / empty sub_category is always allowed (legacy listings,
+ *   sellers who skip the field, parents with no sub-categories).
+ * - A non-null sub_category is only allowed for parents listed in
+ *   SUB_CATEGORIES_BY_CATEGORY, and must match one of that parent's
+ *   exact strings.
+ */
+export function isValidSubCategoryPair(
+  category: string,
+  subCategory: string | null | undefined
+): boolean {
+  if (subCategory === null || subCategory === undefined || subCategory === "") {
+    return true;
+  }
+  const allowed =
+    SUB_CATEGORIES_BY_CATEGORY[category as ListingCategory] ?? null;
+  if (!allowed) return false;
+  return allowed.includes(subCategory);
+}
+
+// ============================================================
 // Conditions — matching live Play Store app
 // ============================================================
 
@@ -222,7 +269,7 @@ export const SELLER_COUNTRIES = [
 ] as const;
 
 // Country codes used in profiles.location
-export const COUNTRY_CODES = ["AU", "NZ", "US", "CA", "UK"] as const;
+export const COUNTRY_CODES = ["AU", "NZ", "US", "CA", "GB"] as const;
 
 // ============================================================
 // Country of origin — matching live Play Store app

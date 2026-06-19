@@ -15,6 +15,7 @@ import {
   // DRY_CLEANING_STATUSES,
   COUNTRIES_OF_ORIGIN,
   PHOTO_MIN_COUNT,
+  isValidSubCategoryPair,
   type ListingCategory,
   type Measurements,
 } from "../types/listings.js";
@@ -43,6 +44,11 @@ const createListingSchema = z.object({
   title: z.string().min(1, "Title is required").max(200, "Title must be 200 characters or less"),
   description: z.string().max(2000, "Description must be 2000 characters or less").optional(),
   category: z.enum(LISTING_CATEGORIES as unknown as [string, ...string[]]),
+  // Optional second-level taxonomy. Only valid for Jewellery, Other,
+  // and Footwear (see SUB_CATEGORIES_BY_CATEGORY). Pair is validated
+  // in a top-level refine() below so a Saree can never silently get
+  // tagged "Bangles". Empty string is normalised to null.
+  sub_category: z.string().max(100).nullable().optional(),
   condition: z.enum(LISTING_CONDITIONS as unknown as [string, ...string[]]),
   measurements: z
     .object({
@@ -98,12 +104,23 @@ const createListingSchema = z.object({
   // Video
   video_url: z.string().url().optional(),
   video_storage_path: z.string().optional(),
-});
+}).refine(
+  (data) => isValidSubCategoryPair(data.category, data.sub_category),
+  {
+    message:
+      "sub_category is not valid for this category. Either omit it or pick one from the category's allowed list.",
+    path: ["sub_category"],
+  }
+);
 
 const updateListingSchema = z.object({
   title: z.string().min(1).max(200).optional(),
   description: z.string().max(2000).optional(),
   category: z.enum(LISTING_CATEGORIES as unknown as [string, ...string[]]).optional(),
+  // Pair validation happens in the update handler because PATCH can omit
+  // category while still changing sub_category — we have to read the
+  // existing row to know the effective category before validating.
+  sub_category: z.string().max(100).nullable().optional(),
   condition: z.enum(LISTING_CONDITIONS as unknown as [string, ...string[]]).optional(),
   measurements: z
     .object({
@@ -404,6 +421,7 @@ listings.post("/", clerkMiddleware, requireProfile, async (c) => {
       title: input.title,
       description: input.description || null,
       category: input.category,
+      sub_category: input.sub_category || null,
       condition: input.condition,
       measurements: input.measurements || {},
       occasion_tags: input.occasion_tags || [],
@@ -622,6 +640,31 @@ listings.put("/:id", clerkMiddleware, requireProfile, async (c) => {
     }
   }
 
+  // Validate (category, sub_category) pair. PATCH can omit category
+  // while still patching sub_category — in that case the effective
+  // category is whatever's already on the row. Reject the request if
+  // the pair becomes invalid after the patch is applied.
+  if (input.category !== undefined || input.sub_category !== undefined) {
+    const nextCategory = (input.category ?? existing.category) as string;
+    const nextSub =
+      input.sub_category !== undefined
+        ? input.sub_category
+        : (existing.sub_category as string | null);
+    if (!isValidSubCategoryPair(nextCategory, nextSub)) {
+      return c.json(
+        {
+          error: "Validation failed",
+          details: {
+            sub_category: [
+              "sub_category is not valid for this category. Either omit it or pick one from the category's allowed list.",
+            ],
+          },
+        },
+        400
+      );
+    }
+  }
+
   // Validate measurements if category is being changed or measurements are provided
   const effectiveCategory = (input.category || existing.category) as ListingCategory;
   const effectiveMeasurements = (input.measurements || existing.measurements) as Measurements;
@@ -643,6 +686,7 @@ listings.put("/:id", clerkMiddleware, requireProfile, async (c) => {
   if (input.title !== undefined) updateData.title = input.title;
   if (input.description !== undefined) updateData.description = input.description;
   if (input.category !== undefined) updateData.category = input.category;
+  if (input.sub_category !== undefined) updateData.sub_category = input.sub_category;
   if (input.condition !== undefined) updateData.condition = input.condition;
   if (input.measurements !== undefined) updateData.measurements = input.measurements;
   if (input.occasion_tags !== undefined) updateData.occasion_tags = input.occasion_tags;

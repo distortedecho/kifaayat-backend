@@ -486,6 +486,19 @@ orders.patch("/:id/ship", clerkMiddleware, requireProfile, async (c) => {
     );
   }
 
+  // Pickup orders never go through the shipped state. The seller hands
+  // the item over in person and the buyer marks it collected via the
+  // confirm-received endpoint, which takes the order straight to
+  // complete. Reject any attempt to write a tracking number against
+  // a pickup order — defense-in-depth in case the FE sends the wrong
+  // CTA from a stale screen.
+  if (order.delivery_method === "pickup") {
+    return c.json(
+      { error: "Pickup orders cannot be marked as shipped" },
+      400
+    );
+  }
+
   // User must be seller
   if (order.seller_id !== profile.id) {
     return c.json({ error: "Only the seller can ship this order" }, 403);
@@ -778,7 +791,25 @@ orders.post("/:id/confirm-received", clerkMiddleware, requireProfile, async (c) 
     return c.json({ error: "Only the buyer can confirm receipt" }, 403);
   }
 
-  if (order.status !== "shipped" && order.status !== "delivered") {
+  // Shipping orders: must be shipped (preferred) or already delivered.
+  // Pickup orders: jump straight from paid → complete on the buyer's
+  // "mark as collected" tap, as long as the seller has accepted (no
+  // accepting means the order is still in the 48h seller-decision
+  // window and shouldn't be confirmable yet).
+  if (order.delivery_method === "pickup") {
+    if (order.status !== "paid") {
+      return c.json(
+        { error: `Cannot confirm receipt for order with status '${order.status}'` },
+        400
+      );
+    }
+    if (!order.seller_accepted_at) {
+      return c.json(
+        { error: "Seller has not accepted the order yet" },
+        400
+      );
+    }
+  } else if (order.status !== "shipped" && order.status !== "delivered") {
     return c.json(
       { error: `Cannot confirm receipt for order with status '${order.status}'` },
       400
@@ -803,6 +834,16 @@ orders.post("/:id/confirm-received", clerkMiddleware, requireProfile, async (c) 
     console.error("Error confirming receipt:", updateError);
     return c.json({ error: "Failed to confirm receipt" }, 500);
   }
+
+  // Mark the listing as sold. Shipping orders already did this in
+  // /ship, but pickup orders skip that path entirely — without this
+  // line a completed pickup order leaves the listing stuck at
+  // 'reserved' forever, so it still shows up as in-flight in the
+  // seller's dashboard. Idempotent for shipping orders.
+  await supabase
+    .from("listings")
+    .update({ status: "sold" })
+    .eq("id", order.listing_id);
 
   // Release escrow funds to the seller. Stripe Connect sellers get an
   // automatic transfer; Wise/PayPal sellers flip to ready_for_payout
@@ -1034,9 +1075,24 @@ orders.post("/:id/accept", clerkMiddleware, requireProfile, async (c) => {
     return c.json({ error: "Order already accepted" }, 400);
   }
 
+  // Pickup orders skip shipping entirely, so there's no shipped_at
+  // moment to count auto-complete from. Anchor the auto-complete
+  // window on acceptance instead — same AUTO_COMPLETE_DAYS, just a
+  // different starting point. Shipping orders still get auto_complete_at
+  // set in the ship endpoint after we know shipped_at.
+  const acceptedAt = new Date();
+  const acceptUpdates: Record<string, string> = {
+    seller_accepted_at: acceptedAt.toISOString(),
+  };
+  if (order.delivery_method === "pickup") {
+    const autoCompleteAt = new Date(acceptedAt);
+    autoCompleteAt.setDate(autoCompleteAt.getDate() + AUTO_COMPLETE_DAYS);
+    acceptUpdates.auto_complete_at = autoCompleteAt.toISOString();
+  }
+
   const { data: updatedOrder, error: updateError } = await supabase
     .from("orders")
-    .update({ seller_accepted_at: new Date().toISOString() })
+    .update(acceptUpdates)
     .eq("id", orderId)
     .select()
     .single();
@@ -1175,13 +1231,22 @@ orders.post("/cron/auto-complete", async (c) => {
 
   const supabase = createSupabaseAdmin();
 
-  // Find shipped orders past auto-complete deadline
+  // Find orders past auto-complete deadline. Includes:
+  //   - Shipping orders that are 'shipped' and past auto_complete_at
+  //     (buyer never confirmed receipt within the window)
+  //   - Pickup orders that are 'paid' + seller-accepted and past
+  //     auto_complete_at (buyer never marked collected; seller has
+  //     already received their payout window as if the pickup
+  //     happened — same protection as the shipping flow).
+  const nowIso = new Date().toISOString();
   const { data: overdueOrders, error: queryError } = await supabase
     .from("orders")
     .select("id, buyer_id, seller_id, listing_id, currency, seller_payout, listings!orders_listing_id_fkey(title)")
-    .eq("status", "shipped")
+    .or(
+      "and(status.eq.shipped,delivery_method.eq.shipping),and(status.eq.paid,delivery_method.eq.pickup)"
+    )
     .not("auto_complete_at", "is", null)
-    .lte("auto_complete_at", new Date().toISOString());
+    .lte("auto_complete_at", nowIso);
 
   if (queryError) {
     console.error("Error querying overdue orders:", queryError);
@@ -1210,6 +1275,14 @@ orders.post("/cron/auto-complete", async (c) => {
     }
 
     completedCount++;
+
+    // Mark the listing as sold. Pickup orders never went through /ship,
+    // so without this they'd sit at 'reserved' indefinitely even after
+    // auto-completion. Idempotent for shipping orders.
+    await supabase
+      .from("listings")
+      .update({ status: "sold" })
+      .eq("id", order.listing_id);
 
     // Release escrow funds for this auto-completed order. Fire-and-forget
     // so a single Stripe transfer failure doesn't block the rest of the

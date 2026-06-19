@@ -37,20 +37,48 @@ export class StripeServiceError extends Error {
 }
 
 /**
+ * Validate a profile.location value as an ISO 3166-1 alpha-2 country
+ * code Stripe accepts when creating a Connect account. We now store
+ * the same codes Stripe uses (AU / US / NZ / CA / GB), so this is
+ * essentially a passthrough — but we still validate so a typo in the
+ * profile can never silently default Stripe to the platform country
+ * (which previously gave UK sellers an Australian onboarding form).
+ * Returns null if location is unset or outside our supported markets.
+ */
+export function profileLocationToStripeCountry(
+  location: string | null
+): string | null {
+  if (!location) return null;
+  const supported = new Set(["AU", "US", "NZ", "CA", "GB"]);
+  const upper = location.toUpperCase();
+  return supported.has(upper) ? upper : null;
+}
+
+/**
  * Create (or return existing) Stripe Express connected account for
  * a seller profile, persisting the account id on the profile row.
  */
 export async function createExpressAccount(profile: {
   id: string;
   stripe_account_id?: string | null;
+  location?: string | null;
 }): Promise<string> {
   if (profile.stripe_account_id) {
     return profile.stripe_account_id;
   }
 
+  const country = profileLocationToStripeCountry(profile.location ?? null);
+  if (!country) {
+    throw new StripeServiceError(
+      "Set your country in profile before connecting Stripe",
+      400
+    );
+  }
+
   const stripe = getStripeClient();
   const account = await stripe.accounts.create({
     type: "express",
+    country,
     capabilities: {
       card_payments: { requested: true },
       transfers: { requested: true },

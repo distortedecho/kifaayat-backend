@@ -728,6 +728,7 @@ cart.post("/checkout", clerkMiddleware, requireProfile, async (c) => {
     const paymentIntent = await getStripe().paymentIntents.create({
       amount: chargeAmount,
       currency: "aud",
+      payment_method_types: ["card"],
       transfer_group: `cart_${cartCheckoutId}`,
       metadata: {
         checkout_type: "cart",

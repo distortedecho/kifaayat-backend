@@ -9,7 +9,7 @@ const addresses = new Hono();
 const UUID_REGEX =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-const COUNTRY_CODES = ["AU", "US", "NZ", "CA", "UK"] as const;
+const COUNTRY_CODES = ["AU", "US", "NZ", "CA", "GB"] as const;
 
 const createAddressSchema = z.object({
   label: z.string().max(50).nullish(),
@@ -17,7 +17,10 @@ const createAddressSchema = z.object({
   street_line1: z.string().min(1).max(200),
   street_line2: z.string().max(200).nullish(),
   city: z.string().min(1).max(100),
-  state: z.string().min(1).max(100),
+  // UK addresses don't have a "state" — they go straight from city to
+  // postcode. Keep the column but allow it to be empty / omitted so
+  // non-AU/US users can save without a fake placeholder value.
+  state: z.string().max(100).nullish(),
   postal_code: z.string().min(1).max(20),
   country: z.enum(COUNTRY_CODES),
   phone: z.string().max(30).nullish(),
@@ -61,8 +64,10 @@ addresses.post("/", clerkMiddleware, requireProfile, async (c) => {
   const body = await c.req.json();
   const parsed = createAddressSchema.safeParse(body);
   if (!parsed.success) {
+    const fieldErrors = parsed.error.flatten().fieldErrors;
+    console.warn("[addresses] Validation failed:", JSON.stringify(fieldErrors));
     return c.json(
-      { error: "Validation failed", details: parsed.error.flatten().fieldErrors },
+      { error: "Validation failed", details: fieldErrors },
       400
     );
   }
@@ -119,8 +124,10 @@ addresses.patch("/:id", clerkMiddleware, requireProfile, async (c) => {
   const body = await c.req.json();
   const parsed = updateAddressSchema.safeParse(body);
   if (!parsed.success) {
+    const fieldErrors = parsed.error.flatten().fieldErrors;
+    console.warn("[addresses] Validation failed:", JSON.stringify(fieldErrors));
     return c.json(
-      { error: "Validation failed", details: parsed.error.flatten().fieldErrors },
+      { error: "Validation failed", details: fieldErrors },
       400
     );
   }

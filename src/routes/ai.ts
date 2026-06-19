@@ -12,6 +12,8 @@ import {
   FABRIC_TYPES,
   WORK_TYPES,
   PRIMARY_COLOURS,
+  SUB_CATEGORIES_BY_CATEGORY,
+  isValidSubCategoryPair,
 } from "../types/listings.js";
 import type {
   AIAnalysisResponse,
@@ -53,6 +55,38 @@ export const cronGeminiQueue = new PQueue({
   intervalCap: 5,
   interval: 60_000,
 });
+
+/**
+ * Fires one tiny Gemini call at server boot so the SDK, HTTP client,
+ * and Google's edge connection are warm by the time the first real
+ * user request hits /analyze. Without this the first call after a
+ * deploy/restart adds ~3-5s of cold-start latency on top of the
+ * normal Gemini inference time, which combined with photo upload
+ * over cellular pushes some Android clients past their fetch timeout.
+ *
+ * Non-blocking: never throws back to startup, never blocks the port
+ * binding. Skipped silently if GEMINI_API_KEY is unset (dev/CI).
+ */
+export async function prewarmGemini(): Promise<void> {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) return;
+  try {
+    const genAI = new GoogleGenAI({ apiKey });
+    await userGeminiQueue.add(async () => {
+      await genAI.models.generateContent({
+        model: "gemini-2.5-flash",
+        contents: ["ping"],
+        config: { temperature: 0, maxOutputTokens: 1 },
+      });
+    });
+    console.log("[AI Prewarm] Gemini SDK warmed up");
+  } catch (err) {
+    console.warn(
+      "[AI Prewarm] Failed (non-fatal):",
+      err instanceof Error ? err.message : String(err)
+    );
+  }
+}
 
 // ============================================================
 // Per-user AI rate limit (Phase 2.3)
@@ -249,6 +283,8 @@ ai.post("/analyze", clerkMiddleware, async (c) => {
 Return a JSON object with these fields:
 - category: one of [${aiCategoryOptions.join(", ")}]. Pick the most specific category that fits — do NOT return any value outside this list.
 - category_confidence: confidence score 0-100
+- sub_category: ONLY return a value if category is "Jewellery" or "Footwear", and only from the corresponding list below. For Jewellery: [${SUB_CATEGORIES_BY_CATEGORY.Jewellery!.join(", ")}]. For Footwear: [${SUB_CATEGORIES_BY_CATEGORY.Footwear!.join(", ")}]. For any other category (Lehenga, Saree, Suit/Salwar, Indowestern, Blouse, Menswear, Kidswear), set this to null. The "Other" parent has its own sub-categories but we only ask for sub_category when the AI is confident — leave null for "Other" since users will pick manually.
+- sub_category_confidence: confidence score 0-100
 - title: a descriptive marketplace title (max 200 chars)
 - title_confidence: confidence score 0-100
 - description: detailed description mentioning fabric, embroidery, color details, occasion suitability (max 500 chars)
@@ -370,6 +406,17 @@ function mapGeminiResponse(raw: Record<string, unknown>): AIAnalysisResponse {
   const categoryValid = LISTING_CATEGORIES.includes(raw.category as any);
   const conditionValid = LISTING_CONDITIONS.includes(raw.condition as any);
 
+  // Validate the sub_category against the same vocabulary the listings
+  // API enforces. If category isn't valid we can't pair anything, and
+  // if Gemini returned a sub that doesn't match the parent it gets
+  // dropped to null + confidence 0 — same hardening as category/condition.
+  const rawSub =
+    raw.sub_category == null || raw.sub_category === ""
+      ? null
+      : String(raw.sub_category);
+  const subCategoryValid =
+    categoryValid && isValidSubCategoryPair(String(raw.category), rawSub);
+
   // Validate occasion tags
   const rawTags = Array.isArray(raw.occasion_tags) ? raw.occasion_tags : [];
   const validTags = rawTags.filter((tag: unknown) =>
@@ -414,6 +461,14 @@ function mapGeminiResponse(raw: Record<string, unknown>): AIAnalysisResponse {
       // leaking "Anarkali" or other categories that don't exist on the platform.
       value: categoryValid ? String(raw.category) : "",
       confidence: categoryValid ? toConfidence(raw.category_confidence) : 0,
+    },
+    sub_category: {
+      // null = AI is not sure / category doesn't have sub-categories /
+      // parent + sub pair didn't validate. Frontend should treat null
+      // the same as "AI not sure": leave the field blank for the seller
+      // to pick manually.
+      value: subCategoryValid ? rawSub : null,
+      confidence: subCategoryValid ? toConfidence(raw.sub_category_confidence) : 0,
     },
     title: {
       value: truncateAtWordBoundary(String(raw.title || ""), 100),

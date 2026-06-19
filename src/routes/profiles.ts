@@ -172,7 +172,7 @@ const updateProfileSchema = z.object({
     .max(50, "Display name must be 50 characters or less")
     .optional(),
   avatar_url: z.string().url("Must be a valid URL").nullable().optional(),
-  location: z.enum(["AU", "US", "NZ", "CA", "UK"]).optional(),
+  location: z.enum(["AU", "US", "NZ", "CA", "GB"]).optional(),
   currency: z.enum(["AUD", "USD", "NZD", "CAD", "GBP"]).optional(),
   size_preferences: z
     .object({
@@ -415,7 +415,7 @@ const payoutMethodSchema = z.discriminatedUnion("payout_method", [
   z.object({
     payout_method: z.literal("wise"),
     wise_account_holder: z.string().min(1).max(200),
-    wise_bank_country: z.enum(["AU", "UK", "US", "CA", "NZ"]),
+    wise_bank_country: z.enum(["AU", "GB", "US", "CA", "NZ"]),
     wise_bank_currency: z.enum(["AUD", "GBP", "USD", "CAD", "NZD"]),
     wise_routing_code: z.string().min(1).max(50),
     wise_account_number: z.string().min(1).max(50),

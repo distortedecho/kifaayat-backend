@@ -1,7 +1,12 @@
 import { Hono } from "hono";
 import { optionalClerkMiddleware } from "../middleware/clerk.js";
 import { createSupabaseAdmin } from "../lib/supabase.js";
-import { LISTING_CATEGORIES, LISTING_CONDITIONS, OCCASION_TAGS } from "../types/listings.js";
+import {
+  LISTING_CATEGORIES,
+  LISTING_CONDITIONS,
+  OCCASION_TAGS,
+  isValidSubCategoryPair,
+} from "../types/listings.js";
 import { type ListingBadge, BADGE_PRIORITY } from "../types/trust.js";
 
 const search = new Hono();
@@ -135,6 +140,7 @@ search.get("/", optionalClerkMiddleware, async (c) => {
   // Parse query params
   const q = c.req.query("q")?.trim() || "";
   const category = c.req.query("category");
+  const subCategory = c.req.query("sub_category");
   const condition = c.req.query("condition");
   const occasion = c.req.query("occasion"); // comma-separated
   const color = c.req.query("color"); // comma-separated
@@ -154,16 +160,32 @@ search.get("/", optionalClerkMiddleware, async (c) => {
   ) {
     return c.json({ error: "Invalid category filter" }, 400);
   }
+  // sub_category must always be paired with a category in the same
+  // request — the FE filter sheet only surfaces sub-categories once a
+  // parent is picked, so receiving sub_category alone signals a stale
+  // or malformed query. Validate the pair against the same vocabulary
+  // the listings endpoints use.
+  if (subCategory) {
+    if (!category) {
+      return c.json(
+        { error: "sub_category requires a category to be specified" },
+        400
+      );
+    }
+    if (!isValidSubCategoryPair(category, subCategory)) {
+      return c.json({ error: "Invalid sub_category for this category" }, 400);
+    }
+  }
   if (
     condition &&
     !LISTING_CONDITIONS.includes(condition as (typeof LISTING_CONDITIONS)[number])
   ) {
     return c.json({ error: "Invalid condition filter" }, 400);
   }
-  if (location && !["AU", "US", "NZ", "CA", "UK"].includes(location)) {
+  if (location && !["AU", "US", "NZ", "CA", "GB"].includes(location)) {
     return c.json({ error: "Invalid location filter" }, 400);
   }
-  if (market && !["AU", "US", "NZ", "CA", "UK"].includes(market)) {
+  if (market && !["AU", "US", "NZ", "CA", "GB"].includes(market)) {
     return c.json({ error: "Invalid market filter" }, 400);
   }
   if (size && !VALID_SIZES.includes(size)) {
@@ -208,7 +230,7 @@ search.get("/", optionalClerkMiddleware, async (c) => {
   let query = supabase
     .from("listings")
     .select(
-      "id, title, description, price_amount, price_currency, original_price_amount, category, condition, estimated_size, size_type, designer_name, international_shipping, measurements, occasion_tags, colors, created_at, listing_photos(url, position), profiles!listings_seller_id_fkey(display_name, location, trust_tier)",
+      "id, title, description, price_amount, price_currency, original_price_amount, category, sub_category, condition, estimated_size, size_type, designer_name, international_shipping, measurements, occasion_tags, colors, created_at, listing_photos(url, position), profiles!listings_seller_id_fkey(display_name, location, trust_tier)",
       { count: "estimated" }
     )
     .eq("status", "active");
@@ -241,6 +263,10 @@ search.get("/", optionalClerkMiddleware, async (c) => {
   // --- Apply filters ---
   if (category) {
     query = query.eq("category", category);
+  }
+
+  if (subCategory) {
+    query = query.eq("sub_category", subCategory);
   }
 
   if (condition) {

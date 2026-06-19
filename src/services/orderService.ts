@@ -235,6 +235,27 @@ export async function createOrder(
       });
       order = rows[0] || null;
     } catch (err) {
+      // The SELECT-then-INSERT idempotency check above isn't atomic,
+      // so the webhook handler can win the race between our SELECT and
+      // our INSERT. Postgres 23505 from the partial UNIQUE index on
+      // stripe_payment_intent_id (schema-15) means exactly that. Return
+      // the existing row WITHOUT emitting order:created — the webhook
+      // path has already fired the seller's "You Made a Sale!" push.
+      const pgErr = err as { code?: string };
+      if (pgErr?.code === "23505") {
+        const { data: raceWinner } = await supabase
+          .from("orders")
+          .select("*")
+          .eq("stripe_payment_intent_id", stripe_payment_intent_id)
+          .maybeSingle();
+        if (raceWinner) {
+          logger.info("orderService.race_resolved_to_existing", {
+            payment_intent_id: stripe_payment_intent_id,
+            existing_order_id: raceWinner.id,
+          });
+          return raceWinner as CreatedOrder;
+        }
+      }
       logger.error("orderService.atomic_create_failed", {
         listing_id,
         error: err instanceof Error ? err.message : String(err),
@@ -268,6 +289,24 @@ export async function createOrder(
       .select()
       .single();
     if (insertError) {
+      // Same race-resolution as the atomic branch above. 23505 = the
+      // webhook beat us to the insert; return the existing row and
+      // skip the emit so the listener doesn't fire a duplicate
+      // order_paid push.
+      if ((insertError as { code?: string }).code === "23505") {
+        const { data: raceWinner } = await supabase
+          .from("orders")
+          .select("*")
+          .eq("stripe_payment_intent_id", stripe_payment_intent_id)
+          .maybeSingle();
+        if (raceWinner) {
+          logger.info("orderService.race_resolved_to_existing", {
+            payment_intent_id: stripe_payment_intent_id,
+            existing_order_id: raceWinner.id,
+          });
+          return raceWinner as CreatedOrder;
+        }
+      }
       logger.error("orderService.insert_failed", {
         listing_id,
         error: insertError.message,
