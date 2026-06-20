@@ -8,7 +8,6 @@ import { createSupabaseAdmin } from "../lib/supabase.js";
 import {
   LISTING_CATEGORIES,
   LISTING_CONDITIONS,
-  OCCASION_TAGS,
   FABRIC_TYPES,
   WORK_TYPES,
   PRIMARY_COLOURS,
@@ -295,8 +294,6 @@ Return a JSON object with these fields:
 - condition_confidence: confidence score 0-100
 - colors: array of 1-4 dominant colors from [${PRIMARY_COLOURS.join(", ")}]
 - colors_confidence: confidence score 0-100
-- occasion_tags: array from [${OCCASION_TAGS.join(", ")}]
-- occasion_tags_confidence: confidence score 0-100
 - photo_quality: array of objects for each photo, each with:
   - index: photo index (0-based)
   - is_blurry: boolean (true if image appears out of focus or motion-blurred)
@@ -417,11 +414,10 @@ function mapGeminiResponse(raw: Record<string, unknown>): AIAnalysisResponse {
   const subCategoryValid =
     categoryValid && isValidSubCategoryPair(String(raw.category), rawSub);
 
-  // Validate occasion tags
-  const rawTags = Array.isArray(raw.occasion_tags) ? raw.occasion_tags : [];
-  const validTags = rawTags.filter((tag: unknown) =>
-    OCCASION_TAGS.includes(tag as any)
-  );
+  // occasion_tags intentionally not surfaced — no UI accepts them, so
+  // returning a suggestion would just be dead weight on the wire.
+  // Re-enable by restoring the OCCASION_TAGS prompt block and the
+  // mapping below if/when the seller form gets an occasion picker.
 
   // Validate colors against the canonical 20-color palette. Anything Gemini
   // hallucinates (e.g. "Mauve", "Champagne") gets dropped so the frontend
@@ -491,10 +487,7 @@ function mapGeminiResponse(raw: Record<string, unknown>): AIAnalysisResponse {
       value: validColors,
       confidence: validColors.length > 0 ? toConfidence(raw.colors_confidence) : 0,
     },
-    occasion_tags: {
-      value: validTags.map(String),
-      confidence: toConfidence(raw.occasion_tags_confidence),
-    },
+    // occasion_tags removed from response — no FE UI accepts them yet.
 
     // v2 fields
     photo_quality: {

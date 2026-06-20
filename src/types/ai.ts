@@ -37,7 +37,10 @@ export interface AIAnalysisResponse {
   suggested_price: AIField<number>;
   condition: AIField<string>;
   colors: AIField<string[]>;
-  occasion_tags: AIField<string[]>;
+  // Optional — currently not surfaced by the analyze endpoint because
+  // no seller-side UI exists to accept the suggestion. Re-enable in
+  // routes/ai.ts when the form gets an occasion picker.
+  occasion_tags?: AIField<string[]>;
 
   // v2 fields — additive, all optional for backward compatibility
   photo_quality?: AIField<PhotoQualityAssessment[]>;

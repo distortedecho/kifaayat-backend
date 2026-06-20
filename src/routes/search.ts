@@ -6,6 +6,7 @@ import {
   LISTING_CONDITIONS,
   OCCASION_TAGS,
   isValidSubCategoryPair,
+  CURATION_TAGS,
 } from "../types/listings.js";
 import { type ListingBadge, BADGE_PRIORITY } from "../types/trust.js";
 
@@ -152,6 +153,11 @@ search.get("/", optionalClerkMiddleware, async (c) => {
   const sort = c.req.query("sort") || (q ? "relevance" : "newest");
   const cursor = c.req.query("cursor");
   const limit = Math.min(parseInt(c.req.query("limit") || "20", 10), 50);
+  // Curation chip the FE filter sheet sends. Six accepted values:
+  //   4 admin-tagged (CURATION_TAGS) → filtered via curation_tags column
+  //   "Trending" → computed via view_count + save_count on recent listings
+  //   "Budget Friendly" → computed via price < category_median * 0.6
+  const curation = c.req.query("curation");
 
   // Validate filter values
   if (
@@ -193,6 +199,14 @@ search.get("/", optionalClerkMiddleware, async (c) => {
   }
   if (!["newest", "price_asc", "price_desc", "relevance"].includes(sort)) {
     return c.json({ error: "Invalid sort option" }, 400);
+  }
+  const CURATION_COMPUTED = ["Trending", "Budget Friendly"] as const;
+  const ALLOWED_CURATION = [
+    ...CURATION_TAGS,
+    ...CURATION_COMPUTED,
+  ] as readonly string[];
+  if (curation && !ALLOWED_CURATION.includes(curation)) {
+    return c.json({ error: "Invalid curation filter" }, 400);
   }
 
   const priceMin = priceMinStr ? parseInt(priceMinStr, 10) : null;
@@ -269,6 +283,44 @@ search.get("/", optionalClerkMiddleware, async (c) => {
     query = query.eq("sub_category", subCategory);
   }
 
+  // --- Curation chip filter ---
+  // 4 admin-tagged values land here as a curation_tags array containment
+  // check (GIN-indexed in schema-07). Trending + Budget Friendly are
+  // computed below: Trending alters the sort + adds a recency window,
+  // Budget Friendly adds a price upper bound based on the category
+  // median cache. Trending/BF can coexist with other filters (e.g.
+  // "Trending Jewellery under $100" works).
+  if (curation && (CURATION_TAGS as readonly string[]).includes(curation)) {
+    query = query.contains("curation_tags", [curation]);
+  }
+
+  if (curation === "Trending") {
+    // Last 30 days; popularity-weighted ranking applied below in sort.
+    const thirtyDaysAgo = new Date(
+      Date.now() - 30 * 24 * 60 * 60 * 1000
+    ).toISOString();
+    query = query.gte("created_at", thirtyDaysAgo);
+  }
+
+  if (curation === "Budget Friendly") {
+    // Per-category median * 0.6 = ~40% cheaper than typical. If no
+    // category is specified, fall back to the *minimum* median across
+    // all categories — conservative threshold that still returns
+    // genuinely cheap listings instead of mid-priced ones in cheaper
+    // categories. Skip the filter entirely if no medians cached yet
+    // (fresh deploy, cron hasn't populated admin_settings).
+    const medianValues = Object.values(categoryMedians);
+    if (medianValues.length > 0) {
+      let threshold: number;
+      if (category && categoryMedians[category]) {
+        threshold = Math.round(categoryMedians[category] * 0.6);
+      } else {
+        threshold = Math.round(Math.min(...medianValues) * 0.6);
+      }
+      query = query.lte("price_amount", threshold);
+    }
+  }
+
   if (condition) {
     query = query.eq("condition", condition);
   }
@@ -313,7 +365,18 @@ search.get("/", optionalClerkMiddleware, async (c) => {
   // (No DB filter applied here.)
 
   // --- Apply sort ---
-  switch (sort) {
+  // Trending overrides the default sort to a popularity-weighted order
+  // so the chip actually surfaces hot listings rather than just-recent
+  // ones. If the caller explicitly asked for price_asc/price_desc we
+  // still respect that — Trending becomes "popular within this price
+  // band" rather than fighting the user's intent.
+  if (curation === "Trending" && (sort === "newest" || sort === "relevance")) {
+    query = query
+      .order("save_count", { ascending: false })
+      .order("view_count", { ascending: false })
+      .order("created_at", { ascending: false })
+      .order("id", { ascending: false });
+  } else switch (sort) {
     case "newest":
       query = query
         .order("created_at", { ascending: false })
@@ -505,10 +568,22 @@ search.get("/", optionalClerkMiddleware, async (c) => {
     }
   })();
 
+  // total_count: when market or location is applied, the DB-side count
+  // is the pre-filter total (1247 listings in DB) because the
+  // market/location filter runs in JS post-fetch. That produced the
+  // wildly inflated "1247 results" with only 1 visible item bug.
+  // Substitute the post-filtered length so the count matches what the
+  // user actually sees. Slight under-count on paginated calls (we only
+  // know this page's filtered length, not the global total) is better
+  // than wildly over-counting; the FE has hasMore / next_cursor to
+  // signal "there's more, paginate".
+  const effectiveTotalCount =
+    market || location ? filteredRows.length : count ?? null;
+
   return c.json({
     items,
     next_cursor: nextCursor,
-    total_count: count ?? null,
+    total_count: effectiveTotalCount,
   });
 });
 

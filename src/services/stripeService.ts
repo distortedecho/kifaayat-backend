@@ -27,6 +27,53 @@ export function getStripeClient(): Stripe {
   return _stripe;
 }
 
+/**
+ * Idempotent: returns the existing customer id if the profile already
+ * has one, otherwise creates a new Stripe Customer and persists the id.
+ *
+ * Created lazily on first checkout — not at signup — so users who only
+ * browse never get a Customer record in Stripe (saves on Stripe-side
+ * object count and keeps free-tier accounts clean). Email + display_name
+ * are passed for Stripe dashboard searchability; profile_id metadata
+ * lets us trace from Stripe back to our DB when debugging.
+ */
+export async function getOrCreateStripeCustomer(profile: {
+  id: string;
+  stripe_customer_id?: string | null;
+  display_name?: string | null;
+  email?: string | null;
+}): Promise<string> {
+  if (profile.stripe_customer_id) {
+    return profile.stripe_customer_id;
+  }
+
+  const stripe = getStripeClient();
+  const customer = await stripe.customers.create({
+    email: profile.email ?? undefined,
+    name: profile.display_name ?? undefined,
+    metadata: { kifaayat_profile_id: profile.id },
+  });
+
+  const supabase = createSupabaseAdmin();
+  const { error: updateError } = await supabase
+    .from("profiles")
+    .update({ stripe_customer_id: customer.id })
+    .eq("id", profile.id);
+
+  if (updateError) {
+    logger.error("stripeService.store_customer_failed", {
+      profile_id: profile.id,
+      error: updateError.message,
+    });
+    // Stripe customer was already created at this point. Not fatal —
+    // the worst case is one orphan customer in Stripe; next call will
+    // create another. Surface as 500 so the checkout retries.
+    throw new StripeServiceError("Failed to save Stripe customer", 500);
+  }
+
+  return customer.id;
+}
+
 export class StripeServiceError extends Error {
   status: number;
   constructor(message: string, status: number) {

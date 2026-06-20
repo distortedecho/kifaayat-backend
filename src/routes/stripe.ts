@@ -23,7 +23,10 @@ import {
   resolveSellerPayoutMethod,
   type SellerPayoutProfile,
 } from "../services/payoutService.js";
-import { profileLocationToStripeCountry } from "../services/stripeService.js";
+import {
+  profileLocationToStripeCountry,
+  getOrCreateStripeCustomer,
+} from "../services/stripeService.js";
 
 const stripeRoutes = new Hono();
 
@@ -214,10 +217,12 @@ stripeRoutes.post("/payment-intent", optionalClerkMiddleware, async (c) => {
 
   // Resolve buyer identity
   let buyerProfileId: string | null = null;
+  let buyerProfile: Awaited<ReturnType<typeof getProfileByClerkId>> | null = null;
   if (clerkUserId) {
     const profile = await getProfileByClerkId(clerkUserId);
     if (profile) {
       buyerProfileId = profile.id;
+      buyerProfile = profile;
     }
   }
 
@@ -398,6 +403,29 @@ stripeRoutes.post("/payment-intent", optionalClerkMiddleware, async (c) => {
   // What Stripe actually charges the buyer.
   const chargeAmount = itemAmount + shippingAmount - voucherDiscount;
 
+  // Lazily get-or-create a Stripe Customer for authenticated buyers so
+  // the card they enter at checkout gets saved on their account and
+  // shows up next time (inline in PaymentSheet + on the Settings →
+  // Payment Methods screen). Guests skip this — we don't have a stable
+  // identity to attach to. Failures here must NOT block the checkout;
+  // fall back to the no-customer path on error.
+  let buyerStripeCustomerId: string | null = null;
+  if (buyerProfile) {
+    try {
+      buyerStripeCustomerId = await getOrCreateStripeCustomer({
+        id: buyerProfile.id,
+        stripe_customer_id: buyerProfile.stripe_customer_id,
+        display_name: buyerProfile.display_name,
+        email: buyerProfile.email,
+      });
+    } catch (err) {
+      console.error(
+        "[stripe] getOrCreateStripeCustomer failed (continuing without saved card):",
+        err
+      );
+    }
+  }
+
   // Build PaymentIntent params — no transfer_data, no application_fee_amount.
   // Funds land fully in Kifaayat's balance; we move them on delivery.
   //
@@ -411,6 +439,19 @@ stripeRoutes.post("/payment-intent", optionalClerkMiddleware, async (c) => {
     amount: chargeAmount,
     currency: listing.price_currency.toLowerCase(),
     payment_method_types: ["card"],
+    // Attaching the Stripe Customer + setup_future_usage means the
+    // card the buyer enters gets saved on their profile automatically
+    // when the charge succeeds. No extra trip through SetupIntent
+    // needed — the same PaymentSheet flow that takes payment also
+    // tokenises the card for next time. "off_session" because we'll
+    // potentially charge it again later without the user present
+    // (e.g. for the next purchase).
+    ...(buyerStripeCustomerId
+      ? {
+          customer: buyerStripeCustomerId,
+          setup_future_usage: "off_session" as const,
+        }
+      : {}),
     metadata: {
       listing_id,
       buyer_email: buyer_email || "",
@@ -483,6 +524,14 @@ stripeRoutes.post("/create-account", clerkMiddleware, requireProfile, async (c) 
   }
 
   try {
+    // Log the country we're locking the new account to so a "Stripe
+    // is showing AU but I picked UK" report can be diagnosed in one
+    // glance — answer is always "your profile.location was AU when
+    // you tapped Connect with Stripe".
+    console.log(
+      `[stripe create-account] profile=${profile.id} location=${profile.location} → country=${country}`
+    );
+
     // Create Stripe Express account
     const account = await getStripe().accounts.create({
       type: "express",
@@ -627,6 +676,17 @@ stripeRoutes.get("/account-status", clerkMiddleware, requireProfile, async (c) =
       payouts_enabled: account.payouts_enabled ?? false,
       payout_method: payoutMethod,
       payout_ready: resolvedMethod !== null,
+      // Per-account requirements bag — what Stripe still needs from
+      // the seller before onboarding is considered complete. FE uses
+      // this to render specific pending items rather than a generic
+      // "Setup pending" message. disabled_reason is non-null when
+      // Stripe has blocked the account (rejected, KYC failed, etc).
+      requirements: {
+        currently_due: account.requirements?.currently_due ?? [],
+        past_due: account.requirements?.past_due ?? [],
+        eventually_due: account.requirements?.eventually_due ?? [],
+        disabled_reason: account.requirements?.disabled_reason ?? null,
+      },
     };
 
     return c.json(response);

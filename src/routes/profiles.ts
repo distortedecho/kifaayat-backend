@@ -2,8 +2,13 @@ import { Hono } from "hono";
 import { z } from "zod";
 import crypto from "node:crypto";
 import { clerkMiddleware, optionalClerkMiddleware } from "../middleware/clerk.js";
+import { requireProfile } from "../middleware/requireProfile.js";
 import { createSupabaseAdmin } from "../lib/supabase.js";
 import { createNotification, welcomeBackNotification } from "../lib/notifications.js";
+import {
+  getStripeClient,
+  getOrCreateStripeCustomer,
+} from "../services/stripeService.js";
 
 const profiles = new Hono();
 
@@ -182,6 +187,11 @@ const updateProfileSchema = z.object({
       garment_length: z.string().optional(),
       sleeve_length: z.string().optional(),
       clothing_size: z.string().optional(),
+      // Single free-form string (e.g. "5'7\"") matching how listings
+      // store measurements.height. FE keeps reading legacy
+      // height_ft/height_in from old saves for backward compatibility,
+      // but new writes go through this single key.
+      height: z.string().optional(),
     })
     .optional(),
   occasion_tags: z
@@ -235,6 +245,34 @@ profiles.get("/me", clerkMiddleware, async (c) => {
   }
 
   if (profile) {
+    // Write-through sync from Clerk: if the user verified a new phone
+    // (e.g. via the "Add phone" flow in Settings) or changed their
+    // email since the last time we wrote to this row, refresh our
+    // copy. Clerk is the source of truth for both — we never trust
+    // the FE to send them in a PATCH because the values would be
+    // unverified at our layer. Best-effort; failures are logged but
+    // don't block the GET.
+    try {
+      const { email: clerkEmail, phone: clerkPhone } =
+        await fetchClerkContactInfo(clerkUserId);
+      const updates: Record<string, string | null> = {};
+      if (clerkPhone && clerkPhone !== profile.phone) {
+        updates.phone = clerkPhone;
+      }
+      if (clerkEmail && clerkEmail.toLowerCase() !== (profile.email || "").toLowerCase()) {
+        updates.email = clerkEmail;
+      }
+      if (Object.keys(updates).length > 0) {
+        await supabase
+          .from("profiles")
+          .update(updates)
+          .eq("id", profile.id);
+        Object.assign(profile, updates);
+      }
+    } catch (err) {
+      console.warn("[profiles GET /me] Clerk sync failed (non-fatal):", err);
+    }
+
     const counts = await fetchFollowCounts(supabase, profile.id);
     return c.json({ profile: { ...profile, ...counts } });
   }
@@ -456,21 +494,29 @@ profiles.put("/me/payout-method", clerkMiddleware, async (c) => {
 
   const data = parsed.data;
 
-  // For Stripe, gate-check that onboarding is already complete — otherwise
-  // the seller can't actually receive money via this method. Avoids the UI
-  // letting them "pick Stripe" without first running through AccountLink.
+  // For Stripe, the seller must at least have a Stripe Connect account
+  // before declaring intent — but they don't need to have FINISHED
+  // onboarding yet. The FE flow is:
+  //   1. User picks "Stripe Connect" → FE PATCHes payout_method=stripe
+  //   2. FE then walks them through create-account + onboarding-url
+  //   3. Webhook flips stripe_onboarding_complete=true on success
+  // Blocking step 1 on completed onboarding (the old behaviour) forced
+  // a chicken-and-egg loop where the FE had to remember to PATCH later.
+  // Money flow is still gated separately by resolveSellerPayoutMethod,
+  // which refuses to dispatch a payout until onboarding is complete —
+  // so "set intent now, finish onboarding later" is safe.
   if (data.payout_method === "stripe") {
     const { data: stripeProfile } = await supabase
       .from("profiles")
-      .select("stripe_account_id, stripe_onboarding_complete")
+      .select("stripe_account_id")
       .eq("clerk_id", clerkUserId)
       .single();
 
-    if (!stripeProfile?.stripe_account_id || !stripeProfile.stripe_onboarding_complete) {
+    if (!stripeProfile?.stripe_account_id) {
       return c.json(
         {
           error:
-            "Complete Stripe Connect onboarding before selecting Stripe as your payout method.",
+            "Set up Stripe Connect first. Tap 'Connect with Stripe' to start onboarding.",
         },
         400
       );
@@ -691,5 +737,134 @@ profiles.post("/me/avatar", clerkMiddleware, async (c) => {
 
   return c.json({ avatar_url: updatedProfile.avatar_url });
 });
+
+// ============================================================
+// Payment methods — saved cards for the current buyer
+// ============================================================
+//
+// Cards are attached to the buyer's Stripe Customer at checkout time
+// (see stripe.ts /payment-intent — passes customer + setup_future_usage).
+// These endpoints expose the saved set so:
+//   1. Settings → Payment Methods can list and remove cards
+//   2. PaymentSheet at checkout can render saved cards inline (via the
+//      ephemeral-key endpoint, which gates the customer's tokens to a
+//      single client session without exposing the secret key).
+
+const UUID_REGEX_PAYMENTS =
+  /^pm_[A-Za-z0-9]+$/; // Stripe PaymentMethod id format ("pm_...")
+
+/**
+ * GET /api/profiles/me/payment-methods
+ * Lists the buyer's saved cards. Empty list if no Stripe Customer
+ * exists yet (i.e., they've never checked out).
+ */
+profiles.get("/me/payment-methods", clerkMiddleware, requireProfile, async (c) => {
+  const profile = c.get("profile");
+  if (!profile.stripe_customer_id) {
+    return c.json({ payment_methods: [] });
+  }
+  try {
+    const stripe = getStripeClient();
+    const result = await stripe.paymentMethods.list({
+      customer: profile.stripe_customer_id,
+      type: "card",
+      limit: 20,
+    });
+    const payment_methods = result.data.map((pm) => ({
+      id: pm.id,
+      brand: pm.card?.brand ?? null,
+      last4: pm.card?.last4 ?? null,
+      exp_month: pm.card?.exp_month ?? null,
+      exp_year: pm.card?.exp_year ?? null,
+    }));
+    return c.json({ payment_methods });
+  } catch (err) {
+    console.error("[payment-methods list] Stripe error:", err);
+    return c.json({ error: "Failed to load payment methods" }, 500);
+  }
+});
+
+/**
+ * DELETE /api/profiles/me/payment-methods/:id
+ * Detaches a card from the buyer's Customer. The card is owned by
+ * Stripe, so we can detach but cannot guarantee deletion server-side;
+ * detach is the standard "remove from my account" operation.
+ */
+profiles.delete(
+  "/me/payment-methods/:id",
+  clerkMiddleware,
+  requireProfile,
+  async (c) => {
+    const paymentMethodId = c.req.param("id");
+    if (!UUID_REGEX_PAYMENTS.test(paymentMethodId)) {
+      return c.json({ error: "Invalid payment method ID format" }, 400);
+    }
+    const profile = c.get("profile");
+    if (!profile.stripe_customer_id) {
+      return c.json({ error: "No saved payment methods" }, 404);
+    }
+    try {
+      const stripe = getStripeClient();
+      // Confirm the card belongs to this customer before we detach.
+      // Without this anyone could remove anyone else's card by guessing
+      // a pm_ id.
+      const pm = await stripe.paymentMethods.retrieve(paymentMethodId);
+      if (pm.customer !== profile.stripe_customer_id) {
+        return c.json({ error: "Payment method not found" }, 404);
+      }
+      await stripe.paymentMethods.detach(paymentMethodId);
+      return c.body(null, 204);
+    } catch (err) {
+      const stripeErr = err as { code?: string; statusCode?: number };
+      if (stripeErr?.code === "resource_missing") {
+        return c.json({ error: "Payment method not found" }, 404);
+      }
+      console.error("[payment-methods detach] Stripe error:", err);
+      return c.json({ error: "Failed to remove payment method" }, 500);
+    }
+  }
+);
+
+/**
+ * POST /api/profiles/me/payment-methods/ephemeral-key
+ * Returns a short-lived ephemeral key tied to the buyer's Customer.
+ * The frontend hands this to Stripe's PaymentSheet so it can render
+ * the buyer's saved cards as inline options at checkout — without
+ * the FE ever holding the secret key.
+ *
+ * Lazily creates the Customer on first call so the FE can fetch this
+ * before kicking off a PaymentIntent.
+ */
+profiles.post(
+  "/me/payment-methods/ephemeral-key",
+  clerkMiddleware,
+  requireProfile,
+  async (c) => {
+    const profile = c.get("profile");
+    try {
+      const customerId = await getOrCreateStripeCustomer({
+        id: profile.id,
+        stripe_customer_id: profile.stripe_customer_id,
+        display_name: profile.display_name,
+        email: profile.email,
+      });
+      const stripe = getStripeClient();
+      const key = await stripe.ephemeralKeys.create(
+        { customer: customerId },
+        // Stripe-Version pinned so the client SDK + server agree on
+        // the response schema. Use the same version the rest of the
+        // backend is on (stripeService.ts apiVersion).
+        { apiVersion: "2026-02-25.clover" }
+      );
+      return c.json({
+        customer_id: customerId,
+        ephemeral_key_secret: key.secret,
+      });
+    } catch (err) {
+      console.error("[payment-methods ephemeral-key] Stripe error:", err);
+      return c.json({ error: "Failed to create ephemeral key" }, 500);
+    }
+  }
+);
 
 export default profiles;

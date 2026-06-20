@@ -8,6 +8,7 @@ import {
   LISTING_CONDITIONS,
   LISTING_STATUSES,
   OCCASION_TAGS,
+  CURATION_TAGS,
 } from "../types/listings.js";
 import {
   createNotification,
@@ -809,9 +810,19 @@ const adminUpdateListingSchema = z.object({
   original_price_amount: z.number().int().positive().nullable().optional(),
   negotiable: z.boolean().optional(),
   shipping_info: z.string().max(500).nullable().optional(),
+  // Admin-curated chip tags (Bridal Edit / Designer Edit / Top Picks /
+  // Popular Brands) that drive the buyer-facing curation filter. Strict
+  // enum so a typo can never silently leak into the buyer UI.
+  curation_tags: z
+    .array(z.enum(CURATION_TAGS as unknown as [string, ...string[]]))
+    .optional(),
 });
 
-admin.put("/listings/:id", async (c) => {
+// Shared handler so PUT and PATCH on the same path do the same thing.
+// PATCH is the semantically correct verb for partial updates (which is
+// what this is — every field is optional); admin FE was sending PATCH
+// and getting 404 because we only had PUT registered.
+const adminUpdateListingHandler = async (c: import("hono").Context) => {
   const listingId = c.req.param("id");
   const supabase = createSupabaseAdmin();
 
@@ -846,6 +857,7 @@ admin.put("/listings/:id", async (c) => {
   if (input.original_price_amount !== undefined) updateData.original_price_amount = input.original_price_amount;
   if (input.negotiable !== undefined) updateData.negotiable = input.negotiable;
   if (input.shipping_info !== undefined) updateData.shipping_info = input.shipping_info;
+  if (input.curation_tags !== undefined) updateData.curation_tags = input.curation_tags;
 
   if (Object.keys(updateData).length === 0) {
     return c.json({ error: "No fields to update" }, 400);
@@ -864,7 +876,10 @@ admin.put("/listings/:id", async (c) => {
   }
 
   return c.json({ listing: updated });
-});
+};
+
+admin.put("/listings/:id", adminUpdateListingHandler);
+admin.patch("/listings/:id", adminUpdateListingHandler);
 
 admin.patch("/listings/:id/status", async (c) => {
   const listingId = c.req.param("id");

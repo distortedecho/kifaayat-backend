@@ -5,6 +5,7 @@ import { requireProfile } from "../middleware/requireProfile.js";
 import { getProfileByClerkId } from "../lib/profiles.js";
 import { createSupabaseAdmin } from "../lib/supabase.js";
 import { computeRiskScore } from "../lib/risk-scoring.js";
+import { summarizeZodError } from "../lib/validation.js";
 import {
   LISTING_CATEGORIES,
   LISTING_CONDITIONS,
@@ -390,13 +391,42 @@ listings.post("/", clerkMiddleware, requireProfile, async (c) => {
   const parsed = createListingSchema.safeParse(body);
 
   if (!parsed.success) {
+    const fieldErrors = parsed.error.flatten().fieldErrors;
+    console.warn(
+      `[listings POST] Validation failed:`,
+      JSON.stringify(fieldErrors)
+    );
     return c.json(
-      { error: "Validation failed", details: parsed.error.flatten().fieldErrors },
+      {
+        error: summarizeZodError(parsed.error),
+        details: fieldErrors,
+      },
       400
     );
   }
 
   const input = parsed.data;
+
+  // video_url and video_storage_path must travel together — half-set
+  // means the FE upload pipeline partially failed (e.g. storage upload
+  // worked but URL signing didn't, or vice versa). Refusing the
+  // half-set case prevents a listing that renders a broken video
+  // player. FE should gate the submit button on upload success.
+  if (
+    (input.video_url && !input.video_storage_path) ||
+    (!input.video_url && input.video_storage_path)
+  ) {
+    return c.json(
+      {
+        error: "video_url and video_storage_path must be set together",
+        details: {
+          video_url: input.video_url ? null : ["required when video_storage_path is set"],
+          video_storage_path: input.video_storage_path ? null : ["required when video_url is set"],
+        },
+      },
+      400
+    );
+  }
 
   // Validate category-dependent measurements
   const missingMeasurements = validateMeasurements(
@@ -496,9 +526,16 @@ listings.get("/:id", optionalClerkMiddleware, async (c) => {
     return c.json({ error: "Listing not found" }, 404);
   }
 
-  // If listing is not active, only the seller and any buyer who has ever
-  // placed an order on this listing (any status) can view it. This keeps
-  // sold/deactivated listings reachable from chat threads and order history.
+  // If listing is not active, only specific roles can view it:
+  //   1. The seller (always)
+  //   2. A buyer who has placed an order on this listing (any status) —
+  //      keeps sold/deactivated listings reachable from chat + history
+  //   3. A buyer with an ACCEPTED offer on this listing — they're
+  //      heading to checkout. Without this branch, a buyer who accepted
+  //      a counter-offer (or had their offer accepted), backed out of
+  //      checkout, then re-opened it via the notification would see a
+  //      404 because the listing flipped to 'reserved' on offer accept
+  //      and no order exists yet.
   if (listing.status !== "active") {
     const clerkUserId = c.get("clerkUserId");
     if (!clerkUserId) {
@@ -512,18 +549,30 @@ listings.get("/:id", optionalClerkMiddleware, async (c) => {
     const isSeller = profile.id === listing.seller_id;
 
     let isBuyerWithOrder = false;
+    let isBuyerWithAcceptedOffer = false;
     if (!isSeller) {
-      const { data: buyerOrder } = await createSupabaseAdmin()
-        .from("orders")
-        .select("id")
-        .eq("listing_id", listingId)
-        .eq("buyer_id", profile.id)
-        .limit(1)
-        .maybeSingle();
+      const [{ data: buyerOrder }, { data: acceptedOffer }] = await Promise.all([
+        createSupabaseAdmin()
+          .from("orders")
+          .select("id")
+          .eq("listing_id", listingId)
+          .eq("buyer_id", profile.id)
+          .limit(1)
+          .maybeSingle(),
+        createSupabaseAdmin()
+          .from("offers")
+          .select("id")
+          .eq("listing_id", listingId)
+          .eq("buyer_id", profile.id)
+          .eq("status", "accepted")
+          .limit(1)
+          .maybeSingle(),
+      ]);
       isBuyerWithOrder = !!buyerOrder;
+      isBuyerWithAcceptedOffer = !!acceptedOffer;
     }
 
-    if (!isSeller && !isBuyerWithOrder) {
+    if (!isSeller && !isBuyerWithOrder && !isBuyerWithAcceptedOffer) {
       return c.json({ error: "Listing not found" }, 404);
     }
   }
@@ -623,8 +672,16 @@ listings.put("/:id", clerkMiddleware, requireProfile, async (c) => {
   const parsed = updateListingSchema.safeParse(body);
 
   if (!parsed.success) {
+    const fieldErrors = parsed.error.flatten().fieldErrors;
+    console.warn(
+      `[listings PATCH ${listingId}] Validation failed:`,
+      JSON.stringify(fieldErrors)
+    );
     return c.json(
-      { error: "Validation failed", details: parsed.error.flatten().fieldErrors },
+      {
+        error: summarizeZodError(parsed.error),
+        details: fieldErrors,
+      },
       400
     );
   }
@@ -658,6 +715,32 @@ listings.put("/:id", clerkMiddleware, requireProfile, async (c) => {
             sub_category: [
               "sub_category is not valid for this category. Either omit it or pick one from the category's allowed list.",
             ],
+          },
+        },
+        400
+      );
+    }
+  }
+
+  // Same paired-field rule as the create path: video_url and
+  // video_storage_path must be set together OR cleared together
+  // (both null), never one without the other. Only check when either
+  // field is being touched by this PATCH; otherwise the existing row
+  // is already consistent.
+  if (input.video_url !== undefined || input.video_storage_path !== undefined) {
+    const nextUrl =
+      input.video_url !== undefined ? input.video_url : (existing.video_url as string | null);
+    const nextPath =
+      input.video_storage_path !== undefined
+        ? input.video_storage_path
+        : (existing.video_storage_path as string | null);
+    if ((nextUrl && !nextPath) || (!nextUrl && nextPath)) {
+      return c.json(
+        {
+          error: "video_url and video_storage_path must be set together",
+          details: {
+            video_url: nextUrl ? null : ["required when video_storage_path is set"],
+            video_storage_path: nextPath ? null : ["required when video_url is set"],
           },
         },
         400

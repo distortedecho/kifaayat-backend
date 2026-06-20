@@ -13,6 +13,8 @@ export interface ProfileBase {
   stripe_account_id: string | null;
   stripe_onboarding_complete: boolean;
   location: string | null;
+  email: string | null;
+  stripe_customer_id: string | null;
 }
 
 /**
@@ -27,7 +29,7 @@ export async function getProfileByClerkId(
   const { data, error } = await supabase
     .from("profiles")
     .select(
-      "id, profile_complete, is_admin, display_name, avatar_url, stripe_account_id, stripe_onboarding_complete, location"
+      "id, profile_complete, is_admin, display_name, avatar_url, stripe_account_id, stripe_onboarding_complete, location, email, stripe_customer_id"
     )
     .eq("clerk_id", clerkUserId)
     .single();
