@@ -46,6 +46,7 @@ interface CliArgs {
   bundleMetadata: string | null;
   photosFolder: string;
   testMode: boolean;
+  seedAll: boolean;
   targetListings: number;
   dryRun: boolean;
   bucket: string;
@@ -57,6 +58,7 @@ function parseArgs(): CliArgs {
   let bundleMetadata: string | null = null;
   let photosFolder = "./sample-da";
   let testMode = false;
+  let seedAll = false;
   let targetListings = 25;
   let dryRun = true; // safe default
   let bucket = "listing-photos";
@@ -67,6 +69,7 @@ function parseArgs(): CliArgs {
     if (a === "--bundle-metadata") bundleMetadata = args[++i];
     else if (a === "--photos-folder") photosFolder = args[++i];
     else if (a === "--test") testMode = true;
+    else if (a === "--seed-all") seedAll = true;
     else if (a === "--target-listings") targetListings = parseInt(args[++i], 10);
     else if (a === "--commit") dryRun = false;
     else if (a === "--dry-run") dryRun = true;
@@ -92,6 +95,7 @@ function parseArgs(): CliArgs {
     bundleMetadata,
     photosFolder: resolve(process.cwd(), photosFolder),
     testMode,
+    seedAll,
     targetListings,
     dryRun,
     bucket,
@@ -105,6 +109,7 @@ Usage: tsx scripts/migrate-photos.ts [options]
 
 Modes:
   Test:        --test --target-listings <N>
+  Seed-all:    --seed-all --photos-folder <dir>   (every migrated listing gets all images in dir)
   Production:  --bundle-metadata <path>
 
 Common options:
@@ -360,6 +365,149 @@ async function runTestMode(args: CliArgs): Promise<void> {
 }
 
 // ============================================================
+// SEED-ALL mode — give EVERY migrated listing the same placeholder set
+// ============================================================
+//
+// Uploads the placeholder images in --photos-folder (Megha's 3) to
+// storage ONCE, then points every migrated listing's listing_photos
+// rows at those same shared URLs. This is the efficient design: 3 file
+// uploads + DB-only inserts, instead of physically re-uploading the
+// same 3 files once per listing (30k+ redundant copies).
+//
+// Idempotency: a listing is skipped entirely if it already has any
+// 'product' photo — so re-running is safe AND we never clobber real
+// photos uploaded later at cutover.
+//
+// Paginates by created_at to handle the full ~10k migrated set without
+// hitting Supabase's 1000-row query cap.
+
+async function runSeedAllMode(args: CliArgs): Promise<void> {
+  const supabase = createSupabaseAdmin();
+  const photoFiles = listPhotoFiles(args.photosFolder);
+  if (photoFiles.length === 0) {
+    console.error(`No placeholder images found in ${args.photosFolder}`);
+    process.exit(1);
+  }
+
+  // Read + upload each placeholder ONCE to a shared path. Reused by
+  // every listing via its public URL.
+  const shared: Array<{ url: string; storagePath: string; position: number }> = [];
+  for (let i = 0; i < photoFiles.length; i++) {
+    const filename = basename(photoFiles[i]);
+    const buffer = readFileSync(`${args.photosFolder}/${filename}`);
+    const detected = detectContentType(buffer);
+    if (detected.contentType === "application/octet-stream") {
+      console.error(`Skipping ${filename}: unrecognised binary type`);
+      continue;
+    }
+    const base = filename.includes(".")
+      ? filename.substring(0, filename.lastIndexOf("."))
+      : filename;
+    const storagePath = `placeholders/${base}.${detected.extension}`;
+
+    if (args.dryRun) {
+      console.log(`  [dry-run] would upload shared placeholder → ${storagePath}`);
+    } else {
+      const { error: upErr } = await supabase.storage
+        .from(args.bucket)
+        .upload(storagePath, buffer, {
+          contentType: detected.contentType,
+          upsert: true, // shared file — overwrite is fine, idempotent
+        });
+      if (upErr && !upErr.message?.includes("exists")) {
+        console.error(`Failed to upload shared placeholder ${filename}: ${upErr.message}`);
+        process.exit(1);
+      }
+    }
+    const { data: urlData } = supabase.storage
+      .from(args.bucket)
+      .getPublicUrl(storagePath);
+    shared.push({ url: urlData.publicUrl, storagePath, position: i });
+  }
+
+  console.log(
+    `SEED-ALL MODE — ${shared.length} shared placeholder(s) → every migrated listing without photos\n` +
+      `  shared paths: ${shared.map((s) => s.storagePath).join(", ")}`
+  );
+
+  let processed = 0;
+  let seeded = 0;
+  let skipped = 0;
+  const PAGE = 1000;
+  let cursor: string | null = null;
+
+  for (;;) {
+    let q = supabase
+      .from("listings")
+      .select("id, created_at")
+      .not("legacy_sharetribe_id", "is", null)
+      .order("created_at", { ascending: true })
+      .limit(PAGE);
+    if (cursor) q = q.gt("created_at", cursor);
+
+    const { data: page, error } = await q;
+    if (error) {
+      console.error("Failed to fetch listings page:", error);
+      process.exit(1);
+    }
+    if (!page || page.length === 0) break;
+
+    const pageIds = page.map((l) => l.id as string);
+
+    // One query per page: which of these listings already have a
+    // product photo? Those get skipped (don't clobber real photos /
+    // don't double-seed on re-run).
+    const { data: existingRows } = await supabase
+      .from("listing_photos")
+      .select("listing_id")
+      .in("listing_id", pageIds)
+      .eq("photo_type", "product");
+    const havePhotos = new Set(
+      (existingRows ?? []).map((r) => r.listing_id as string)
+    );
+
+    // Build all rows for listings that need seeding, insert in one shot.
+    const rows: Array<Record<string, unknown>> = [];
+    for (const id of pageIds) {
+      if (havePhotos.has(id)) {
+        skipped += 1;
+        continue;
+      }
+      for (const s of shared) {
+        rows.push({
+          listing_id: id,
+          storage_path: s.storagePath,
+          url: s.url,
+          position: s.position,
+          photo_type: args.photoType,
+        });
+      }
+      seeded += 1;
+    }
+
+    if (rows.length > 0 && !args.dryRun) {
+      const { error: insErr } = await supabase.from("listing_photos").insert(rows);
+      if (insErr) {
+        console.error("Failed to insert listing_photos batch:", insErr);
+        process.exit(1);
+      }
+    }
+
+    processed += page.length;
+    cursor = page[page.length - 1].created_at as string;
+    console.log(
+      `  …${processed} listings scanned (seeded=${seeded}, skipped=${skipped})`
+    );
+
+    if (page.length < PAGE) break;
+  }
+
+  console.log(
+    `\nDone. ${processed} migrated listings scanned — ${seeded} seeded with placeholders, ${skipped} already had photos.`
+  );
+}
+
+// ============================================================
 // PRODUCTION mode — match by UUID against bundle metadata
 // ============================================================
 
@@ -530,7 +678,9 @@ async function main(): Promise<void> {
   const args = parseArgs();
   console.log(args.dryRun ? "DRY RUN — no uploads" : "COMMIT MODE — uploading to Supabase");
 
-  if (args.testMode) {
+  if (args.seedAll) {
+    await runSeedAllMode(args);
+  } else if (args.testMode) {
     await runTestMode(args);
   } else {
     await runProductionMode(args);

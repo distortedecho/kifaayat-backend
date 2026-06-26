@@ -62,6 +62,7 @@ const createListingSchema = z.object({
       age_range: z.string().optional(),
       height: z.string().optional(),
     })
+    .nullable()
     .optional(),
   occasion_tags: z
     .array(z.enum(OCCASION_TAGS as unknown as [string, ...string[]]))
@@ -134,6 +135,7 @@ const updateListingSchema = z.object({
       age_range: z.string().optional(),
       height: z.string().optional(),
     })
+    .nullable()
     .optional(),
   occasion_tags: z
     .array(z.enum(OCCASION_TAGS as unknown as [string, ...string[]]))

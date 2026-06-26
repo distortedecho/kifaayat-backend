@@ -8,6 +8,8 @@ import { createNotification, welcomeBackNotification } from "../lib/notification
 import {
   getStripeClient,
   getOrCreateStripeCustomer,
+  createExpressAccount,
+  StripeServiceError,
 } from "../services/stripeService.js";
 
 const profiles = new Hono();
@@ -402,6 +404,27 @@ profiles.put("/me", clerkMiddleware, async (c) => {
 
   const updateData = parsed.data;
 
+  // Keep currency in lockstep with country. When the user changes their
+  // location and doesn't explicitly send a currency, derive it from the
+  // new country (AU→AUD, GB→GBP, etc). Without this, currency stayed
+  // stale on a country change — a UK seller could end up listing items
+  // priced in AUD and mismatched against their GBP payout account.
+  // An explicit currency in the request still wins (lets a user override
+  // if they ever genuinely want a different display currency).
+  const COUNTRY_TO_CURRENCY: Record<string, string> = {
+    AU: "AUD",
+    US: "USD",
+    NZ: "NZD",
+    CA: "CAD",
+    GB: "GBP",
+  };
+  if (updateData.location && updateData.currency === undefined) {
+    const derived = COUNTRY_TO_CURRENCY[updateData.location];
+    if (derived) {
+      (updateData as { currency?: string }).currency = derived;
+    }
+  }
+
   // Check if profile is complete (all required fields present)
   // Required for selling: display_name, avatar_url, location, size_preferences
   const { data: existingProfile } = await supabase
@@ -494,32 +517,46 @@ profiles.put("/me/payout-method", clerkMiddleware, async (c) => {
 
   const data = parsed.data;
 
-  // For Stripe, the seller must at least have a Stripe Connect account
-  // before declaring intent — but they don't need to have FINISHED
-  // onboarding yet. The FE flow is:
-  //   1. User picks "Stripe Connect" → FE PATCHes payout_method=stripe
-  //   2. FE then walks them through create-account + onboarding-url
-  //   3. Webhook flips stripe_onboarding_complete=true on success
-  // Blocking step 1 on completed onboarding (the old behaviour) forced
-  // a chicken-and-egg loop where the FE had to remember to PATCH later.
-  // Money flow is still gated separately by resolveSellerPayoutMethod,
-  // which refuses to dispatch a payout until onboarding is complete —
-  // so "set intent now, finish onboarding later" is safe.
+  // For Stripe, auto-create the Connect account here if the seller
+  // doesn't have one yet. This is the key fix for the "I had PayPal set
+  // up, then tried Stripe and it didn't work" case: a PayPal-only seller
+  // has no stripe_account_id, and the old code 400'd telling them to
+  // "set up Stripe first" — a chicken-and-egg dead end. Now picking
+  // Stripe as the payout method provisions the account on the spot, so
+  // the FE can go straight to onboarding-url next.
+  //
+  // Onboarding does NOT need to be complete to declare intent — money
+  // flow is gated separately by resolveSellerPayoutMethod, which refuses
+  // to dispatch a payout until onboarding finishes. So "set intent now,
+  // finish onboarding later" is safe.
   if (data.payout_method === "stripe") {
     const { data: stripeProfile } = await supabase
       .from("profiles")
-      .select("stripe_account_id")
+      .select("id, stripe_account_id, location")
       .eq("clerk_id", clerkUserId)
       .single();
 
-    if (!stripeProfile?.stripe_account_id) {
-      return c.json(
-        {
-          error:
-            "Set up Stripe Connect first. Tap 'Connect with Stripe' to start onboarding.",
-        },
-        400
-      );
+    if (!stripeProfile) {
+      return c.json({ error: "Profile not found" }, 404);
+    }
+
+    if (!stripeProfile.stripe_account_id) {
+      try {
+        // Idempotent + persists stripe_account_id on the row. Throws a
+        // StripeServiceError(400) if the profile has no country set —
+        // Stripe Connect accounts are pinned to a country at creation.
+        await createExpressAccount({
+          id: stripeProfile.id as string,
+          stripe_account_id: null,
+          location: stripeProfile.location as string | null,
+        });
+      } catch (err) {
+        if (err instanceof StripeServiceError) {
+          return c.json({ error: err.message }, err.status as 400 | 500);
+        }
+        console.error("Error auto-creating Stripe account in payout-method:", err);
+        return c.json({ error: "Failed to set up Stripe Connect" }, 500);
+      }
     }
   }
 
@@ -866,5 +903,110 @@ profiles.post(
     }
   }
 );
+
+/**
+ * DELETE /api/profiles/me
+ * Account deletion (soft-delete). Required by Apple + Google for any
+ * app that allows account creation.
+ *
+ * Flow:
+ *   1. Refuse if the user has any in-flight order (paid/shipped/
+ *      delivered) as buyer OR seller — money/goods are mid-transit and
+ *      must be resolved first.
+ *   2. Soft-delete: stamp deleted_at, anonymise all PII + payout fields,
+ *      null clerk_id so the dead profile can't be re-authed or
+ *      re-claimed by email.
+ *   3. Deactivate their active listings so nothing stays buyable.
+ *   4. Delete the Clerk user so they can't log back in. A fresh signup
+ *      later creates a brand-new profile.
+ *
+ * Transactional records (orders, reviews) are intentionally preserved —
+ * the counterparties' history must stay intact.
+ */
+profiles.delete("/me", clerkMiddleware, requireProfile, async (c) => {
+  const clerkUserId = c.get("clerkUserId");
+  const profile = c.get("profile");
+  const supabase = createSupabaseAdmin();
+
+  // 1. Block deletion while any order is mid-flight (as buyer or seller).
+  // 'complete' and 'cancelled' are terminal and don't block.
+  const IN_FLIGHT = ["paid", "shipped", "delivered"];
+  const { data: activeOrders, error: orderErr } = await supabase
+    .from("orders")
+    .select("id, status")
+    .or(`buyer_id.eq.${profile.id},seller_id.eq.${profile.id}`)
+    .in("status", IN_FLIGHT)
+    .limit(1);
+
+  if (orderErr) {
+    console.error("[delete account] order check failed:", orderErr);
+    return c.json({ error: "Failed to verify account state" }, 500);
+  }
+  if (activeOrders && activeOrders.length > 0) {
+    return c.json(
+      {
+        error:
+          "You have an order in progress. Please complete or cancel it before deleting your account.",
+      },
+      409
+    );
+  }
+
+  // 2. Soft-delete + anonymise. Null clerk_id and email so neither the
+  // login path nor the legacy email-claim can ever re-attach this row.
+  const now = new Date().toISOString();
+  const { error: updateErr } = await supabase
+    .from("profiles")
+    .update({
+      deleted_at: now,
+      clerk_id: null,
+      email: null,
+      display_name: "Deleted User",
+      avatar_url: null,
+      phone: null,
+      bio: null,
+      // Payout PII — never leave bank / payout identifiers on a dead row.
+      paypal_email: null,
+      wise_account_holder: null,
+      wise_account_number: null,
+      wise_routing_code: null,
+      stripe_customer_id: null,
+      // Mark them incomplete so any residual UI treats them as gone.
+      profile_complete: false,
+    })
+    .eq("id", profile.id);
+
+  if (updateErr) {
+    console.error("[delete account] soft-delete update failed:", updateErr);
+    return c.json({ error: "Failed to delete account" }, 500);
+  }
+
+  // 3. Deactivate active/reserved listings so nothing stays buyable.
+  // Sold/completed listings stay as-is for order history.
+  await supabase
+    .from("listings")
+    .update({ status: "deactivated" })
+    .eq("seller_id", profile.id)
+    .in("status", ["active", "reserved"]);
+
+  // 4. Delete the Clerk user. Best-effort — the profile is already
+  // anonymised + detached, so even if Clerk deletion fails the user
+  // can't reach their old data. Log loudly so it can be cleaned up.
+  try {
+    const { createClerkClient } = await import("@clerk/backend");
+    const clerk = createClerkClient({
+      secretKey: process.env.CLERK_SECRET_KEY || "",
+    });
+    await clerk.users.deleteUser(clerkUserId);
+  } catch (err) {
+    console.error(
+      `[delete account] Clerk user deletion failed for ${clerkUserId} (profile already anonymised):`,
+      err instanceof Error ? err.message : String(err)
+    );
+  }
+
+  console.log(`[delete account] profile=${profile.id} soft-deleted`);
+  return c.json({ deleted: true });
+});
 
 export default profiles;

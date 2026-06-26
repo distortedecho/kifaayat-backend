@@ -16,17 +16,6 @@ export interface AIField<T> {
 }
 
 /**
- * Per-photo quality assessment from AI analysis
- */
-export interface PhotoQualityAssessment {
-  index: number;
-  is_blurry: boolean;
-  is_dark: boolean;
-  quality_score: number; // 0-100
-  issues: string[];
-}
-
-/**
  * AI analysis response — structured fields with confidence scores
  */
 export interface AIAnalysisResponse {
@@ -43,7 +32,6 @@ export interface AIAnalysisResponse {
   occasion_tags?: AIField<string[]>;
 
   // v2 fields — additive, all optional for backward compatibility
-  photo_quality?: AIField<PhotoQualityAssessment[]>;
   designer_name?: AIField<string | null>;
   fabric_types?: AIField<string[]>;
   work_types?: AIField<string[]>;

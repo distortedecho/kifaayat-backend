@@ -106,13 +106,12 @@ describe("POST /api/ai/analyze", () => {
     expect(body.suggested_price).toBeDefined();
     expect(body.condition).toBeDefined();
     expect(body.colors).toBeDefined();
-    expect(body.occasion_tags).toBeDefined();
 
-    // v2 fields
-    expect(body.photo_quality).toBeDefined();
-    expect(body.photo_quality.value).toHaveLength(1);
-    expect(body.photo_quality.value[0].quality_score).toBe(92);
-    expect(body.photo_quality.value[0].is_blurry).toBe(false);
+    // occasion_tags and photo_quality are intentionally NOT surfaced —
+    // no FE UI consumes them and photo_quality was the biggest output
+    // chunk on the latency-critical path (see routes/ai.ts).
+    expect(body.occasion_tags).toBeUndefined();
+    expect(body.photo_quality).toBeUndefined();
 
     expect(body.designer_name).toBeDefined();
     expect(body.designer_name.value).toBe("Sabyasachi Mukherjee");

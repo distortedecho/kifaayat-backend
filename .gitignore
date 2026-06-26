@@ -33,11 +33,16 @@ rawdata_synthetic_new.json
 designer_full_export.csv
 designer_full_export.json
 
-# Database dumps (real prod data, never commit)
-/main_data.sql
-/old_db_dump.sql
+# Database dumps (real prod data, never commit). Anchored to repo root
+# so pg_dump output (data.sql, full-backup.sql, roles.sql, schema.sql,
+# main_data.sql, old_db_dump.sql) is ignored WITHOUT touching the
+# tracked schema files under src/db/.
+/*.sql
 *.sql.bak
 *.sql.dump
+
+# Client-provided Sharetribe field-mapping reference (PDFs/exports)
+sharetribe-data/
 
 # Photo samples / bundles (binary, large)
 sample-da/

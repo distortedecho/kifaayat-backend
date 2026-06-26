@@ -10,7 +10,6 @@ import { logError, type MigrationContext } from "./context.js";
 import {
   buildMeasurementsJsonb,
   cleanDesigner,
-  coerceToStringArray,
   dollarsToCents,
   extractCurationTags,
   extractItemsIncluded,
@@ -18,7 +17,12 @@ import {
   isRentalListing,
   mapCategory,
   mapCondition,
+  mapColours,
+  mapCountryOfOrigin,
+  mapDryCleaningStatus,
+  mapFabricTypes,
   mapListingState,
+  mapOccasionTags,
   mapSize,
   sanitizeCents,
 } from "./mappings.js";
@@ -149,9 +153,12 @@ export async function importListings(
         size_type: size.size_type,
         estimated_size: size.estimated_size,
         designer_name: designer,
-        country_of_origin: (pub.country as string | undefined) ?? null,
-        dry_cleaning_status: (pub.dryCleaningStatus as string | undefined) ?? null,
-        fabric_types: coerceToStringArray(pub.fabric),
+        // Slug → display-label mapping (see mappings.ts). Was previously
+        // stored raw, which surfaced "india" / "net" / camelCase
+        // dry-clean slugs in the UI.
+        country_of_origin: mapCountryOfOrigin(pub.country),
+        dry_cleaning_status: mapDryCleaningStatus(pub.dryCleaningStatus),
+        fabric_types: mapFabricTypes(pub.fabric),
         // Folds loose bustinches/hipsinches/waistinch/lengthinches into
         // the structured measurements JSONB alongside publicData.measurements.
         // Pass the object directly — postgres-js handles JSONB serialization.
@@ -171,10 +178,11 @@ export async function importListings(
         share_count: shareCount,
         curation_tags: extractCurationTags(pub),
         legacy_product_type: extractLegacyProductType(pub),
-        occasion_tags: coerceToStringArray(pub.Occasion),
-        // `colour` is stored as a single string in Sharetribe — coerce
-        // to a one-element array for our TEXT[] column.
-        colors: coerceToStringArray(pub.colour),
+        // Slug → label maps; unmapped values dropped (see mappings.ts).
+        occasion_tags: mapOccasionTags(pub.Occasion),
+        // `colour` is a single slug in Sharetribe; mapColours title-cases
+        // it and returns a one-element array for our TEXT[] column.
+        colors: mapColours(pub.colour),
         legacy_sharetribe_id: l.id,
         legacy_numeric_id: legacyNumericId,
         created_at: a.createdAt,

@@ -140,14 +140,29 @@ search.get("/", optionalClerkMiddleware, async (c) => {
 
   // Parse query params
   const q = c.req.query("q")?.trim() || "";
-  const category = c.req.query("category");
+  // category and size are comma-separated multi-select (e.g.
+  // ?category=Lehenga,Saree&size=UK8 / US4 / AU8,Free Size). The size
+  // labels themselves contain " / " but never commas, so splitting on
+  // comma is safe. A buyer who'd accept several sizes/categories picks
+  // them all and we match any (.in()). Single value still works — it
+  // just becomes a one-element array.
+  const categoryRaw = c.req.query("category");
+  const categories = categoryRaw
+    ? categoryRaw.split(",").map((s) => s.trim()).filter(Boolean)
+    : [];
+  // Kept for sub_category pairing + Budget-Friendly median lookup, which
+  // only make sense with a single category. Null when 0 or 2+ selected.
+  const category = categories.length === 1 ? categories[0] : undefined;
   const subCategory = c.req.query("sub_category");
   const condition = c.req.query("condition");
   const occasion = c.req.query("occasion"); // comma-separated
   const color = c.req.query("color"); // comma-separated
   const location = c.req.query("location");
   const market = c.req.query("market"); // AU, US, NZ -- filters by seller location
-  const size = c.req.query("size");
+  const sizeRaw = c.req.query("size");
+  const sizes = sizeRaw
+    ? sizeRaw.split(",").map((s) => s.trim()).filter(Boolean)
+    : [];
   const priceMinStr = c.req.query("price_min");
   const priceMaxStr = c.req.query("price_max");
   const sort = c.req.query("sort") || (q ? "relevance" : "newest");
@@ -159,26 +174,26 @@ search.get("/", optionalClerkMiddleware, async (c) => {
   //   "Budget Friendly" → computed via price < category_median * 0.6
   const curation = c.req.query("curation");
 
-  // Validate filter values
-  if (
-    category &&
-    !LISTING_CATEGORIES.includes(category as (typeof LISTING_CATEGORIES)[number])
-  ) {
-    return c.json({ error: "Invalid category filter" }, 400);
+  // Validate filter values — every category in the multi-select must be
+  // a known one.
+  const invalidCategory = categories.find(
+    (cat) => !LISTING_CATEGORIES.includes(cat as (typeof LISTING_CATEGORIES)[number])
+  );
+  if (invalidCategory) {
+    return c.json({ error: `Invalid category filter: ${invalidCategory}` }, 400);
   }
-  // sub_category must always be paired with a category in the same
-  // request — the FE filter sheet only surfaces sub-categories once a
-  // parent is picked, so receiving sub_category alone signals a stale
-  // or malformed query. Validate the pair against the same vocabulary
-  // the listings endpoints use.
+  // sub_category only makes sense paired with EXACTLY ONE category — the
+  // FE filter sheet only surfaces sub-categories after a single parent is
+  // picked. Reject if sub_category is sent with zero or multiple
+  // categories (stale/malformed query).
   if (subCategory) {
-    if (!category) {
+    if (categories.length !== 1) {
       return c.json(
-        { error: "sub_category requires a category to be specified" },
+        { error: "sub_category requires exactly one category to be specified" },
         400
       );
     }
-    if (!isValidSubCategoryPair(category, subCategory)) {
+    if (!isValidSubCategoryPair(category!, subCategory)) {
       return c.json({ error: "Invalid sub_category for this category" }, 400);
     }
   }
@@ -194,8 +209,9 @@ search.get("/", optionalClerkMiddleware, async (c) => {
   if (market && !["AU", "US", "NZ", "CA", "GB"].includes(market)) {
     return c.json({ error: "Invalid market filter" }, 400);
   }
-  if (size && !VALID_SIZES.includes(size)) {
-    return c.json({ error: "Invalid size filter" }, 400);
+  const invalidSize = sizes.find((s) => !VALID_SIZES.includes(s));
+  if (invalidSize) {
+    return c.json({ error: `Invalid size filter: ${invalidSize}` }, 400);
   }
   if (!["newest", "price_asc", "price_desc", "relevance"].includes(sort)) {
     return c.json({ error: "Invalid sort option" }, 400);
@@ -275,8 +291,10 @@ search.get("/", optionalClerkMiddleware, async (c) => {
   }
 
   // --- Apply filters ---
-  if (category) {
-    query = query.eq("category", category);
+  // Multi-select: match any of the chosen categories. Single value
+  // collapses to a one-element .in() which behaves like .eq().
+  if (categories.length > 0) {
+    query = query.in("category", categories);
   }
 
   if (subCategory) {
@@ -344,9 +362,15 @@ search.get("/", optionalClerkMiddleware, async (c) => {
     query = query.lte("price_amount", priceMax);
   }
 
-  // Size filter: uses the standardized estimated_size column
-  if (size && size !== "Free Size" && size !== "Free size") {
-    query = query.eq("estimated_size", size);
+  // Size filter: multi-select on the standardized estimated_size column.
+  // "Free Size" / "Free size" are excluded from the DB filter because
+  // they're catch-all labels that shouldn't constrain results — keep the
+  // original single-value behaviour, just applied across the array.
+  const sizesToFilter = sizes.filter(
+    (s) => s !== "Free Size" && s !== "Free size"
+  );
+  if (sizesToFilter.length > 0) {
+    query = query.in("estimated_size", sizesToFilter);
   }
 
   // Location filter: explicit user choice (e.g. "show me only AU sellers") —
@@ -560,7 +584,7 @@ search.get("/", optionalClerkMiddleware, async (c) => {
       await supabase.from("search_queries").insert({
         term: q || "",
         user_id: userId,
-        filters: { category, condition, occasion, size, market },
+        filters: { categories, condition, occasion, sizes, market },
         result_count: items.length,
       });
     } catch {

@@ -18,7 +18,6 @@ import type {
   AIAnalysisResponse,
   AIField,
   AIErrorResponse,
-  PhotoQualityAssessment,
 } from "../types/ai.js";
 
 const ai = new Hono();
@@ -128,9 +127,17 @@ const AI_CACHE_TTL_MS = 60 * 60 * 1000;
 const aiCache = new Map<string, { result: AIAnalysisResponse; expiry: number }>();
 
 function getCacheKey(photos: string[]): string {
+  // Hash the entire base64 payload. The previous "first 1000 chars only"
+  // approach silently collided whenever two photos went through the same
+  // encoding pipeline (e.g. both downloaded from the Kifaayat image CDN)
+  // because the leading bytes of a JPEG are quant tables / Huffman
+  // tables / SOF0 dimensions — all identical for any two images at the
+  // same resolution + quality. Different outfits, same cache key, same
+  // returned AI result. SHA-256 over the full payload is fast (<10ms for
+  // a 500KB string) and eliminates the collision class entirely.
   const hash = crypto.createHash("sha256");
   for (const p of photos) {
-    hash.update(p.slice(0, 1000));
+    hash.update(p);
     hash.update("|");
   }
   return hash.digest("hex");
@@ -294,12 +301,6 @@ Return a JSON object with these fields:
 - condition_confidence: confidence score 0-100
 - colors: array of 1-4 dominant colors from [${PRIMARY_COLOURS.join(", ")}]
 - colors_confidence: confidence score 0-100
-- photo_quality: array of objects for each photo, each with:
-  - index: photo index (0-based)
-  - is_blurry: boolean (true if image appears out of focus or motion-blurred)
-  - is_dark: boolean (true if image is underexposed or poorly lit)
-  - quality_score: 0-100 (100 = excellent, crisp, well-lit)
-  - issues: array of strings describing quality problems (e.g., "image is too dark", "image appears blurry/out of focus", "image has poor lighting")
 - designer_name: detected or suggested designer name (string or null if not recognizable). Look for labels, tags, distinctive styles.
 - designer_name_confidence: confidence score 0-100
 - fabric_types: array of detected fabric types from this list: [${FABRIC_TYPES.join(", ")}]
@@ -322,6 +323,13 @@ Return valid JSON only, no markdown formatting.`;
           config: {
             responseMimeType: "application/json",
             temperature: 0.2,
+            // gemini-2.5-flash is a thinking model — by default it runs a
+            // dynamic internal reasoning pass before answering, which adds
+            // several seconds of latency. This endpoint is pure structured
+            // extraction from an image (no multi-step reasoning needed), so
+            // we disable thinking entirely. Typically 2-4x faster with no
+            // measurable quality loss for this task.
+            thinkingConfig: { thinkingBudget: 0 },
           },
         });
         return result.text ?? "";
@@ -428,16 +436,6 @@ function mapGeminiResponse(raw: Record<string, unknown>): AIAnalysisResponse {
     .filter((c: string) => (PRIMARY_COLOURS as readonly string[]).includes(c))
     .slice(0, 4);
 
-  // Parse photo quality assessments
-  const rawPhotoQuality = Array.isArray(raw.photo_quality) ? raw.photo_quality : [];
-  const photoQuality: PhotoQualityAssessment[] = rawPhotoQuality.map((pq: any, i: number) => ({
-    index: typeof pq?.index === "number" ? pq.index : i,
-    is_blurry: pq?.is_blurry === true,
-    is_dark: pq?.is_dark === true,
-    quality_score: toConfidence(pq?.quality_score),
-    issues: Array.isArray(pq?.issues) ? pq.issues.map(String) : [],
-  }));
-
   // Validate fabric types
   const rawFabricTypes = Array.isArray(raw.fabric_types) ? raw.fabric_types : [];
   const validFabricTypes = rawFabricTypes
@@ -488,12 +486,11 @@ function mapGeminiResponse(raw: Record<string, unknown>): AIAnalysisResponse {
       confidence: validColors.length > 0 ? toConfidence(raw.colors_confidence) : 0,
     },
     // occasion_tags removed from response — no FE UI accepts them yet.
+    // photo_quality removed — FE doesn't render blur/dark warnings, and
+    // the nested per-photo array was the single biggest chunk of output
+    // tokens on the latency-critical path. Drop it to speed up analyze.
 
     // v2 fields
-    photo_quality: {
-      value: photoQuality,
-      confidence: photoQuality.length > 0 ? toConfidence(raw.photo_quality_confidence ?? 80) : 0,
-    },
     designer_name: {
       value: raw.designer_name != null ? String(raw.designer_name) : null,
       confidence: toConfidence(raw.designer_name_confidence),

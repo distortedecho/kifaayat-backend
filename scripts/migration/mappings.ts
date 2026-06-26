@@ -172,15 +172,28 @@ export function mapSize(publicData: Record<string, unknown>): MappedSize {
   const mensB = publicData.estimateMenSSizeAu as string | undefined; // typo'd field
   const footwear = publicData.footwearSizeAu as string | undefined;
 
+  // Each branch maps the raw slug (AU number / size-letter) to the
+  // combined display label the new app expects. Unmapped slugs fall to
+  // null estimated_size rather than storing the bare "8" / "large".
   if (footwear) {
-    return { size_type: "footwear", estimated_size: footwear };
+    return {
+      size_type: "footwear",
+      estimated_size: lookupLabel(footwear, FOOTWEAR_SIZE_MAP),
+    };
   }
   // Merge both menswear keys — the typo'd field stored the same thing.
-  if (mensA || mensB) {
-    return { size_type: "menswear_kidswear", estimated_size: mensA ?? mensB ?? null };
+  const mens = mensA ?? mensB;
+  if (mens) {
+    return {
+      size_type: "menswear_kidswear",
+      estimated_size: lookupLabel(mens, MENS_SIZE_MAP),
+    };
   }
   if (womens) {
-    return { size_type: "womens", estimated_size: womens };
+    return {
+      size_type: "womens",
+      estimated_size: lookupLabel(womens, WOMENS_SIZE_MAP),
+    };
   }
   return { size_type: null, estimated_size: null };
 }
@@ -424,8 +437,11 @@ export function extractItemsIncluded(
 ): string[] {
   const merged = new Set<string>();
   for (const key of ["lehengaitems", "salwaritemsincluded", "sareeitems"]) {
-    const v = publicData[key];
-    for (const t of coerceToStringArray(v)) merged.add(t);
+    // Map each slug to its display label (e.g. "lehengaskirt" →
+    // "Lehenga skirt"); unmapped slugs are dropped by lookupLabels.
+    for (const label of lookupLabels(publicData[key], ITEMS_INCLUDED_MAP)) {
+      merged.add(label);
+    }
   }
   return Array.from(merged);
 }
@@ -450,6 +466,215 @@ export function coerceToStringArray(value: unknown): string[] {
     return [value.trim()].filter((v) => v.length > 0);
   }
   return [];
+}
+
+// ============================================================
+// Sharetribe option-key → display-label maps
+// ============================================================
+//
+// Sharetribe select fields store the option KEY (a slug), not the
+// label. The new app renders the label. Without translation, listings
+// showed raw slugs ("net", "lehengaskirt", "dryCleanedOver1MonthAgo").
+// Keys below are lowercased so lookups are case-insensitive (source
+// data mixes "Linen"/"net" casing); all inputs are lowercased before
+// lookup. Unmapped values are dropped rather than passed through raw,
+// so a stray junk slug can't leak into the UI.
+//
+// Source of truth: /sharetribe-data/*.pdf (labels) + distinct values
+// extracted from the raw export (keys).
+
+const FABRIC_MAP: Record<string, string> = {
+  artsilk: "Art silk",
+  chiffon: "Chiffon",
+  cotton: "Cotton",
+  chinon: "Chinon",
+  georgette: "Georgette",
+  lawn: "Lawn",
+  linen: "Linen",
+  net: "Net",
+  organza: "Organza",
+  puresilk: "Pure silk",
+  rawsilk: "Raw silk",
+  satin: "Satin",
+  sequin: "Sequin",
+  velvet: "Velvet",
+  other: "Other",
+};
+
+const COLOUR_MAP: Record<string, string> = {
+  black: "Black",
+  grey: "Grey",
+  white: "White",
+  brown: "Brown",
+  tan: "Tan",
+  cream: "Cream",
+  yellow: "Yellow",
+  red: "Red",
+  burgundy: "Burgundy",
+  orange: "Orange",
+  pink: "Pink",
+  purple: "Purple",
+  blue: "Blue",
+  navy: "Navy",
+  green: "Green",
+  khaki: "Khaki",
+  multi: "Multi",
+  silver: "Silver",
+  gold: "Gold",
+  other: "Other",
+};
+
+const OCCASION_MAP: Record<string, string> = {
+  bridal: "Bridal",
+  casual: "Casual",
+  festive: "Festive",
+  groom: "Groom",
+  prewedding: "Pre-wedding event (bride/groom)",
+  preweddingguest: "Pre-wedding event (guest)",
+  weddingguest: "Wedding guest",
+  weddingparty: "Wedding party",
+};
+
+// Merged across lehengaitems / sareeitems / salwaritemsincluded — keys
+// are unique across the three source fields. `dupatta` (lehenga) and
+// `dupattasalwar` (salwar) both map to "Dupatta".
+const ITEMS_INCLUDED_MAP: Record<string, string> = {
+  // Lehenga
+  lehengaskirt: "Lehenga skirt",
+  dupatta: "Dupatta",
+  lehengablouse: "Lehenga top/blouse",
+  potlimatching: "Matching potli bag/purse",
+  // Saree
+  stichedblouse: "Stitched Blouse",
+  blousepiece: "Blouse piece (material)",
+  petticoat: "Petticoat/Underskirt",
+  // Suit/Salwar/Menswear
+  kurta: "Kurta/Kurti",
+  dupattasalwar: "Dupatta",
+  bottoms: "Bottoms (e.g. Pant, Salwar, Shalwar, Sharara)",
+};
+
+// Sharetribe had 7 dry-cleaning values (incl. jewellery-specific ones);
+// the new app has only 3. Client-confirmed collapse: anything implying
+// "previously dry cleaned/sanitised" → previously; "pre-owned, not
+// cleaned" → never; "new" → brand new.
+const DRY_CLEANING_MAP: Record<string, string> = {
+  preownedandnotdrycleaned: "Pre-loved, never dry cleaned",
+  drycleanedlessthan1monthago: "Pre-loved, previously dry cleaned",
+  drycleanedover1monthago: "Pre-loved, previously dry cleaned",
+  newthereforenotdrycleaned: "Brand new, never dry cleaned",
+  newjewelleryaccessoriesonly: "Brand new, never dry cleaned",
+  preownedandnotsanitisedjewelleryaccessoriesonly: "Pre-loved, never dry cleaned",
+  sanitisedjewelleryaccessoriesonly: "Pre-loved, previously dry cleaned",
+};
+
+const COUNTRY_OF_ORIGIN_MAP: Record<string, string> = {
+  india: "India",
+  indiandesigner: "Indian - Designer",
+  pakistan: "Pakistan",
+  pakistanidesigner: "Pakistani - Designer",
+  nepal: "Nepal",
+  bangladesh: "Bangladesh",
+  srilanka: "Sri Lanka",
+  maldives: "Maldives",
+  afghanistan: "Afghanistan",
+  bhutan: "Bhutan",
+  other: "Other",
+  designerother: "Other - Designer",
+};
+
+// Size maps: the slug is the AU number (women's/footwear) or a
+// size-letter slug (menswear). Output is the combined display label
+// that matches VALID_SIZES in routes/search.ts and the new app.
+const WOMENS_SIZE_MAP: Record<string, string> = {
+  "4": "UK4 / US0 / AU4",
+  "6": "UK6 / US2 / AU6",
+  "8": "UK8 / US4 / AU8",
+  "10": "UK10 / US6 / AU10",
+  "12": "UK12 / US8 / AU12",
+  "14": "UK14 / US10 / AU14",
+  "16": "UK16 / US12 / AU16",
+  "18": "UK18 / US14 / AU18",
+  "20": "UK20 / US16 / AU20",
+  "22": "UK22 / US18 / AU22",
+  "24": "UK24 / US20 / AU24",
+  "26": "UK26 / US22 / AU26",
+  "28": "UK28 / US24 / AU28",
+  freesize: "Free Size",
+};
+
+const FOOTWEAR_SIZE_MAP: Record<string, string> = {
+  "4": "AU4 / UK2 / US5 / EU35",
+  "5": "AU5 / UK3 / US6 / EU36",
+  "6": "AU6 / UK4 / US7 / EU37",
+  "7": "AU7 / UK5 / US8 / EU38",
+  "8": "AU8 / UK6 / US9 / EU39",
+  "9": "AU9 / UK7 / US10 / EU40",
+  "10": "AU10 / UK8 / US11 / EU41",
+  "11": "AU11 / UK9 / US12 / EU42",
+  "12": "AU12 / UK10 / US14 / EU43",
+  "13": "AU13 / UK11 / US15 / EU44",
+  "14": "AU14 / UK12 / US16 / EU45",
+};
+
+// Two source fields (estimateMensSizeAu + the typo'd estimateMenSSizeAu)
+// used different slug schemes — descriptive (small/large/xlarge) and
+// abbreviated (s/l/xl). Both covered here.
+const MENS_SIZE_MAP: Record<string, string> = {
+  xxs: "XXS",
+  xs: "XS",
+  s: "S",
+  small: "S",
+  m: "M",
+  medium: "M",
+  l: "L",
+  large: "L",
+  xl: "XL",
+  xlarge: "XL",
+  xxl: "XXL",
+  "2xl": "XXL",
+  "3xl": "3XL",
+  "4xl": "4XL",
+  freesize: "Free size",
+};
+
+/** Map a single slug to its label via the given map (case-insensitive). */
+function lookupLabel(
+  value: unknown,
+  map: Record<string, string>
+): string | null {
+  if (typeof value !== "string" || !value.trim()) return null;
+  return map[value.toLowerCase().trim()] ?? null;
+}
+
+/** Map an array (or single) of slugs to labels, dropping unmapped. */
+function lookupLabels(value: unknown, map: Record<string, string>): string[] {
+  const seen = new Set<string>();
+  for (const raw of coerceToStringArray(value)) {
+    const label = map[raw.toLowerCase().trim()];
+    if (label) seen.add(label);
+  }
+  return Array.from(seen);
+}
+
+export function mapFabricTypes(value: unknown): string[] {
+  return lookupLabels(value, FABRIC_MAP);
+}
+
+export function mapColours(value: unknown): string[] {
+  return lookupLabels(value, COLOUR_MAP);
+}
+
+export function mapOccasionTags(value: unknown): string[] {
+  return lookupLabels(value, OCCASION_MAP);
+}
+
+export function mapDryCleaningStatus(value: unknown): string | null {
+  return lookupLabel(value, DRY_CLEANING_MAP);
+}
+
+export function mapCountryOfOrigin(value: unknown): string | null {
+  return lookupLabel(value, COUNTRY_OF_ORIGIN_MAP);
 }
 
 // ============================================================
