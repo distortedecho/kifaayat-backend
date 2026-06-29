@@ -154,6 +154,10 @@ search.get("/", optionalClerkMiddleware, async (c) => {
   // only make sense with a single category. Null when 0 or 2+ selected.
   const category = categories.length === 1 ? categories[0] : undefined;
   const subCategory = c.req.query("sub_category");
+  // Exact-ish designer filter (e.g. a "Sabyasachi Mukherjee" chip or
+  // designer dropdown). Case-insensitive substring so minor label
+  // variations still match. Independent of the free-text `q` search.
+  const designer = c.req.query("designer")?.trim();
   const condition = c.req.query("condition");
   const occasion = c.req.query("occasion"); // comma-separated
   const color = c.req.query("color"); // comma-separated
@@ -283,9 +287,12 @@ search.get("/", optionalClerkMiddleware, async (c) => {
 
     if (tsQueryStr) {
       // Use textSearch for FTS match
-      // Also match via title ILIKE for simple substring + fuzzy matching
+      // Also match via title ILIKE for simple substring + fuzzy matching.
+      // designer_name is included so typing a label name in the search
+      // box (e.g. "Sabyasachi") surfaces that designer's listings even
+      // when the name isn't in the title/description.
       query = query.or(
-        `title.ilike.%${sanitized}%,description.ilike.%${sanitized}%,category.ilike.%${sanitized}%`
+        `title.ilike.%${sanitized}%,description.ilike.%${sanitized}%,category.ilike.%${sanitized}%,designer_name.ilike.%${sanitized}%`
       );
     }
   }
@@ -299,6 +306,15 @@ search.get("/", optionalClerkMiddleware, async (c) => {
 
   if (subCategory) {
     query = query.eq("sub_category", subCategory);
+  }
+
+  if (designer) {
+    // Sanitize to avoid breaking PostgREST's filter syntax, then match
+    // case-insensitively. ilike with no wildcards is effectively a
+    // case-insensitive exact match; wrapping in % makes it a contains
+    // so "Sabyasachi" matches "Sabyasachi Mukherjee".
+    const safeDesigner = designer.replace(/[%,()]/g, "");
+    query = query.ilike("designer_name", `%${safeDesigner}%`);
   }
 
   // --- Curation chip filter ---
@@ -584,7 +600,7 @@ search.get("/", optionalClerkMiddleware, async (c) => {
       await supabase.from("search_queries").insert({
         term: q || "",
         user_id: userId,
-        filters: { categories, condition, occasion, sizes, market },
+        filters: { categories, condition, occasion, sizes, market, designer },
         result_count: items.length,
       });
     } catch {

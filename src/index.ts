@@ -28,6 +28,7 @@ import iso from "./routes/iso.js";
 import sitemap from "./routes/sitemap.js";
 import config from "./routes/config.js";
 import addresses from "./routes/addresses.js";
+import website from "./routes/website.js";
 import {
   initJobQueue,
   scheduleRecurringJobs,
@@ -215,6 +216,7 @@ v1.route("/referrals", referrals);
 v1.route("/iso", iso);
 v1.route("/listing-config", config);
 v1.route("/addresses", addresses);
+v1.route("/website", website);
 
 // Canonical versioned mount
 app.route("/api/v1", v1);
