@@ -668,6 +668,17 @@ stripeRoutes.get("/account-status", clerkMiddleware, requireProfile, async (c) =
     );
 
     const status = mapAccountToStatus(account);
+    const onboardingComplete =
+      (account.charges_enabled ?? false) && (account.payouts_enabled ?? false);
+
+    // Sync DB so payout routing is always accurate regardless of
+    // whether the account.updated webhook arrived.
+    if (onboardingComplete !== profile.stripe_onboarding_complete) {
+      await supabase
+        .from("profiles")
+        .update({ stripe_onboarding_complete: onboardingComplete })
+        .eq("id", profile.id);
+    }
 
     const response = {
       status,
@@ -676,11 +687,6 @@ stripeRoutes.get("/account-status", clerkMiddleware, requireProfile, async (c) =
       payouts_enabled: account.payouts_enabled ?? false,
       payout_method: payoutMethod,
       payout_ready: resolvedMethod !== null,
-      // Per-account requirements bag — what Stripe still needs from
-      // the seller before onboarding is considered complete. FE uses
-      // this to render specific pending items rather than a generic
-      // "Setup pending" message. disabled_reason is non-null when
-      // Stripe has blocked the account (rejected, KYC failed, etc).
       requirements: {
         currently_due: account.requirements?.currently_due ?? [],
         past_due: account.requirements?.past_due ?? [],
