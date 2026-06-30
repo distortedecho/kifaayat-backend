@@ -724,14 +724,22 @@ stripeRoutes.get("/account-status", clerkMiddleware, requireProfile, async (c) =
  */
 stripeRoutes.post("/webhook", async (c) => {
   const sig = c.req.header("stripe-signature");
-  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+  // Connect webhooks include Stripe-Account header; platform webhooks don't.
+  const isConnectEvent = !!c.req.header("stripe-account");
+  const webhookSecret = isConnectEvent
+    ? process.env.STRIPE_CONNECT_WEBHOOK_SECRET
+    : process.env.STRIPE_WEBHOOK_SECRET;
 
   if (!sig) {
     return c.json({ error: "Missing stripe-signature header" }, 400);
   }
 
   if (!webhookSecret) {
-    console.error("STRIPE_WEBHOOK_SECRET is not set");
+    console.error(
+      isConnectEvent
+        ? "STRIPE_CONNECT_WEBHOOK_SECRET is not set"
+        : "STRIPE_WEBHOOK_SECRET is not set"
+    );
     return c.json({ error: "Webhook not configured" }, 500);
   }
 
