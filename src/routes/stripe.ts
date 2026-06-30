@@ -743,6 +743,12 @@ stripeRoutes.post("/webhook", async (c) => {
     return c.json({ error: "Webhook not configured" }, 500);
   }
 
+  logger.info("stripe.webhook_incoming", {
+    is_connect: isConnectEvent,
+    secret_set: !!webhookSecret,
+    secret_prefix: webhookSecret.slice(0, 12),
+  });
+
   // Get raw body for signature verification
   const rawBody = await c.req.text();
 
