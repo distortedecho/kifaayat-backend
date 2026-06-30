@@ -724,43 +724,49 @@ stripeRoutes.get("/account-status", clerkMiddleware, requireProfile, async (c) =
  */
 stripeRoutes.post("/webhook", async (c) => {
   const sig = c.req.header("stripe-signature");
-  // Connect webhooks include Stripe-Account header; platform webhooks don't.
-  const isConnectEvent = !!c.req.header("stripe-account");
-  const webhookSecret = isConnectEvent
-    ? process.env.STRIPE_CONNECT_WEBHOOK_SECRET
-    : process.env.STRIPE_WEBHOOK_SECRET;
 
   if (!sig) {
     return c.json({ error: "Missing stripe-signature header" }, 400);
   }
 
-  if (!webhookSecret) {
-    console.error(
-      isConnectEvent
-        ? "STRIPE_CONNECT_WEBHOOK_SECRET is not set"
-        : "STRIPE_WEBHOOK_SECRET is not set"
-    );
+  const platformSecret = process.env.STRIPE_WEBHOOK_SECRET;
+  const connectSecret = process.env.STRIPE_CONNECT_WEBHOOK_SECRET;
+
+  if (!platformSecret) {
+    console.error("STRIPE_WEBHOOK_SECRET is not set");
     return c.json({ error: "Webhook not configured" }, 500);
   }
-
-  logger.info("stripe.webhook_incoming", {
-    is_connect: isConnectEvent,
-    secret_set: !!webhookSecret,
-    secret_prefix: webhookSecret.slice(0, 12),
-  });
 
   // Get raw body for signature verification
   const rawBody = await c.req.text();
 
+  // Event Destinations (new Stripe UI) don't send Stripe-Account header even
+  // for connected account events. Try platform secret first; if it fails and
+  // a Connect secret is configured, try that. Whichever verifies is correct.
   let event: Stripe.Event;
+  let isConnectEvent = false;
+
   try {
-    event = getStripe().webhooks.constructEvent(rawBody, sig, webhookSecret);
-  } catch (error) {
-    console.error("Webhook signature verification failed:", error);
-    return c.json({ error: "Invalid signature" }, 400);
+    event = getStripe().webhooks.constructEvent(rawBody, sig, platformSecret);
+  } catch {
+    if (!connectSecret) {
+      console.error("Webhook signature verification failed and no STRIPE_CONNECT_WEBHOOK_SECRET set");
+      return c.json({ error: "Invalid signature" }, 400);
+    }
+    try {
+      event = getStripe().webhooks.constructEvent(rawBody, sig, connectSecret);
+      isConnectEvent = true;
+    } catch (err) {
+      console.error("Webhook signature verification failed with both secrets:", err);
+      return c.json({ error: "Invalid signature" }, 400);
+    }
   }
 
-  logger.info("stripe.webhook_received", { event_type: event.type, event_id: event.id });
+  logger.info("stripe.webhook_received", {
+    event_type: event.type,
+    event_id: event.id,
+    is_connect: isConnectEvent,
+  });
 
   const supabase = createSupabaseAdmin();
 
