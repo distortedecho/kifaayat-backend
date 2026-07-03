@@ -285,6 +285,17 @@ search.get("/", optionalClerkMiddleware, async (c) => {
   // international_shipping is pulled so we can include "ships globally"
   // listings in non-local markets (matching feed behavior) and so the
   // frontend can render a "Ships internationally" badge per result.
+  //
+  // Country filtering (both `location` and `market`) is done on the
+  // denormalized `listings.seller_location` column — a copy of the
+  // seller's profile location kept in sync by a DB trigger (schema-25).
+  // This is deliberate: filtering on the *embedded* seller
+  // (`profiles.location`) can't restrict the top-level listings at the DB
+  // level for the inclusive `market` OR, so it used to run in JS *after*
+  // fetching just `limit + 1` rows — which silently dropped any match past
+  // the first DB page (e.g. an AU Lehenga ranked #73 of 79 by newest) and
+  // set hasMore=false, killing pagination. A native column lets both
+  // filters paginate correctly.
   let query = supabase
     .from("listings")
     .select(
@@ -414,19 +425,25 @@ search.get("/", optionalClerkMiddleware, async (c) => {
   }
 
   // Location filter: explicit user choice (e.g. "show me only AU sellers") —
-  // strict, no international shipping bypass.
+  // strict, no international-shipping bypass. Filters on the denormalized
+  // seller_location column so it restricts at the DB level and paginates.
   if (location) {
-    query = query.eq("profiles.location", location);
+    query = query.eq("seller_location", location);
   }
 
-  // Market filter (`?market=US`): drives the home-feed/marketplace context.
-  // Unlike `location` above, this is NOT strict — international-shipping
-  // listings from other markets are also surfaced (matches GET /api/feed
-  // behavior). The actual OR (local OR international) is applied in JS
-  // after fetching since PostgREST .or() across embedded + native columns
-  // is awkward. Caveat: page sizes may be slightly under `limit` when
-  // many fetched rows are filtered out — acceptable trade-off for now.
-  // (No DB filter applied here.)
+  // Market filter (`?market=US`): drives the home-feed/marketplace context
+  // and is the PRIMARY country path (feed always, search by default).
+  // Unlike `location`, it's inclusive — local sellers OR anyone who ships
+  // internationally OR listings with no known seller location (matches
+  // GET /api/feed's filterByMarket, so a listing never appears in the feed
+  // yet vanishes from search). Expressed as a DB-level OR on native columns
+  // so it restricts BEFORE pagination. `location` (the explicit strict
+  // chip) takes precedence, so only apply market when location isn't set.
+  if (market && !location) {
+    query = query.or(
+      `seller_location.eq.${market},international_shipping.eq.true,seller_location.is.null`
+    );
+  }
 
   // --- Apply sort ---
   // Trending overrides the default sort to a popularity-weighted order
@@ -506,32 +523,12 @@ search.get("/", optionalClerkMiddleware, async (c) => {
 
   const allRows = rows || [];
 
-  // location (strict, explicit user choice) — drop anything not in that country
-  // market (inclusive) — keep local sellers OR listings that ship internationally
-  let filteredRows = allRows;
-  if (location) {
-    filteredRows = allRows.filter((row: Record<string, unknown>) => {
-      const profiles = row.profiles as Record<string, unknown> | null;
-      return profiles && profiles.location === location;
-    });
-  } else if (market) {
-    filteredRows = allRows
-      .filter((row: Record<string, unknown>) => {
-        const profiles = row.profiles as Record<string, unknown> | null;
-        if (!profiles) return false;
-        const sellerMarket = profiles.location as string | null | undefined;
-        const intl = row.international_shipping === true;
-        return sellerMarket === market || intl;
-      })
-      // Local sellers bubble to the top of search results; international fills out.
-      .sort((a: Record<string, unknown>, b: Record<string, unknown>) => {
-        const aLocal =
-          (a.profiles as Record<string, unknown> | null)?.location === market ? 0 : 1;
-        const bLocal =
-          (b.profiles as Record<string, unknown> | null)?.location === market ? 0 : 1;
-        return aLocal - bLocal;
-      });
-  }
+  // Both `location` and `market` are now filtered at the DB level (on the
+  // native seller_location column), so the fetched rows are already the
+  // correctly-filtered set — no JS post-filtering needed, and pagination /
+  // hasMore operate on the true result set. (Previously this was a JS
+  // post-filter that truncated results past the first DB page.)
+  const filteredRows = allRows;
 
   const hasMore = filteredRows.length > limit;
   const pageRows = hasMore ? filteredRows.slice(0, limit) : filteredRows;
@@ -632,17 +629,12 @@ search.get("/", optionalClerkMiddleware, async (c) => {
     }
   })();
 
-  // total_count: when market or location is applied, the DB-side count
-  // is the pre-filter total (1247 listings in DB) because the
-  // market/location filter runs in JS post-fetch. That produced the
-  // wildly inflated "1247 results" with only 1 visible item bug.
-  // Substitute the post-filtered length so the count matches what the
-  // user actually sees. Slight under-count on paginated calls (we only
-  // know this page's filtered length, not the global total) is better
-  // than wildly over-counting; the FE has hasMore / next_cursor to
-  // signal "there's more, paginate".
-  const effectiveTotalCount =
-    market || location ? filteredRows.length : count ?? null;
+  // total_count: both `location` and `market` are now filtered at the DB
+  // level (on seller_location), so the DB-side `count` is already the
+  // accurate post-filter total for every filter combination. (This is what
+  // fixed the old "1247 results, 1 visible" over-count — the count no
+  // longer reflects a pre-filter total.)
+  const effectiveTotalCount = count ?? null;
 
   return c.json({
     items,

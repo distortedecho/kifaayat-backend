@@ -618,19 +618,21 @@ feed.get("/category/:category", optionalClerkMiddleware, async (c) => {
   const catMedians: Record<string, number> =
     (catSettingsRow?.category_medians as Record<string, number>) ?? {};
 
-  // Over-fetch to account for post-filter on market (filterByMarket handles
-  // local + international shipping). Bumped multiplier vs the old strict
-  // market filter since we're now filtering across all markets in JS.
-  const overFetchLimit = (limit + 1) * 4;
-
   let query = supabase
     .from("listings")
     .select(LISTING_SELECT)
     .eq("status", "active")
     .eq("category", category)
+    // Market filter at the DB level on the denormalized seller_location
+    // column (schema-25), so it restricts BEFORE pagination and every match
+    // is reachable. Inclusive like filterByMarket: local sellers OR anyone
+    // who ships internationally OR listings with no known seller location.
+    .or(
+      `seller_location.eq.${market},international_shipping.eq.true,seller_location.is.null`
+    )
     .order("created_at", { ascending: false })
     .order("id", { ascending: false })
-    .limit(overFetchLimit);
+    .limit(limit + 1);
 
   // Cursor-based pagination
   if (cursor) {
@@ -655,11 +657,9 @@ feed.get("/category/:category", optionalClerkMiddleware, async (c) => {
     return c.json({ error: "Failed to fetch listings" }, 500);
   }
 
-  // Post-filter by market (embedded join filter can leave null profiles)
-  const filteredRows = filterByMarket(
-    (rows || []) as Record<string, unknown>[],
-    market
-  );
+  // Market is now filtered at the DB level, so fetched rows are already the
+  // correct set — no JS post-filter (which used to truncate past page 1).
+  const filteredRows = (rows || []) as Record<string, unknown>[];
 
   const hasMore = filteredRows.length > limit;
   const pageRows = hasMore ? filteredRows.slice(0, limit) : filteredRows;
