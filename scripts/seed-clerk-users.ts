@@ -32,6 +32,7 @@ const MANUAL_EMAILS: string[] = [
   "kifaayattest2+clerk_test@example.com",
   "kifaayattest3+clerk_test@example.com",
   "kifaayattest7+clerk_test@example.com",
+  "kifaayattest8+clerk_test@example.com",
   // "someone@example.com",
   // "another@example.com",
 ];
