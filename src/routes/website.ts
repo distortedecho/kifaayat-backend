@@ -11,6 +11,25 @@ import { hasDirectDb, getSql } from "../lib/db.js";
 
 const website = new Hono();
 
+// Markets the country picker can select (same set as /api/search + /api/feed).
+const VALID_MARKETS = ["AU", "US", "NZ", "CA", "GB"] as const;
+type Market = (typeof VALID_MARKETS)[number];
+
+/**
+ * Read + validate the optional `?market=` param. Country filtering is
+ * opt-in: no param → return everything (backward compatible, unchanged for
+ * any caller not sending it). Present-but-unknown → `invalid` so the
+ * handler can 400 (matching /api/search). Present-and-valid → the market.
+ */
+function readMarket(m: string | undefined): {
+  market: Market | null;
+  invalid: boolean;
+} {
+  if (!m) return { market: null, invalid: false };
+  if (!VALID_MARKETS.includes(m as Market)) return { market: null, invalid: true };
+  return { market: m as Market, invalid: false };
+}
+
 /**
  * GET /api/website/in-demand
  * "Most-saved pieces" — active listings ranked by how many times they
@@ -25,6 +44,8 @@ const website = new Hono();
 website.get("/in-demand", optionalClerkMiddleware, async (c) => {
   const supabase = createSupabaseAdmin();
   const limit = Math.min(parseInt(c.req.query("limit") || "12", 10) || 12, 50);
+  const { market, invalid } = readMarket(c.req.query("market"));
+  if (invalid) return c.json({ error: "Invalid market" }, 400);
 
   if (!hasDirectDb()) {
     return c.json({ error: "Service unavailable" }, 503);
@@ -47,6 +68,13 @@ website.get("/in-demand", optionalClerkMiddleware, async (c) => {
   }>;
   try {
     const sql = getSql();
+    // Inclusive market scope (matches /api/feed): sellers local to the
+    // market OR listings that ship internationally OR listings with no
+    // known seller location. seller_location is the denormalized column
+    // from schema-25.
+    const marketFilter = market
+      ? sql`AND (l.seller_location = ${market} OR l.international_shipping IS TRUE OR l.seller_location IS NULL)`
+      : sql``;
     rows = await sql`
       SELECT
         l.id, l.title, l.price_amount, l.price_currency,
@@ -57,6 +85,7 @@ website.get("/in-demand", optionalClerkMiddleware, async (c) => {
       JOIN listings l ON l.id = w.listing_id
       WHERE w.created_at >= NOW() - INTERVAL '30 days'
         AND l.status = 'active'
+        ${marketFilter}
       GROUP BY l.id
       ORDER BY saves_recent DESC, l.created_at DESC
       LIMIT ${limit}
@@ -131,13 +160,24 @@ website.get("/in-demand", optionalClerkMiddleware, async (c) => {
 website.get("/just-sold", optionalClerkMiddleware, async (c) => {
   const supabase = createSupabaseAdmin();
   const limit = Math.min(parseInt(c.req.query("limit") || "12", 10) || 12, 50);
+  const { market, invalid } = readMarket(c.req.query("market"));
+  if (invalid) return c.json({ error: "Invalid market" }, 400);
 
-  const { data, error } = await supabase
+  // "Just sold in <market>" = sales by sellers located in that market
+  // (strict). When a market is set we INNER-join the seller so
+  // `.eq("seller.location", …)` actually restricts the orders — a plain
+  // embed would only null the seller and still return the row.
+  const sellerEmbed = market
+    ? "seller:profiles!orders_seller_id_fkey!inner(location)"
+    : "seller:profiles!orders_seller_id_fkey(location)";
+  let query = supabase
     .from("orders")
     .select(
-      "amount, currency, created_at, listings!orders_listing_id_fkey(category), seller:profiles!orders_seller_id_fkey(location)"
+      `amount, currency, created_at, listings!orders_listing_id_fkey(category), ${sellerEmbed}`
     )
-    .neq("status", "cancelled")
+    .neq("status", "cancelled");
+  if (market) query = query.eq("seller.location", market);
+  const { data, error } = await query
     .order("created_at", { ascending: false })
     .limit(limit);
 
@@ -169,6 +209,8 @@ website.get("/just-sold", optionalClerkMiddleware, async (c) => {
  */
 website.get("/designers", optionalClerkMiddleware, async (c) => {
   const limit = Math.min(parseInt(c.req.query("limit") || "50", 10) || 50, 200);
+  const { market, invalid } = readMarket(c.req.query("market"));
+  if (invalid) return c.json({ error: "Invalid market" }, 400);
 
   if (!hasDirectDb()) {
     return c.json({ error: "Service unavailable" }, 503);
@@ -176,12 +218,17 @@ website.get("/designers", optionalClerkMiddleware, async (c) => {
 
   try {
     const sql = getSql();
+    // Inclusive market scope (matches /api/feed).
+    const marketFilter = market
+      ? sql`AND (seller_location = ${market} OR international_shipping IS TRUE OR seller_location IS NULL)`
+      : sql``;
     const rows = await sql<{ name: string; count: number }[]>`
       SELECT designer_name AS name, COUNT(*)::int AS count
       FROM listings
       WHERE status = 'active'
         AND designer_name IS NOT NULL
         AND designer_name <> ''
+        ${marketFilter}
       GROUP BY designer_name
       ORDER BY count DESC, designer_name ASC
       LIMIT ${limit}
@@ -201,6 +248,8 @@ website.get("/designers", optionalClerkMiddleware, async (c) => {
  */
 website.get("/top-sellers", optionalClerkMiddleware, async (c) => {
   const limit = Math.min(parseInt(c.req.query("limit") || "20", 10) || 20, 100);
+  const { market, invalid } = readMarket(c.req.query("market"));
+  if (invalid) return c.json({ error: "Invalid market" }, 400);
 
   if (!hasDirectDb()) {
     return c.json({ error: "Service unavailable" }, 503);
@@ -208,6 +257,9 @@ website.get("/top-sellers", optionalClerkMiddleware, async (c) => {
 
   try {
     const sql = getSql();
+    // "Top sellers in <market>" = sellers located in that market (strict,
+    // like the app feed's Top Wardrobes).
+    const marketFilter = market ? sql`AND p.location = ${market}` : sql``;
     const rows = await sql<
       {
         id: string;
@@ -237,6 +289,7 @@ website.get("/top-sellers", optionalClerkMiddleware, async (c) => {
         AND r.reviewer_role = 'buyer'
         AND r.revealed_at IS NOT NULL
       WHERE p.deleted_at IS NULL
+        ${marketFilter}
       GROUP BY p.id
       HAVING COUNT(r.id) >= 1
       ORDER BY avg_rating DESC, review_count DESC
