@@ -11,9 +11,18 @@
 // See PAYOUTS.md for the full design rationale.
 // ============================================================
 
+import type Stripe from "stripe";
 import { createSupabaseAdmin } from "../lib/supabase.js";
 import { getStripe } from "../lib/stripeClient.js";
 import { logger } from "../lib/logger.js";
+import { enqueueDelayed, JOB_RETRY_STRIPE_PAYOUT } from "../lib/jobs.js";
+
+// Destination-charge funds sit in the seller's `pending` balance for
+// Stripe's settlement window (~2 business days). If they haven't cleared
+// when we release, we defer and retry roughly daily, up to this many times
+// before giving up and flagging the payout for admin review.
+const MAX_PAYOUT_RETRIES = 5;
+const PAYOUT_RETRY_DELAY_SECONDS = 24 * 60 * 60;
 
 export type PayoutMethod = "stripe" | "wise" | "paypal";
 
@@ -52,23 +61,30 @@ export function resolveSellerPayoutMethod(
   if (!profile) return null;
 
   const chosen = profile.payout_method;
-  const hasStripe =
-    profile.stripe_account_id && profile.stripe_onboarding_complete;
-  const hasWise =
+  const hasStripe = !!(
+    profile.stripe_account_id && profile.stripe_onboarding_complete
+  );
+  const hasWise = !!(
     profile.wise_account_holder &&
     profile.wise_account_number &&
     profile.wise_bank_country &&
     profile.wise_bank_currency &&
-    profile.wise_routing_code;
+    profile.wise_routing_code
+  );
   const hasPaypal = !!profile.paypal_email;
 
-  // Honour the seller's explicit choice when the relevant details are set.
-  if (chosen === "stripe" && hasStripe) return "stripe";
-  if (chosen === "wise" && hasWise) return "wise";
-  if (chosen === "paypal" && hasPaypal) return "paypal";
+  // The seller's explicit choice is AUTHORITATIVE. If they picked a method,
+  // we ONLY use that method — never silently pay them via a different one
+  // they happen to have configured. If their chosen method isn't ready yet
+  // (e.g. Stripe onboarding incomplete), return null so the purchase is
+  // blocked until they finish setting it up. Resolved live at checkout, so
+  // this applies to every listing (old + new) automatically.
+  if (chosen === "stripe") return hasStripe ? "stripe" : null;
+  if (chosen === "wise") return hasWise ? "wise" : null;
+  if (chosen === "paypal") return hasPaypal ? "paypal" : null;
 
-  // Fallback chain for sellers who haven't explicitly chosen but have
-  // something configured. Stripe wins (auto-payout, lowest admin lift).
+  // No explicit choice — fall back to whatever is configured (Stripe wins:
+  // auto-payout, lowest admin lift).
   if (hasStripe) return "stripe";
   if (hasWise) return "wise";
   if (hasPaypal) return "paypal";
@@ -237,48 +253,209 @@ async function disburseViaStripe(payout: PayoutRow): Promise<void> {
     return;
   }
 
-  // Look up the original charge so we can set `source_transaction` on
-  // the Transfer. This (a) links the transfer to the original payment
-  // in the Stripe dashboard so "Transferred to" populates on the
-  // payment row, and (b) draws funds from that specific charge
-  // instead of the platform's general available balance — useful if
-  // the platform balance is temporarily low or held for other reasons.
+  // How the order was charged decides how we release:
+  //   - DESTINATION CHARGE (single-item checkout): the funds already
+  //     transferred to the seller's Stripe balance at purchase, held by
+  //     their manual payout schedule. Release = pay out to their bank.
+  //   - PLATFORM-BALANCE CHARGE (cart, or legacy pre-destination-charge
+  //     orders): funds are in Kifaayat's balance. Release = create a
+  //     Transfer to the seller (works for AU; cross-border restricted).
+  // We detect by inspecting the charge: a destination charge has a
+  // `transfer` pointing at the seller's account.
+  const charge = await getOrderCharge(payout.order_id);
+  const destTransferId = getChargeTransferId(charge);
+
+  if (destTransferId) {
+    await releaseViaPayout(
+      payout,
+      sellerProfile.stripe_account_id,
+      destTransferId,
+      0
+    );
+  } else {
+    await releaseViaTransfer(
+      payout,
+      sellerProfile.stripe_account_id,
+      charge?.id
+    );
+  }
+}
+
+/** Pull the (expanded) charge for an order's PaymentIntent, or null. */
+async function getOrderCharge(
+  orderId: string
+): Promise<Stripe.Charge | null> {
+  const supabase = createSupabaseAdmin();
   const { data: order } = await supabase
     .from("orders")
     .select("stripe_payment_intent_id")
-    .eq("id", payout.order_id)
+    .eq("id", orderId)
     .single();
+  if (!order?.stripe_payment_intent_id) return null;
+  try {
+    const pi = await getStripe().paymentIntents.retrieve(
+      order.stripe_payment_intent_id,
+      { expand: ["latest_charge"] }
+    );
+    return (pi.latest_charge as Stripe.Charge | null) ?? null;
+  } catch (err) {
+    logger.error("payoutService.charge_lookup_failed", {
+      order_id: orderId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return null;
+  }
+}
 
-  let sourceTransactionId: string | undefined;
-  if (order?.stripe_payment_intent_id) {
-    try {
-      const pi = await getStripe().paymentIntents.retrieve(
-        order.stripe_payment_intent_id
-      );
-      // latest_charge is a string id when not expanded.
-      if (typeof pi.latest_charge === "string") {
-        sourceTransactionId = pi.latest_charge;
-      } else if (pi.latest_charge && "id" in pi.latest_charge) {
-        sourceTransactionId = pi.latest_charge.id;
-      }
-    } catch (err) {
-      // Non-fatal — we can still create the transfer without source_transaction,
-      // just loses the dashboard linkage.
-      logger.error("payoutService.charge_lookup_failed", {
-        payout_id: payout.id,
-        payment_intent_id: order.stripe_payment_intent_id,
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
+/** The seller-bound transfer id on a destination charge, if any. */
+function getChargeTransferId(charge: Stripe.Charge | null): string | undefined {
+  if (!charge) return undefined;
+  if (typeof charge.transfer === "string") return charge.transfer;
+  return charge.transfer?.id;
+}
+
+/**
+ * Release a DESTINATION-CHARGE order: the money already lives in the
+ * seller's Stripe balance (in THEIR currency), so we pay it out to their
+ * bank. The amount/currency come from the transfer the charge created —
+ * NOT the ledger's amount_cents, which is in the buyer's charge currency
+ * and would be wrong for a cross-currency sale.
+ *
+ * Funds may still be `pending` (settlement window). If not enough is
+ * available yet, we mark the row `awaiting_funds` and enqueue a retry.
+ */
+async function releaseViaPayout(
+  payout: PayoutRow,
+  sellerAccountId: string,
+  destTransferId: string,
+  attempt: number
+): Promise<void> {
+  const supabase = createSupabaseAdmin();
+
+  let transfer: Stripe.Transfer;
+  try {
+    transfer = await getStripe().transfers.retrieve(destTransferId);
+  } catch (err) {
+    await markPayoutFailed(
+      payout.id,
+      `Could not load destination transfer ${destTransferId}: ${
+        err instanceof Error ? err.message : String(err)
+      }`
+    );
+    return;
   }
 
+  const amount = transfer.amount; // seller-currency minor units
+  const currency = transfer.currency; // seller currency
+
+  // Is enough settled to pay out yet?
+  const balance = await getStripe().balance.retrieve({
+    stripeAccount: sellerAccountId,
+  });
+  const available =
+    balance.available.find((b) => b.currency === currency)?.amount ?? 0;
+
+  if (available < amount) {
+    if (attempt >= MAX_PAYOUT_RETRIES) {
+      await markPayoutFailed(
+        payout.id,
+        `Funds still pending after ${attempt} retries ` +
+          `(available ${available} < needed ${amount} ${currency})`
+      );
+      return;
+    }
+    await supabase
+      .from("seller_payouts")
+      .update({ status: "awaiting_funds" })
+      .eq("id", payout.id)
+      .in("status", ["pending", "awaiting_funds"]);
+    await enqueueDelayed(
+      JOB_RETRY_STRIPE_PAYOUT,
+      { orderId: payout.order_id, attempt: attempt + 1 },
+      PAYOUT_RETRY_DELAY_SECONDS
+    );
+    logger.info("payoutService.payout_deferred_pending_funds", {
+      payout_id: payout.id,
+      order_id: payout.order_id,
+      available,
+      needed: amount,
+      currency,
+      attempt,
+    });
+    return;
+  }
+
+  try {
+    const po = await getStripe().payouts.create(
+      {
+        amount,
+        currency,
+        metadata: {
+          payout_id: payout.id,
+          order_id: payout.order_id,
+          seller_id: payout.seller_id,
+        },
+      },
+      { stripeAccount: sellerAccountId }
+    );
+
+    const { error: updateError } = await supabase
+      .from("seller_payouts")
+      .update({
+        status: "sent",
+        stripe_payout_id: po.id,
+        sent_at: new Date().toISOString(),
+      })
+      .eq("id", payout.id)
+      .in("status", ["pending", "awaiting_funds"]);
+
+    if (updateError) {
+      logger.error("payoutService.stripe_update_after_payout_failed", {
+        payout_id: payout.id,
+        stripe_payout_id: po.id,
+        error: updateError.message,
+      });
+      return;
+    }
+
+    logger.info("payoutService.stripe_payout_sent", {
+      payout_id: payout.id,
+      order_id: payout.order_id,
+      stripe_payout_id: po.id,
+      amount,
+      currency,
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    logger.error("payoutService.stripe_payout_failed", {
+      payout_id: payout.id,
+      order_id: payout.order_id,
+      error: message,
+    });
+    await markPayoutFailed(payout.id, message);
+  }
+}
+
+/**
+ * Release a PLATFORM-BALANCE order via a Transfer to the seller. Used for
+ * cart orders and legacy orders that predate destination charges. Setting
+ * `source_transaction` links the transfer to the original charge (populates
+ * "Transferred to" in the dashboard and draws from that specific charge).
+ * Cross-border restricted — only reliable AU platform → AU seller.
+ */
+async function releaseViaTransfer(
+  payout: PayoutRow,
+  sellerAccountId: string,
+  sourceChargeId: string | undefined
+): Promise<void> {
+  const supabase = createSupabaseAdmin();
   try {
     const transfer = await getStripe().transfers.create({
       amount: payout.amount_cents,
       currency: payout.currency.toLowerCase(),
-      destination: sellerProfile.stripe_account_id,
+      destination: sellerAccountId,
       transfer_group: `payout_${payout.id}`,
-      ...(sourceTransactionId ? { source_transaction: sourceTransactionId } : {}),
+      ...(sourceChargeId ? { source_transaction: sourceChargeId } : {}),
       metadata: {
         payout_id: payout.id,
         order_id: payout.order_id,
@@ -322,6 +499,60 @@ async function disburseViaStripe(payout: PayoutRow): Promise<void> {
   }
 }
 
+/**
+ * Retry a deferred destination-charge payout (status 'awaiting_funds')
+ * once the seller's funds should have cleared. Invoked by the
+ * JOB_RETRY_STRIPE_PAYOUT worker.
+ */
+export async function retryStripePayoutRelease(
+  orderId: string,
+  attempt: number
+): Promise<void> {
+  const supabase = createSupabaseAdmin();
+
+  const { data: payout } = await supabase
+    .from("seller_payouts")
+    .select("id, seller_id, order_id, amount_cents, currency, method, status")
+    .eq("order_id", orderId)
+    .maybeSingle();
+
+  if (!payout) {
+    logger.error("payoutService.retry_no_payout_row", { order_id: orderId });
+    return;
+  }
+  if (payout.status !== "awaiting_funds") {
+    logger.info("payoutService.retry_skipped", {
+      order_id: orderId,
+      status: payout.status,
+    });
+    return;
+  }
+
+  const { data: sellerProfile } = await supabase
+    .from("profiles")
+    .select("stripe_account_id")
+    .eq("id", payout.seller_id)
+    .single();
+  if (!sellerProfile?.stripe_account_id) {
+    await markPayoutFailed(payout.id, "Seller lost Stripe account before retry");
+    return;
+  }
+
+  const charge = await getOrderCharge(orderId);
+  const destTransferId = getChargeTransferId(charge);
+  if (!destTransferId) {
+    await markPayoutFailed(payout.id, "No destination transfer found on retry");
+    return;
+  }
+
+  await releaseViaPayout(
+    payout,
+    sellerProfile.stripe_account_id,
+    destTransferId,
+    attempt
+  );
+}
+
 async function markPayoutFailed(
   payoutId: string,
   reason: string
@@ -357,7 +588,10 @@ export async function cancelPayoutForOrder(
       failure_reason: reason.slice(0, 1000),
     })
     .eq("order_id", orderId)
-    .eq("status", "pending");
+    // Cancel while the payout hasn't gone out yet. 'awaiting_funds' rows
+    // have a retry job queued; flipping to 'cancelled' makes that retry
+    // no-op (it only proceeds for 'awaiting_funds').
+    .in("status", ["pending", "awaiting_funds"]);
 
   if (error) {
     logger.error("payoutService.cancel_failed", {
@@ -368,4 +602,36 @@ export async function cancelPayoutForOrder(
   }
 
   logger.info("payoutService.cancelled", { order_id: orderId, reason });
+}
+
+/**
+ * Refund an order's payment correctly for whichever charge model it used.
+ *
+ * For DESTINATION CHARGES (single-item Stripe Connect orders) the funds
+ * settled into the seller's balance, so the refund must:
+ *   - reverse_transfer: claw the money back from the seller's balance
+ *   - refund_application_fee: return Kifaayat's commission too
+ * For PLATFORM-BALANCE charges (cart / Wise / PayPal orders) the money is
+ * still in Kifaayat's balance, so a plain refund is correct — passing
+ * reverse_transfer there would error (there's no transfer to reverse).
+ *
+ * We detect the model by inspecting the charge for a seller-bound transfer.
+ * Best-effort: on refund failure we throw so the caller can decide.
+ */
+export async function refundOrderPayment(
+  paymentIntentId: string
+): Promise<Stripe.Refund> {
+  const stripe = getStripe();
+  const pi = await stripe.paymentIntents.retrieve(paymentIntentId, {
+    expand: ["latest_charge"],
+  });
+  const charge = (pi.latest_charge as Stripe.Charge | null) ?? null;
+  const isDestinationCharge = !!getChargeTransferId(charge);
+
+  return stripe.refunds.create({
+    payment_intent: paymentIntentId,
+    ...(isDestinationCharge
+      ? { reverse_transfer: true, refund_application_fee: true }
+      : {}),
+  });
 }

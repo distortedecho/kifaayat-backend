@@ -41,6 +41,7 @@ import "dotenv/config";
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { resolve, basename } from "node:path";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
+import PQueue from "p-queue";
 
 interface CliArgs {
   bundleMetadata: string | null;
@@ -51,6 +52,7 @@ interface CliArgs {
   dryRun: boolean;
   bucket: string;
   photoType: "product" | "brand_tag" | "receipt";
+  concurrency: number;
 }
 
 function parseArgs(): CliArgs {
@@ -63,6 +65,7 @@ function parseArgs(): CliArgs {
   let dryRun = true; // safe default
   let bucket = "listing-photos";
   let photoType: "product" | "brand_tag" | "receipt" = "product";
+  let concurrency = 16;
 
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
@@ -73,6 +76,7 @@ function parseArgs(): CliArgs {
     else if (a === "--target-listings") targetListings = parseInt(args[++i], 10);
     else if (a === "--commit") dryRun = false;
     else if (a === "--dry-run") dryRun = true;
+    else if (a === "--concurrency") concurrency = parseInt(args[++i], 10) || 16;
     else if (a === "--bucket") bucket = args[++i];
     else if (a === "--photo-type") {
       const v = args[++i];
@@ -100,6 +104,7 @@ function parseArgs(): CliArgs {
     dryRun,
     bucket,
     photoType,
+    concurrency,
   };
 }
 
@@ -254,12 +259,19 @@ async function uploadAndLink(
     return;
   }
 
-  const { error: uploadError } = await supabase.storage
-    .from(bucket)
-    .upload(storagePath, photoBuffer, {
-      contentType: detected.contentType,
-      upsert: false,
-    });
+  // Retry transient network errors (e.g. "fetch failed") a couple times.
+  let uploadError: { message?: string } | null = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const res = await supabase.storage
+      .from(bucket)
+      .upload(storagePath, photoBuffer, {
+        contentType: detected.contentType,
+        upsert: false,
+      });
+    uploadError = res.error;
+    if (!uploadError || uploadError.message?.includes("exists")) break;
+    await new Promise((r) => setTimeout(r, 300 * (attempt + 1)));
+  }
   if (uploadError) {
     // "already exists" means a previous run uploaded it but the DB
     // row was never written. Recover by linking the existing object.
@@ -553,107 +565,131 @@ async function runProductionMode(args: CliArgs): Promise<void> {
     failed: 0,
     unsupported_type: 0,
   };
-  let listingsProcessed = 0;
-  let avatarsProcessed = 0;
-  let missingPhotos = 0;
+  // Resolve legacy_sharetribe_id → row ONCE, in bulk (paginated) — avoids a
+  // DB round-trip per record, which was a big chunk of the old runtime.
+  const listingByLegacy = new Map<string, { id: string; seller_id: string }>();
+  for (let from = 0; ; from += 1000) {
+    const { data } = await supabase
+      .from("listings")
+      .select("id, seller_id, legacy_sharetribe_id")
+      .not("legacy_sharetribe_id", "is", null)
+      .range(from, from + 999);
+    if (!data || data.length === 0) break;
+    for (const row of data) {
+      listingByLegacy.set(row.legacy_sharetribe_id as string, {
+        id: row.id as string,
+        seller_id: row.seller_id as string,
+      });
+    }
+    if (data.length < 1000) break;
+  }
+  const profileByLegacy = new Map<string, string>();
+  for (let from = 0; ; from += 1000) {
+    const { data } = await supabase
+      .from("profiles")
+      .select("id, legacy_sharetribe_id")
+      .not("legacy_sharetribe_id", "is", null)
+      .range(from, from + 999);
+    if (!data || data.length === 0) break;
+    for (const row of data) profileByLegacy.set(row.legacy_sharetribe_id as string, row.id as string);
+    if (data.length < 1000) break;
+  }
+  console.log(`Resolved ${listingByLegacy.size} listings, ${profileByLegacy.size} profiles`);
 
-  // Walk records
+  // Build a flat task list from the bundle, then upload concurrently.
+  type UploadTask =
+    | { kind: "listing"; filename: string; listingId: string; sellerId: string; position: number }
+    | { kind: "avatar"; filename: string; profileId: string; avatarUuid: string };
+  const tasks: UploadTask[] = [];
+  let missingPhotos = 0;
   for (const r of records) {
     if (r.type === "listing") {
       const images = r.attributes.images ?? [];
       if (images.length === 0) continue;
-
-      // Resolve sharetribe listing UUID → supabase listing id + seller id
-      const { data: listing } = await supabase
-        .from("listings")
-        .select("id, seller_id")
-        .eq("legacy_sharetribe_id", r.id)
-        .maybeSingle();
+      const listing = listingByLegacy.get(r.id);
       if (!listing) continue;
-
       for (let i = 0; i < images.length; i++) {
-        const photoUuid = images[i].toLowerCase();
-        const photoFilename = photoIndex.get(photoUuid);
-        if (!photoFilename) {
-          missingPhotos += 1;
-          continue;
-        }
-        const buffer = readFileSync(`${args.photosFolder}/${photoFilename}`);
-        await uploadAndLink(
-          supabase,
-          args.bucket,
-          buffer,
-          photoFilename,
-          listing.id as string,
-          i,
-          args.photoType,
-          listing.seller_id as string,
-          args.dryRun,
-          stats
-        );
-      }
-      listingsProcessed += 1;
-      if (listingsProcessed % 100 === 0) {
-        console.log(`  processed ${listingsProcessed} listings`);
+        const filename = photoIndex.get(String(images[i]).toLowerCase());
+        if (!filename) { missingPhotos += 1; continue; }
+        tasks.push({ kind: "listing", filename, listingId: listing.id, sellerId: listing.seller_id, position: i });
       }
     } else if (r.type === "user") {
       const avatarUuid = r.attributes.profile?.avatar;
       if (!avatarUuid) continue;
-      const photoFilename = photoIndex.get(avatarUuid.toLowerCase());
-      if (!photoFilename) {
-        missingPhotos += 1;
-        continue;
-      }
-
-      const { data: profile } = await supabase
-        .from("profiles")
-        .select("id")
-        .eq("legacy_sharetribe_id", r.id)
-        .maybeSingle();
-      if (!profile) continue;
-
-      const buffer = readFileSync(`${args.photosFolder}/${photoFilename}`);
-      const detected = detectContentType(buffer);
-      if (detected.contentType === "application/octet-stream") {
-        stats.unsupported_type += 1;
-        continue;
-      }
-
-      const storagePath = `avatars/${profile.id}/${avatarUuid}.${detected.extension}`;
-
-      if (args.dryRun) {
-        console.log(`  [dry-run avatar] ${avatarUuid} → ${storagePath}`);
-        stats.uploaded += 1;
-        avatarsProcessed += 1;
-        continue;
-      }
-
-      const { error: upErr } = await supabase.storage
-        .from(args.bucket)
-        .upload(storagePath, buffer, {
-          contentType: detected.contentType,
-          upsert: false,
-        });
-      if (upErr && !upErr.message?.includes("exists")) {
-        stats.failed += 1;
-        continue;
-      }
-      const { data: urlData } = supabase.storage
-        .from(args.bucket)
-        .getPublicUrl(storagePath);
-      await supabase
-        .from("profiles")
-        .update({ avatar_url: urlData.publicUrl })
-        .eq("id", profile.id);
-      stats.uploaded += 1;
-      avatarsProcessed += 1;
+      const filename = photoIndex.get(String(avatarUuid).toLowerCase());
+      if (!filename) { missingPhotos += 1; continue; }
+      const profileId = profileByLegacy.get(r.id);
+      if (!profileId) continue;
+      tasks.push({ kind: "avatar", filename, profileId, avatarUuid: String(avatarUuid) });
     }
   }
+  console.log(`${tasks.length} upload tasks (${missingPhotos} missing photo refs) — concurrency ${args.concurrency}`);
 
-  console.log(
-    `\nProcessed ${listingsProcessed} listings, ${avatarsProcessed} avatars, ${missingPhotos} missing photo references`
-  );
+  // Concurrent uploads — the network round-trips dominate, so parallelism
+  // (not CPU) is the win. Each task is idempotent + retried internally.
+  const queue = new PQueue({ concurrency: args.concurrency });
+  let done = 0;
+  for (const task of tasks) {
+    void queue.add(async () => {
+      const buffer = readFileSync(`${args.photosFolder}/${task.filename}`);
+      if (task.kind === "listing") {
+        await uploadAndLink(
+          supabase, args.bucket, buffer, task.filename,
+          task.listingId, task.position, args.photoType, task.sellerId,
+          args.dryRun, stats
+        );
+      } else {
+        await uploadAvatar(
+          supabase, args.bucket, buffer, task.avatarUuid, task.profileId,
+          args.dryRun, stats
+        );
+      }
+      done += 1;
+      if (done % 250 === 0) console.log(`  ${done}/${tasks.length} uploaded`);
+    });
+  }
+  await queue.onIdle();
+
+  console.log(`\nDone. ${tasks.length} tasks, ${missingPhotos} missing photo references`);
   printStats(stats);
+}
+
+/** Upload a user avatar + set profiles.avatar_url. Retries transient errors. */
+async function uploadAvatar(
+  supabase: SupabaseClient,
+  bucket: string,
+  photoBuffer: Buffer,
+  avatarUuid: string,
+  profileId: string,
+  dryRun: boolean,
+  stats: UploadStats
+): Promise<void> {
+  const detected = detectContentType(photoBuffer);
+  if (detected.contentType === "application/octet-stream") {
+    stats.unsupported_type += 1;
+    return;
+  }
+  const storagePath = `avatars/${profileId}/${avatarUuid}.${detected.extension}`;
+  if (dryRun) {
+    stats.uploaded += 1;
+    return;
+  }
+  let upErr: { message?: string } | null = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const res = await supabase.storage
+      .from(bucket)
+      .upload(storagePath, photoBuffer, { contentType: detected.contentType, upsert: false });
+    upErr = res.error;
+    if (!upErr || upErr.message?.includes("exists")) break;
+    await new Promise((r) => setTimeout(r, 300 * (attempt + 1)));
+  }
+  if (upErr && !upErr.message?.includes("exists")) {
+    stats.failed += 1;
+    return;
+  }
+  const { data: urlData } = supabase.storage.from(bucket).getPublicUrl(storagePath);
+  await supabase.from("profiles").update({ avatar_url: urlData.publicUrl }).eq("id", profileId);
+  stats.uploaded += 1;
 }
 
 function printStats(stats: UploadStats): void {

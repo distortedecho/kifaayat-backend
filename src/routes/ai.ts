@@ -95,7 +95,7 @@ export async function prewarmGemini(): Promise<void> {
 // ============================================================
 
 const USER_AI_LIMIT_WINDOW_MS = 60 * 60 * 1000;
-const USER_AI_LIMIT_MAX = 5;
+const USER_AI_LIMIT_MAX = 10;
 const userAICalls = new Map<string, number[]>();
 
 /**
@@ -286,7 +286,9 @@ ai.post("/analyze", clerkMiddleware, async (c) => {
   // "Other" on the form if the AI returns a low-confidence guess.
   const aiCategoryOptions = LISTING_CATEGORIES.filter((c) => c !== "Other");
   const prompt = `Analyze these photos of a South Asian fashion item for a preloved marketplace listing.
+The photos are all meant to be of ONE item. If they instead clearly show MORE THAN ONE distinct item (e.g. a saree in one photo and shoes or jewellery in another), analyze only the PRIMARY item — the one most prominent, or the one in the first photo — and set "multiple_items_detected" to true. Otherwise set it to false. Always return a single JSON object (never an array).
 Return a JSON object with these fields:
+- multiple_items_detected: boolean — true only if the photos show multiple distinct items, else false.
 - category: one of [${aiCategoryOptions.join(", ")}]. Pick the most specific category that fits — do NOT return any value outside this list.
 - category_confidence: confidence score 0-100
 - sub_category: ONLY return a value if category is "Jewellery" or "Footwear", and only from the corresponding list below. For Jewellery: [${SUB_CATEGORIES_BY_CATEGORY.Jewellery!.join(", ")}]. For Footwear: [${SUB_CATEGORIES_BY_CATEGORY.Footwear!.join(", ")}]. For any other category (Lehenga, Saree, Suit/Salwar, Indowestern, Blouse, Menswear, Kidswear), set this to null. The "Other" parent has its own sub-categories but we only ask for sub_category when the AI is confident — leave null for "Other" since users will pick manually.
@@ -334,7 +336,7 @@ Return valid JSON only, no markdown formatting.`;
         });
         return result.text ?? "";
       });
-      const parsed = JSON.parse(responseText ?? "");
+      const parsed = parseAnalysisResponse(responseText ?? "");
 
       // Map and validate response
       const response = mapGeminiResponse(parsed);
@@ -407,6 +409,38 @@ ai.post("/remove-background", clerkMiddleware, async (c) => {
  * Map Gemini's raw JSON response to the AIAnalysisResponse format.
  * Validates enum fields against known values, setting confidence to 0 for invalid values.
  */
+/**
+ * Turn Gemini's raw text into the single object mapGeminiResponse expects.
+ * Hardened against the ways the model deviates when it sees multiple items:
+ *   - markdown-fenced JSON (```json ... ```)
+ *   - a top-level ARRAY of item objects (multiple items) → take the first
+ *     and flag multiple_items_detected
+ * Throws only if there's genuinely no JSON object to be found.
+ */
+function parseAnalysisResponse(responseText: string): Record<string, unknown> {
+  let text = (responseText ?? "").trim();
+  // Strip ```json / ``` fences if the model added them despite JSON mime.
+  if (text.startsWith("```")) {
+    text = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
+  }
+  const parsed = JSON.parse(text);
+
+  if (Array.isArray(parsed)) {
+    // Model returned one object per item — analyze the first, but remember
+    // that there were several so the FE can warn the seller.
+    const first = parsed.find((el) => el && typeof el === "object") as
+      | Record<string, unknown>
+      | undefined;
+    if (!first) throw new Error("Empty analysis array");
+    if (parsed.length > 1) first.multiple_items_detected = true;
+    return first;
+  }
+  if (parsed && typeof parsed === "object") {
+    return parsed as Record<string, unknown>;
+  }
+  throw new Error("Analysis response was not a JSON object");
+}
+
 function mapGeminiResponse(raw: Record<string, unknown>): AIAnalysisResponse {
   const categoryValid = LISTING_CATEGORIES.includes(raw.category as any);
   const conditionValid = LISTING_CONDITIONS.includes(raw.condition as any);
@@ -503,6 +537,7 @@ function mapGeminiResponse(raw: Record<string, unknown>): AIAnalysisResponse {
       value: validWorkTypes,
       confidence: toConfidence(raw.work_types_confidence),
     },
+    multiple_items_detected: raw.multiple_items_detected === true,
   };
 }
 

@@ -9,7 +9,16 @@
     "typecheck": "tsc --noEmit",
     "typecheck:scripts": "tsc -p tsconfig.scripts.json",
     "migrate:sharetribe": "tsx scripts/migrate-sharetribe.ts",
-    "migrate:photos": "tsx scripts/migrate-photos.ts"
+    "migrate:photos": "tsx scripts/migrate-photos.ts",
+    "test:xborder": "tsx scripts/test-xborder.ts",
+    "backfill:manual-payouts": "tsx scripts/backfill-manual-payout-schedule.ts",
+    "backfill:verify-emails": "tsx scripts/backfill-verify-clerk-emails.ts",
+    "seed:clerk-users": "tsx scripts/seed-clerk-users.ts",
+    "check:manual-payouts": "tsx scripts/check-manual-payout-nonlegacy.ts",
+    "backfill:subcategories": "tsx scripts/backfill-subcategories.ts",
+    "backfill:designers": "tsx scripts/backfill-designers.ts",
+    "seed:designers": "tsx scripts/seed-designers.ts",
+    "clean:migrated": "tsx scripts/clean-migrated-data.ts"
   },
   "dependencies": {
     "@clerk/backend": "^1.21.0",

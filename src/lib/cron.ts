@@ -17,9 +17,11 @@ import {
   isoMatchFoundNotification,
   orderAutoCompleteNotification,
   orderRejectedNotification,
+  offerExpiredNotification,
 } from "./notifications.js";
 import { matchISOPost } from "../routes/ai.js";
 import { getStripe } from "./stripeClient.js";
+import { ACCEPTED_OFFER_PAYMENT_HOURS } from "../types/transactions.js";
 
 /**
  * Auto-complete delivered orders that have sat in "delivered" state
@@ -157,14 +159,16 @@ export async function autoRejectOrder(orderId: string): Promise<void> {
       })
       .eq("id", orderId);
 
-    // Attempt Stripe refund (fire-and-forget, log on failure). With escrow
-    // the funds are sitting in Kifaayat's balance, so this is a clean
-    // refund — no seller-side clawback required.
+    // Attempt Stripe refund (fire-and-forget, log on failure).
+    // refundOrderPayment handles both charge models: for destination
+    // charges it reverses the transfer to claw funds back from the
+    // seller's balance; for platform-balance charges it's a plain refund.
     if (order.stripe_payment_intent_id) {
       try {
-        await getStripe().refunds.create({
-          payment_intent: order.stripe_payment_intent_id as string,
-        });
+        const { refundOrderPayment } = await import(
+          "../services/payoutService.js"
+        );
+        await refundOrderPayment(order.stripe_payment_intent_id as string);
         console.log(`[job] autoRejectOrder: refund issued for order ${orderId}`);
       } catch (refundErr) {
         console.error(
@@ -196,6 +200,105 @@ export async function autoRejectOrder(orderId: string): Promise<void> {
     console.log(`[job] autoRejectOrder complete: orderId=${orderId}`);
   } catch (err) {
     console.error(`[job] autoRejectOrder failed: orderId=${orderId}`, err);
+  }
+}
+
+/**
+ * Release accepted-but-unpaid offers. When a seller accepts an offer the
+ * listing is reserved and the buyer has ACCEPTED_OFFER_PAYMENT_HOURS to pay.
+ * If they don't, the listing would otherwise sit reserved forever. This
+ * sweep expires such offers and frees the listing back to 'active'.
+ *
+ * Idempotent + safe: only touches offers still 'accepted' past the window
+ * with NO order created, and only reverts the listing if it's still
+ * 'reserved' (never clobbers a listing that got sold via another path).
+ */
+export async function releaseExpiredAcceptedOffers(): Promise<void> {
+  console.log("[job] releaseExpiredAcceptedOffers start");
+  try {
+    const supabase = createSupabaseAdmin();
+    const cutoff = new Date(
+      Date.now() - ACCEPTED_OFFER_PAYMENT_HOURS * 60 * 60 * 1000
+    ).toISOString();
+
+    const { data: staleOffers, error } = await supabase
+      .from("offers")
+      .select(
+        "id, listing_id, buyer_id, seller_id, listings!offers_listing_id_fkey(title, status)"
+      )
+      .eq("status", "accepted")
+      .lt("updated_at", cutoff);
+
+    if (error) {
+      console.error("[job] releaseExpiredAcceptedOffers query failed:", error);
+      return;
+    }
+    if (!staleOffers || staleOffers.length === 0) {
+      console.log("[job] releaseExpiredAcceptedOffers: none");
+      return;
+    }
+
+    for (const offer of staleOffers as Array<Record<string, unknown>>) {
+      const offerId = offer.id as string;
+      const listingId = offer.listing_id as string;
+
+      // If the buyer actually paid, an in-flight/complete order exists —
+      // leave both the offer and listing alone.
+      const { data: existingOrder } = await supabase
+        .from("orders")
+        .select("id")
+        .eq("listing_id", listingId)
+        .in("status", ["paid", "shipped", "delivered", "complete"])
+        .limit(1)
+        .maybeSingle();
+      if (existingOrder) continue;
+
+      // Expire the offer (guard on status so a concurrent accept/pay wins).
+      const { error: offerErr } = await supabase
+        .from("offers")
+        .update({ status: "expired" })
+        .eq("id", offerId)
+        .eq("status", "accepted");
+      if (offerErr) {
+        console.error(
+          `[job] releaseExpiredAcceptedOffers: expire failed for ${offerId}:`,
+          offerErr
+        );
+        continue;
+      }
+
+      // Free the listing back to active if it's still reserved.
+      await supabase
+        .from("listings")
+        .update({ status: "active", updated_at: new Date().toISOString() })
+        .eq("id", listingId)
+        .eq("status", "reserved");
+
+      // Notify both parties (best-effort).
+      const listing = (offer.listings as Record<string, unknown> | null) || null;
+      const title = (listing?.title as string) || "your item";
+      const template = offerExpiredNotification(title);
+      await Promise.all([
+        createNotification({
+          user_id: offer.buyer_id as string,
+          type: "offer_expired",
+          ...template,
+          data: { listing_id: listingId, role: "buyer" },
+        }).catch(() => {}),
+        createNotification({
+          user_id: offer.seller_id as string,
+          type: "offer_expired",
+          ...template,
+          data: { listing_id: listingId, role: "seller" },
+        }).catch(() => {}),
+      ]);
+
+      console.log(
+        `[job] releaseExpiredAcceptedOffers: released listing ${listingId} (offer ${offerId})`
+      );
+    }
+  } catch (err) {
+    console.error("[job] releaseExpiredAcceptedOffers failed:", err);
   }
 }
 

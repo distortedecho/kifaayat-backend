@@ -78,6 +78,9 @@ export interface Offer {
   currency: string;
   status: OfferStatus;
   round: number;
+  /** Who made this specific offer/counter — explicit maker so clients
+   * don't infer from round parity (which resets when a chain re-opens). */
+  offered_by: "buyer" | "seller" | null;
   parent_offer_id: string | null;
   message?: string | null;
   expires_at: string | null;
@@ -223,6 +226,19 @@ export const COMMISSION_RATE = 15;
  *  No cap; on tier sellers with a lower commission rate, Kifaayat absorbs
  *  the small loss as an acquisition cost. */
 export const VOUCHER_DISCOUNT_RATE = 10;
+
+/**
+ * Global promo codes — platform-wide discount codes NOT tied to any user's
+ * referral. They apply the same VOUCHER_DISCOUNT_RATE (10%) but skip the
+ * referral_codes table lookup, the self-use check, and the referrer-credit
+ * step (there's no referrer to credit). Case-insensitive.
+ */
+export const GLOBAL_PROMO_CODES = new Set(["WELCOME10"]);
+
+export function isGlobalPromoCode(code: string | null | undefined): boolean {
+  if (!code) return false;
+  return GLOBAL_PROMO_CODES.has(code.toUpperCase().trim());
+}
 
 /** Maximum offer rounds before expiry */
 export const MAX_OFFER_ROUNDS = 3;

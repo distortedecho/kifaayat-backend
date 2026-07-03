@@ -46,8 +46,7 @@ export function registerNotificationListeners(): void {
     const template = orderPaidNotification(
       payload.listingTitle,
       payload.amount,
-      payload.currency,
-      payload.sellerPayout
+      payload.currency
     );
     await dispatchNotification({
       user_id: payload.sellerId,

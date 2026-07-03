@@ -28,6 +28,8 @@ export interface AppEventMap {
     amount: number;
     currency: string;
     sellerPayout: number;
+    shippingAmount: number;
+    deliveryMethod: "pickup" | "shipping";
   };
   "offer:received": {
     offerId: string;

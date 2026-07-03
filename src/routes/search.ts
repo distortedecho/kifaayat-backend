@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 import { optionalClerkMiddleware } from "../middleware/clerk.js";
 import { createSupabaseAdmin } from "../lib/supabase.js";
+import { logger } from "../lib/logger.js";
 import {
   LISTING_CATEGORIES,
   LISTING_CONDITIONS,
@@ -153,12 +154,22 @@ search.get("/", optionalClerkMiddleware, async (c) => {
   // Kept for sub_category pairing + Budget-Friendly median lookup, which
   // only make sense with a single category. Null when 0 or 2+ selected.
   const category = categories.length === 1 ? categories[0] : undefined;
-  const subCategory = c.req.query("sub_category");
+  // sub_category is multi-select (comma-separated), e.g. within Jewellery
+  // the buyer can tick Earrings + Bangles at once — same UX as clothing
+  // categories. All values must belong to the single selected parent.
+  const subCategoryRaw = c.req.query("sub_category");
+  const subCategories = subCategoryRaw
+    ? subCategoryRaw.split(",").map((s) => s.trim()).filter(Boolean)
+    : [];
   // Exact-ish designer filter (e.g. a "Sabyasachi Mukherjee" chip or
   // designer dropdown). Case-insensitive substring so minor label
   // variations still match. Independent of the free-text `q` search.
   const designer = c.req.query("designer")?.trim();
-  const condition = c.req.query("condition");
+  // condition is multi-select (comma-separated), same UX as categories.
+  const conditionRaw = c.req.query("condition");
+  const conditions = conditionRaw
+    ? conditionRaw.split(",").map((s) => s.trim()).filter(Boolean)
+    : [];
   const occasion = c.req.query("occasion"); // comma-separated
   const color = c.req.query("color"); // comma-separated
   const location = c.req.query("location");
@@ -178,47 +189,60 @@ search.get("/", optionalClerkMiddleware, async (c) => {
   //   "Budget Friendly" → computed via price < category_median * 0.6
   const curation = c.req.query("curation");
 
+  // Log + return a 400 for a rejected search. Captures the raw query so a
+  // "GET /api/search 400" in the request log tells us WHICH filter the FE
+  // sent that we don't accept (stale value, bad casing, wrong pairing).
+  const rejectSearch = (reason: string) => {
+    logger.warn("search.rejected", {
+      reason,
+      query: c.req.query(),
+      requestId: c.get("requestId"),
+      userId: c.get("clerkUserId") || "anonymous",
+    });
+    return c.json({ error: reason }, 400);
+  };
+
   // Validate filter values — every category in the multi-select must be
   // a known one.
   const invalidCategory = categories.find(
     (cat) => !LISTING_CATEGORIES.includes(cat as (typeof LISTING_CATEGORIES)[number])
   );
   if (invalidCategory) {
-    return c.json({ error: `Invalid category filter: ${invalidCategory}` }, 400);
+    return rejectSearch(`Invalid category filter: ${invalidCategory}`);
   }
   // sub_category only makes sense paired with EXACTLY ONE category — the
   // FE filter sheet only surfaces sub-categories after a single parent is
   // picked. Reject if sub_category is sent with zero or multiple
   // categories (stale/malformed query).
-  if (subCategory) {
+  if (subCategories.length > 0) {
     if (categories.length !== 1) {
-      return c.json(
-        { error: "sub_category requires exactly one category to be specified" },
-        400
-      );
+      return rejectSearch("sub_category requires exactly one category to be specified");
     }
-    if (!isValidSubCategoryPair(category!, subCategory)) {
-      return c.json({ error: "Invalid sub_category for this category" }, 400);
+    const invalidSub = subCategories.find(
+      (sub) => !isValidSubCategoryPair(category!, sub)
+    );
+    if (invalidSub) {
+      return rejectSearch(`Invalid sub_category for this category: ${invalidSub}`);
     }
   }
-  if (
-    condition &&
-    !LISTING_CONDITIONS.includes(condition as (typeof LISTING_CONDITIONS)[number])
-  ) {
-    return c.json({ error: "Invalid condition filter" }, 400);
+  const invalidCondition = conditions.find(
+    (cond) => !LISTING_CONDITIONS.includes(cond as (typeof LISTING_CONDITIONS)[number])
+  );
+  if (invalidCondition) {
+    return rejectSearch(`Invalid condition filter: ${invalidCondition}`);
   }
   if (location && !["AU", "US", "NZ", "CA", "GB"].includes(location)) {
-    return c.json({ error: "Invalid location filter" }, 400);
+    return rejectSearch(`Invalid location filter: ${location}`);
   }
   if (market && !["AU", "US", "NZ", "CA", "GB"].includes(market)) {
-    return c.json({ error: "Invalid market filter" }, 400);
+    return rejectSearch(`Invalid market filter: ${market}`);
   }
   const invalidSize = sizes.find((s) => !VALID_SIZES.includes(s));
   if (invalidSize) {
-    return c.json({ error: `Invalid size filter: ${invalidSize}` }, 400);
+    return rejectSearch(`Invalid size filter: ${invalidSize}`);
   }
   if (!["newest", "price_asc", "price_desc", "relevance"].includes(sort)) {
-    return c.json({ error: "Invalid sort option" }, 400);
+    return rejectSearch(`Invalid sort option: ${sort}`);
   }
   const CURATION_COMPUTED = ["Trending", "Budget Friendly"] as const;
   const ALLOWED_CURATION = [
@@ -226,7 +250,7 @@ search.get("/", optionalClerkMiddleware, async (c) => {
     ...CURATION_COMPUTED,
   ] as readonly string[];
   if (curation && !ALLOWED_CURATION.includes(curation)) {
-    return c.json({ error: "Invalid curation filter" }, 400);
+    return rejectSearch(`Invalid curation filter: ${curation}`);
   }
 
   const priceMin = priceMinStr ? parseInt(priceMinStr, 10) : null;
@@ -304,8 +328,8 @@ search.get("/", optionalClerkMiddleware, async (c) => {
     query = query.in("category", categories);
   }
 
-  if (subCategory) {
-    query = query.eq("sub_category", subCategory);
+  if (subCategories.length > 0) {
+    query = query.in("sub_category", subCategories);
   }
 
   if (designer) {
@@ -355,8 +379,8 @@ search.get("/", optionalClerkMiddleware, async (c) => {
     }
   }
 
-  if (condition) {
-    query = query.eq("condition", condition);
+  if (conditions.length > 0) {
+    query = query.in("condition", conditions);
   }
 
   if (occasion) {
@@ -600,7 +624,7 @@ search.get("/", optionalClerkMiddleware, async (c) => {
       await supabase.from("search_queries").insert({
         term: q || "",
         user_id: userId,
-        filters: { categories, condition, occasion, sizes, market, designer },
+        filters: { categories, conditions, occasion, sizes, market, designer },
         result_count: items.length,
       });
     } catch {

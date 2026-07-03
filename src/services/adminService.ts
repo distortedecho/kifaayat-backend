@@ -228,15 +228,11 @@ export async function approveListing(
 
   const seller = listing.profiles;
 
-  // Any usable payout method qualifies — Stripe Connect, Wise, or PayPal.
-  // See services/payoutService.ts for what "usable" means per method.
-  const { resolveSellerPayoutMethod } = await import("./payoutService.js");
-  if (!resolveSellerPayoutMethod(seller)) {
-    throw new AdminServiceError(
-      "Cannot approve: seller has not set up a payout method (Stripe / Wise / PayPal)",
-      400
-    );
-  }
+  // Approval is a CONTENT decision — payout readiness is NOT gated here.
+  // The admin sees the seller's payout status and decides; if their chosen
+  // payout isn't ready the listing still can't be PURCHASED (checkout
+  // enforces that), so no money is taken for a payee we can't pay. Matches
+  // "publish/approve freely, gate at purchase".
 
   const { data: updated, error: updateError } = await supabase
     .from("listings")

@@ -9,13 +9,14 @@
 import { logError, type MigrationContext } from "./context.js";
 import {
   buildMeasurementsJsonb,
-  cleanDesigner,
   dollarsToCents,
+  dryCleaningApplies,
   extractCurationTags,
   extractItemsIncluded,
   extractLegacyProductType,
   isRentalListing,
-  mapCategory,
+  loadDesignerCsv,
+  mapCategoryAndSub,
   mapCondition,
   mapColours,
   mapCountryOfOrigin,
@@ -24,7 +25,10 @@ import {
   mapListingState,
   mapOccasionTags,
   mapSize,
+  resolveDesigner,
   sanitizeCents,
+  DESIGNER_CSV_DEFAULT,
+  type DesignerCsvMap,
 } from "./mappings.js";
 import type { SharetribeListing, SharetribeTransaction } from "./types.js";
 import { DEFAULT_BATCH_SIZE, chunk } from "./batch.js";
@@ -35,6 +39,17 @@ export async function importListings(
   transactions: SharetribeTransaction[]
 ): Promise<void> {
   console.log(`[listings] importing ${listings.length} records`);
+
+  // Load the client's canonical designer CSV once (env override or default).
+  // If it's missing we still import — designers just come out blank.
+  const csvPath = process.env.DESIGNER_CSV ?? DESIGNER_CSV_DEFAULT;
+  let designerCsv: DesignerCsvMap | null = null;
+  try {
+    designerCsv = loadDesignerCsv(csvPath);
+    console.log(`[listings] designer CSV loaded (${designerCsv.size} keys) from ${csvPath}`);
+  } catch {
+    console.warn(`[listings] designer CSV not found at ${csvPath} — designers will be blank`);
+  }
 
   const soldListingIds = new Set<string>(
     transactions
@@ -47,15 +62,17 @@ export async function importListings(
     description: string | null;
     seller_id: string;
     category: string;
+    sub_category: string | null;
     condition: string;
     status: string;
-    price_amount: number;
+    price_amount: number | null;
     price_currency: string;
     original_price_amount: number | null;
     negotiable: boolean;
     size_type: string | null;
     estimated_size: string | null;
     designer_name: string | null;
+    designer_origin: string | null;
     country_of_origin: string | null;
     dry_cleaning_status: string | null;
     fabric_types: string[];
@@ -98,15 +115,25 @@ export async function importListings(
       const a = l.attributes;
       const meta = a.metadata ?? {};
       const size = mapSize(pub);
-      const designer = cleanDesigner(
-        pub.designer as string | undefined,
-        pub.designerID as string | undefined
+      const { category, sub_category } = mapCategoryAndSub(
+        pub.categoryLevel2 as string | undefined
       );
+      // Canonical designer + origin from the client CSV (blank if unmatched
+      // or CSV absent).
+      const designer = designerCsv
+        ? resolveDesigner(
+            designerCsv,
+            pub.designer as string | undefined,
+            pub.designerID as string | undefined
+          )
+        : { designer_name: null, designer_origin: null };
       // Sharetribe `price.amount` is in dollars (float). Other fields
       // are nominally in subunits but the data has floats and absurd
       // outliers; sanitizeCents rounds + clamps + returns null for
-      // garbage so the INTEGER columns don't overflow.
-      const priceCents = dollarsToCents(a.price?.amount ?? null) ?? 0;
+      // garbage so the INTEGER columns don't overflow. Missing price → null
+      // (client: "shouldn't be missing — investigate"); leaves it as an
+      // incomplete draft rather than a fake $0 listing.
+      const priceCents = dollarsToCents(a.price?.amount ?? null);
       const originalPriceCents = dollarsToCents(
         pub.estimateOriginalPurchasePriceAud as number | undefined
       );
@@ -143,7 +170,8 @@ export async function importListings(
         title: a.title,
         description: a.description ?? null,
         seller_id: sellerId,
-        category: mapCategory(pub.categoryLevel2 as string | undefined) ?? "Other",
+        category,
+        sub_category,
         condition: mapCondition(pub.condition as string | undefined),
         status: mapListingState(a.state, soldListingIds.has(l.id)),
         price_amount: priceCents,
@@ -152,12 +180,16 @@ export async function importListings(
         negotiable: isNegotiable,
         size_type: size.size_type,
         estimated_size: size.estimated_size,
-        designer_name: designer,
+        designer_name: designer.designer_name,
+        designer_origin: designer.designer_origin,
         // Slug → display-label mapping (see mappings.ts). Was previously
         // stored raw, which surfaced "india" / "net" / camelCase
         // dry-clean slugs in the UI.
         country_of_origin: mapCountryOfOrigin(pub.country),
-        dry_cleaning_status: mapDryCleaningStatus(pub.dryCleaningStatus),
+        // Dry-cleaning doesn't apply to Jewellery / Accessories (client).
+        dry_cleaning_status: dryCleaningApplies(category)
+          ? mapDryCleaningStatus(pub.dryCleaningStatus)
+          : null,
         fabric_types: mapFabricTypes(pub.fabric),
         // Folds loose bustinches/hipsinches/waistinch/lengthinches into
         // the structured measurements JSONB alongside publicData.measurements.
@@ -225,6 +257,7 @@ export async function importListings(
           "description",
           "seller_id",
           "category",
+          "sub_category",
           "condition",
           "status",
           "price_amount",
@@ -234,6 +267,7 @@ export async function importListings(
           "size_type",
           "estimated_size",
           "designer_name",
+          "designer_origin",
           "country_of_origin",
           "dry_cleaning_status",
           "fabric_types",

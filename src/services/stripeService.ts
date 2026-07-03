@@ -130,6 +130,14 @@ export async function createExpressAccount(profile: {
       card_payments: { requested: true },
       transfers: { requested: true },
     },
+    // Manual payout schedule = escrow. We charge on behalf of the seller
+    // (destination charge), so buyer funds settle into the seller's Stripe
+    // balance immediately — but with a manual schedule they can't reach the
+    // seller's bank until we trigger the payout on delivery. This also keeps
+    // the funds clawable (reverse_transfer) for refunds before release.
+    settings: {
+      payouts: { schedule: { interval: "manual" } },
+    },
     metadata: {
       kifaayat_profile_id: profile.id,
     },

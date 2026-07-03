@@ -16,6 +16,7 @@ import {
 } from "../lib/notifications.js";
 import { emit } from "../lib/events.js";
 import { acceptOffer, declineOffer, OfferServiceError } from "../services/offerService.js";
+import { findContactInfo } from "../lib/validation.js";
 
 const offers = new Hono();
 
@@ -131,6 +132,7 @@ offers.post("/", idempotencyMiddleware, clerkMiddleware, requireProfile, async (
       currency,
       status: "pending" as OfferStatus,
       round: 1,
+      offered_by: "buyer", // initial offers are always buyer-initiated
       expires_at: expiresAt.toISOString(),
     })
     .select()
@@ -214,6 +216,7 @@ offers.get("/mine", clerkMiddleware, requireProfile, async (c) => {
       currency: row.currency as string,
       status: row.status as OfferStatus,
       round: row.round as number,
+      offered_by: (row.offered_by as "buyer" | "seller" | null) ?? null,
       parent_offer_id: row.parent_offer_id as string | null,
       message: row.message as string | null,
       expires_at: row.expires_at as string | null,
@@ -293,6 +296,7 @@ offers.get("/received", clerkMiddleware, requireProfile, async (c) => {
       currency: row.currency as string,
       status: row.status as OfferStatus,
       round: row.round as number,
+      offered_by: (row.offered_by as "buyer" | "seller" | null) ?? null,
       parent_offer_id: row.parent_offer_id as string | null,
       message: row.message as string | null,
       expires_at: row.expires_at as string | null,
@@ -419,6 +423,19 @@ offers.post("/:id/counter", clerkMiddleware, requireProfile, async (c) => {
 
   const { amount: counterAmount, message: counterMessage } = parsed.data;
 
+  // Authoritative off-platform-contact block. Keep negotiation in-app so
+  // orders/disputes/payments stay traceable — reject counter messages that
+  // smuggle in a phone/email/social handle (the FE deterrent is bypassable).
+  const contactReason = findContactInfo(counterMessage);
+  if (contactReason) {
+    return c.json(
+      {
+        error: `For your safety, keep the conversation in Kifaayat — messages can't include ${contactReason}.`,
+      },
+      400
+    );
+  }
+
   // Fetch the offer
   const { data: offer, error: fetchError } = await supabase
     .from("offers")
@@ -488,6 +505,8 @@ offers.post("/:id/counter", clerkMiddleware, requireProfile, async (c) => {
       status: "pending" as OfferStatus,
       round: offer.round + 1,
       parent_offer_id: offerId,
+      // The maker of THIS counter is whoever is countering right now.
+      offered_by: isSeller ? "seller" : "buyer",
       message: counterMessage || null,
       expires_at: expiresAt.toISOString(),
     })

@@ -4,7 +4,10 @@ import crypto from "node:crypto";
 import { clerkMiddleware, optionalClerkMiddleware } from "../middleware/clerk.js";
 import { requireProfile } from "../middleware/requireProfile.js";
 import { createSupabaseAdmin } from "../lib/supabase.js";
-import { createNotification, welcomeBackNotification } from "../lib/notifications.js";
+import {
+  ensureProfile,
+  fetchClerkContactInfo,
+} from "../lib/profileProvisioning.js";
 import {
   getStripeClient,
   getOrCreateStripeCustomer,
@@ -38,138 +41,6 @@ async function fetchFollowCounts(
     follower_count: followerCount || 0,
     following_count: followingCount || 0,
   };
-}
-
-/**
- * Lookup a Clerk user's primary email + verified phone (if any) via
- * the Clerk backend SDK. Email is lower-cased + trimmed for
- * case-insensitive matching. Phone is returned in its raw E.164 form
- * (e.g. `+61412345678`). Either or both may be null depending on
- * which verification methods the user completed during signup.
- */
-async function fetchClerkContactInfo(
-  clerkUserId: string
-): Promise<{ email: string | null; phone: string | null }> {
-  try {
-    const { createClerkClient } = await import("@clerk/backend");
-    const clerk = createClerkClient({
-      secretKey: process.env.CLERK_SECRET_KEY || "",
-    });
-    const user = await clerk.users.getUser(clerkUserId);
-
-    const primaryEmail = user.emailAddresses.find(
-      (e) => e.id === user.primaryEmailAddressId
-    );
-    const email = (primaryEmail?.emailAddress || user.emailAddresses[0]?.emailAddress || "")
-      .toLowerCase()
-      .trim() || null;
-
-    // Phone is optional — only present if the user added + verified one.
-    // primaryPhoneNumberId points at the active phone; resolve to E.164.
-    const primaryPhone = user.phoneNumbers?.find(
-      (p) => p.id === user.primaryPhoneNumberId
-    );
-    const phone =
-      (primaryPhone?.phoneNumber || user.phoneNumbers?.[0]?.phoneNumber || "").trim() ||
-      null;
-
-    return { email, phone };
-  } catch (err) {
-    console.error("Error fetching Clerk user contact info:", err);
-    return { email: null, phone: null };
-  }
-}
-
-
-/**
- * Sharetribe-migration claim flow.
- *
- * When a returning user signs up via Clerk with the same email they
- * used on the old app, the importer's already left a profile row
- * waiting for them (clerk_id NULL, email set, all their listings/
- * wishlists/reviews already attached). Stamp the Clerk ID onto that
- * row and return it as the canonical profile.
- *
- * Race-safe: the UPDATE uses `clerk_id IS NULL` as a guard so two
- * simultaneous claim attempts can't both win. The losing call falls
- * through to the normal "fresh profile" path and we end up with a
- * harmless second profile — the original Sharetribe data is still on
- * the winner.
- *
- * Returns the claimed profile row, or null if no match was found.
- */
-async function tryClaimLegacyProfile(
-  supabase: ReturnType<typeof createSupabaseAdmin>,
-  clerkUserId: string
-): Promise<Record<string, unknown> | null> {
-  const { email, phone: clerkPhone } = await fetchClerkContactInfo(clerkUserId);
-  if (!email) return null;
-
-  // Find a pre-migrated profile (clerk_id null, email matches, legacy id set).
-  // The unique partial index on LOWER(email) WHERE email IS NOT NULL
-  // guarantees there's at most one candidate.
-  const { data: legacy, error: lookupError } = await supabase
-    .from("profiles")
-    .select("*")
-    .ilike("email", email)
-    .is("clerk_id", null)
-    .not("legacy_sharetribe_id", "is", null)
-    .maybeSingle();
-
-  if (lookupError || !legacy) return null;
-
-  // Backfill phone from Clerk if the migrated profile didn't have one
-  // (a lot of Sharetribe users left phone blank). If they did have a
-  // phone from Sharetribe, keep it — that's the one they explicitly
-  // provided on the old app; Clerk's might differ for legitimate
-  // reasons (different number, partner's account, etc.).
-  const updatePayload: Record<string, unknown> = { clerk_id: clerkUserId };
-  if (!legacy.phone && clerkPhone) {
-    updatePayload.phone = clerkPhone;
-  }
-
-  // Claim it — guarded by `clerk_id IS NULL` so a concurrent claim can't
-  // double-stamp the same row.
-  const { data: claimed, error: updateError } = await supabase
-    .from("profiles")
-    .update(updatePayload)
-    .eq("id", legacy.id)
-    .is("clerk_id", null)
-    .select()
-    .single();
-
-  if (updateError || !claimed) {
-    // Race lost (or DB error) — return null so caller falls through
-    // to the normal create-fresh path.
-    return null;
-  }
-
-  console.log(
-    `[profiles] legacy claim: clerk=${clerkUserId} → profile=${claimed.id} ` +
-      `(legacy_sharetribe_id=${claimed.legacy_sharetribe_id})`
-  );
-
-  // Drop a single welcome-back notification into their inbox so they
-  // land with something rather than an empty notifications screen.
-  // Fire-and-forget — a notification failure must NOT block the claim.
-  // Best-effort first-name extraction from display_name; OK if null.
-  const displayName = (claimed.display_name as string | null) || null;
-  const firstName = displayName ? displayName.split(/\s+/)[0] : null;
-  const template = welcomeBackNotification(firstName);
-  createNotification({
-    user_id: claimed.id as string,
-    type: "welcome_back",
-    title: template.title,
-    body: template.body,
-    data: {
-      role: "buyer",
-      legacy_sharetribe_id: claimed.legacy_sharetribe_id as string,
-    },
-  }).catch((err) =>
-    console.error("Failed to create welcome_back notification:", err)
-  );
-
-  return claimed;
 }
 
 // Zod schema for profile updates
@@ -233,150 +104,53 @@ profiles.get("/me", clerkMiddleware, async (c) => {
   const clerkUserId = c.get("clerkUserId");
   const supabase = createSupabaseAdmin();
 
-  // Try to find existing profile
-  const { data: profile, error: selectError } = await supabase
-    .from("profiles")
-    .select("*")
-    .eq("clerk_id", clerkUserId)
-    .single();
-
-  if (selectError && selectError.code !== "PGRST116") {
-    // PGRST116 = "not found" — any other error is unexpected
-    console.error("Error fetching profile:", selectError);
+  // Ensure a profile exists (find → claim legacy → create fresh). This is
+  // the SAME provisioning path requireProfile uses, so whichever
+  // authenticated request lands first provisions the row — no signup race.
+  const result = await ensureProfile(clerkUserId);
+  if (!result) {
     return c.json({ error: "Failed to fetch profile" }, 500);
   }
+  const { profile, status } = result;
 
-  if (profile) {
-    // Write-through sync from Clerk: if the user verified a new phone
-    // (e.g. via the "Add phone" flow in Settings) or changed their
-    // email since the last time we wrote to this row, refresh our
-    // copy. Clerk is the source of truth for both — we never trust
-    // the FE to send them in a PATCH because the values would be
-    // unverified at our layer. Best-effort; failures are logged but
-    // don't block the GET.
+  // For an already-existing row, write-through sync verified Clerk
+  // email/phone in case the user changed them since our last write. Clerk
+  // is the source of truth; we never trust the FE to PATCH these (they'd be
+  // unverified at our layer). Best-effort; failures don't block the GET.
+  if (status === "existing") {
     try {
       const { email: clerkEmail, phone: clerkPhone } =
         await fetchClerkContactInfo(clerkUserId);
       const updates: Record<string, string | null> = {};
-      if (clerkPhone && clerkPhone !== profile.phone) {
+      const currentPhone = (profile.phone as string | null) || null;
+      const currentEmail = (profile.email as string | null) || "";
+      if (clerkPhone && clerkPhone !== currentPhone) {
         updates.phone = clerkPhone;
       }
-      if (clerkEmail && clerkEmail.toLowerCase() !== (profile.email || "").toLowerCase()) {
+      if (clerkEmail && clerkEmail.toLowerCase() !== currentEmail.toLowerCase()) {
         updates.email = clerkEmail;
       }
       if (Object.keys(updates).length > 0) {
         await supabase
           .from("profiles")
           .update(updates)
-          .eq("id", profile.id);
+          .eq("id", profile.id as string);
         Object.assign(profile, updates);
       }
     } catch (err) {
       console.warn("[profiles GET /me] Clerk sync failed (non-fatal):", err);
     }
-
-    const counts = await fetchFollowCounts(supabase, profile.id);
-    return c.json({ profile: { ...profile, ...counts } });
   }
 
-  // No profile by clerk_id. Before creating a fresh one, check the
-  // Sharetribe-migration lookup: is there a pre-migrated profile with
-  // this user's email and no clerk_id yet? If so, claim it.
-  //
-  // This is the second half of the email-match-on-Clerk-signup flow.
-  // When a returning user signs up via Clerk with the same email they
-  // had on the old Sharetribe app, their listings/wishlist/reviews etc
-  // are already sitting in the DB attached to a profile row that's
-  // waiting to be claimed. We stamp the Clerk ID onto that row instead
-  // of creating a duplicate.
-  const claimed = await tryClaimLegacyProfile(supabase, clerkUserId);
-  if (claimed) {
-    const counts = await fetchFollowCounts(supabase, claimed.id as string);
-    return c.json({ profile: { ...claimed, ...counts } });
-  }
-
-  // No legacy match either — create a fresh profile.
-  // If Clerk has a verified primary phone/email (e.g. the new app's
-  // phone-OTP signup flow), pre-fill them so the onboarding screen
-  // can display them as defaults.
-  const { email: clerkEmail, phone: clerkPhone } = await fetchClerkContactInfo(
-    clerkUserId
-  );
-  const freshInsert: Record<string, unknown> = { clerk_id: clerkUserId };
-  if (clerkEmail) freshInsert.email = clerkEmail;
-  if (clerkPhone) freshInsert.phone = clerkPhone;
-
-  const { data: newProfile, error: insertError } = await supabase
-    .from("profiles")
-    .insert(freshInsert)
-    .select()
-    .single();
-
-  if (insertError) {
-    console.error("Error creating profile:", insertError);
-    return c.json({ error: "Failed to create profile" }, 500);
-  }
-
-  // Fire-and-forget welcome email (don't await, don't block profile creation)
-  // The welcome hook looks up the user's email via Clerk backend SDK.
-  // NOTE: API_URL must be set to the Railway public URL in production,
-  // otherwise the internal callback will point at localhost inside the
-  // container and silently fail. Dev falls back to localhost:PORT.
-  const apiBaseUrl =
-    process.env.API_URL || `http://localhost:${process.env.PORT || 3001}`;
-  fetch(`${apiBaseUrl}/api/email-hooks/welcome`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Internal-Secret": process.env.INTERNAL_API_SECRET || "",
-    },
-    body: JSON.stringify({
-      clerk_user_id: clerkUserId,
-    }),
-  }).catch(() => {
-    // Intentionally swallowed — welcome email is best-effort
-  });
-
-  // Fire-and-forget referral code generation
-  (async () => {
-    try {
-      const { createClerkClient } = await import("@clerk/backend");
-      const clerk = createClerkClient({
-        secretKey: process.env.CLERK_SECRET_KEY || "",
-      });
-      const user = await clerk.users.getUser(clerkUserId);
-      const randomSuffix = () =>
-        "K" +
-        Math.random().toString(36).toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 4).padEnd(4, "0");
-
-      const base = (user.username || user.firstName || newProfile.id.slice(0, 8))
-        .toUpperCase()
-        .replace(/[^A-Z0-9]/g, "")
-        .slice(0, 20) || newProfile.id.slice(0, 8).toUpperCase();
-
-      const code = `${base}-${randomSuffix()}`;
-
-      const { error: codeError } = await supabase.from("referral_codes").insert({
-        user_id: newProfile.id,
-        code,
-      });
-
-      // Handle UNIQUE collision -- regenerate suffix
-      if (codeError?.code === "23505") {
-        await supabase.from("referral_codes").insert({
-          user_id: newProfile.id,
-          code: `${base}-${randomSuffix()}`,
-        });
-      }
-    } catch (err) {
-      console.error("Error generating referral code:", err);
-      // Non-blocking -- profile still created successfully
-    }
-  })();
+  // A just-created profile has no followers yet — skip the round-trip.
+  const counts =
+    status === "created"
+      ? { follower_count: 0, following_count: 0 }
+      : await fetchFollowCounts(supabase, profile.id as string);
 
   return c.json(
-    { profile: { ...newProfile, follower_count: 0, following_count: 0 } },
-    201
+    { profile: { ...profile, ...counts } },
+    status === "created" ? 201 : 200
   );
 });
 

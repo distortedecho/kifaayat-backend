@@ -181,6 +181,11 @@ export async function createOrder(
   const intentMetadata = (intent.metadata || {}) as Record<string, string>;
   const itemAmount = parseInt(intentMetadata.item_amount || String(amount), 10);
   const shippingAmount = parseInt(intentMetadata.shipping_amount || "0", 10);
+  // Persist the buyer's fulfilment choice. Without this the column defaults
+  // to 'shipping' (schema-14), so pickup orders created via this FE-confirm
+  // path were mislabeled — breaking the pickup flow + the sale notification.
+  const deliveryMethod =
+    intentMetadata.delivery_method === "pickup" ? "pickup" : "shipping";
   const voucherDiscount = parseInt(intentMetadata.voucher_discount || "0", 10);
   // Optional buyer note from checkout — empty string in metadata = no note.
   const buyerNote = intentMetadata.buyer_note ? intentMetadata.buyer_note : null;
@@ -215,7 +220,7 @@ export async function createOrder(
             buyer_note,
             currency, commission_rate, commission_amount,
             seller_payout, stripe_payment_intent_id, stripe_checkout_session_id,
-            status
+            status, delivery_method
           ) VALUES (
             ${orderNumber}, ${listing_id}, ${buyerId}, ${listing.seller_id},
             ${buyer_email}, ${offer_id || null}, ${amount}, ${itemAmount}, ${shippingAmount}, ${voucherDiscount},
@@ -223,7 +228,7 @@ export async function createOrder(
             ${currency}, ${commissionRate}, ${commissionAmount}, ${sellerPayout},
             ${stripe_payment_intent_id},
             ${stripe_checkout_session_id || null},
-            ${"paid" as OrderStatus}
+            ${"paid" as OrderStatus}, ${deliveryMethod}
           )
           RETURNING *
         `;
@@ -285,6 +290,7 @@ export async function createOrder(
         stripe_payment_intent_id,
         stripe_checkout_session_id: stripe_checkout_session_id || null,
         status: "paid" as OrderStatus,
+        delivery_method: deliveryMethod,
       })
       .select()
       .single();
@@ -343,6 +349,8 @@ export async function createOrder(
     amount,
     currency,
     sellerPayout,
+    shippingAmount,
+    deliveryMethod,
   });
 
   return order;

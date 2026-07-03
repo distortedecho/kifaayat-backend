@@ -9,6 +9,7 @@ import { createNotification, orderPaidNotification } from "../lib/notifications.
 import {
   generateOrderNumber,
   VOUCHER_DISCOUNT_RATE,
+  isGlobalPromoCode,
   type OrderStatus,
 } from "../types/transactions.js";
 import { getCommissionRate, getSellerCommissionRate } from "../lib/commission.js";
@@ -275,8 +276,10 @@ stripeRoutes.post("/payment-intent", optionalClerkMiddleware, async (c) => {
     return c.json({ error: "You cannot buy your own listing" }, 400);
   }
 
-  // Validate referral_code if provided
-  if (referral_code) {
+  // Validate referral_code if provided. Global promos (e.g. WELCOME10) are
+  // platform-wide — they skip the referral_codes lookup and self-use check;
+  // any valid buyer gets the discount. User referral codes still validate.
+  if (referral_code && !isGlobalPromoCode(referral_code)) {
     const normalizedCode = referral_code.toUpperCase().trim();
     const { data: codeRow } = await supabase
       .from("referral_codes")
@@ -426,8 +429,12 @@ stripeRoutes.post("/payment-intent", optionalClerkMiddleware, async (c) => {
     }
   }
 
-  // Build PaymentIntent params — no transfer_data, no application_fee_amount.
-  // Funds land fully in Kifaayat's balance; we move them on delivery.
+  // Build PaymentIntent params.
+  //
+  // For Stripe Connect sellers this becomes a DESTINATION CHARGE below
+  // (on_behalf_of + transfer_data + application_fee). For Wise/PayPal
+  // sellers it stays a plain charge — funds land in Kifaayat's balance
+  // and admin disburses manually.
   //
   // payment_method_types is pinned to "card" so PaymentSheet doesn't
   // surface redirect-based methods (Klarna, Zip, Afterpay, Link). Those
@@ -485,6 +492,32 @@ stripeRoutes.post("/payment-intent", optionalClerkMiddleware, async (c) => {
     intentParams.receipt_email = buyer_email;
   }
 
+  // DESTINATION CHARGE for Stripe Connect sellers. Charging on behalf of
+  // the seller settles the funds into THEIR Stripe balance (held by their
+  // manual payout schedule until we release on delivery). This is what
+  // makes cross-border payouts work: a standalone Transfer from our AU
+  // platform to a US/UK seller is blocked, but a destination charge is
+  // allowed because it's traceable to the original payment.
+  //
+  // application_fee_amount = what Kifaayat keeps = buyer's charge minus the
+  // seller's payout (commission net of any buyer discount, which Kifaayat
+  // absorbs). Clamped at 0: if a discount ever exceeds commission we can't
+  // top the seller up cross-border, so we keep our whole cut and flag it.
+  if (resolvedMethod === "stripe" && sellerProfile?.stripe_account_id) {
+    const rawFee = chargeAmount - sellerPayout;
+    if (rawFee < 0) {
+      console.warn(
+        `[stripe] buyer discount exceeds commission for listing ${listing_id}; ` +
+          `clamping application_fee to 0 (seller payout capped at charge amount).`
+      );
+    }
+    intentParams.on_behalf_of = sellerProfile.stripe_account_id;
+    intentParams.transfer_data = {
+      destination: sellerProfile.stripe_account_id,
+    };
+    intentParams.application_fee_amount = Math.max(0, rawFee);
+  }
+
   try {
     const paymentIntent = await getStripe().paymentIntents.create(intentParams);
 
@@ -532,13 +565,19 @@ stripeRoutes.post("/create-account", clerkMiddleware, requireProfile, async (c) 
       `[stripe create-account] profile=${profile.id} location=${profile.location} → country=${country}`
     );
 
-    // Create Stripe Express account
+    // Create Stripe Express account. Manual payout schedule = escrow:
+    // destination-charge funds settle into the seller's Stripe balance but
+    // can't reach their bank until we trigger the payout on delivery (and
+    // stay clawable via reverse_transfer for refunds until then).
     const account = await getStripe().accounts.create({
       type: "express",
       country,
       capabilities: {
         card_payments: { requested: true },
         transfers: { requested: true },
+      },
+      settings: {
+        payouts: { schedule: { interval: "manual" } },
       },
       metadata: {
         kifaayat_profile_id: profile.id,
@@ -650,6 +689,24 @@ stripeRoutes.get("/account-status", clerkMiddleware, requireProfile, async (c) =
   const payoutMethod: string | null = fullProfile?.payout_method ?? null;
   const resolvedMethod = resolveSellerPayoutMethod(fullProfile);
 
+  // "Has the seller STARTED any payout method?" — even an incomplete Stripe
+  // counts (stripe_account_id exists the moment onboarding begins). This is
+  // the signal the FE should gate LISTING on: block publishing ONLY when
+  // NOTHING is set up. `payout_ready` (below) is stricter — whether they can
+  // actually be paid via their chosen method right now.
+  const hasWiseDetails = !!(
+    fullProfile?.wise_account_holder &&
+    fullProfile?.wise_account_number &&
+    fullProfile?.wise_bank_country &&
+    fullProfile?.wise_bank_currency &&
+    fullProfile?.wise_routing_code
+  );
+  const payoutConfigured = !!(
+    profile.stripe_account_id ||
+    fullProfile?.paypal_email ||
+    hasWiseDetails
+  );
+
   if (!profile.stripe_account_id) {
     const response = {
       status: "not_connected" as const,
@@ -658,6 +715,7 @@ stripeRoutes.get("/account-status", clerkMiddleware, requireProfile, async (c) =
       payouts_enabled: false,
       payout_method: payoutMethod,
       payout_ready: resolvedMethod !== null,
+      payout_configured: payoutConfigured,
     };
     return c.json(response);
   }
@@ -687,6 +745,7 @@ stripeRoutes.get("/account-status", clerkMiddleware, requireProfile, async (c) =
       payouts_enabled: account.payouts_enabled ?? false,
       payout_method: payoutMethod,
       payout_ready: resolvedMethod !== null,
+      payout_configured: payoutConfigured,
       requirements: {
         currently_due: account.requirements?.currently_due ?? [],
         past_due: account.requirements?.past_due ?? [],
@@ -717,6 +776,9 @@ stripeRoutes.get("/account-status", clerkMiddleware, requireProfile, async (c) =
         payouts_enabled: false,
         payout_method: payoutMethod,
         payout_ready: resolvedMethod !== null,
+        // The stored Stripe id is invalid here, so it doesn't count — only a
+        // real PayPal/Wise method makes them "configured".
+        payout_configured: !!(fullProfile?.paypal_email || hasWiseDetails),
       });
     }
     console.error("Error retrieving Stripe account:", error);
@@ -1021,8 +1083,7 @@ stripeRoutes.post("/webhook", async (c) => {
           const paidTemplate = orderPaidNotification(
             `Order #${orderNumber}`,
             groupTotal,
-            currency,
-            group.seller_payout
+            currency
           );
           await createNotification({
             user_id: group.seller_id,
@@ -1237,9 +1298,8 @@ stripeRoutes.post("/webhook", async (c) => {
       logger.info("stripe.offer_marked_completed", { offer_id: offerId });
     }
 
-    // Create notification for seller
-    const shippingCost = (listing.shipping_cost_amount as number) || 0;
-    const paidTemplate = orderPaidNotification(listing.title, amount, currency, sellerPayout, shippingCost);
+    // Create notification for seller — just the sale + purchase amount.
+    const paidTemplate = orderPaidNotification(listing.title, amount, currency);
     await createNotification({
       user_id: listing.seller_id,
       type: "order_paid",
@@ -1247,9 +1307,10 @@ stripeRoutes.post("/webhook", async (c) => {
       data: { listing_id: listingId, order_id: order.id, role: "seller" },
     });
 
-    // Record referral and award voucher to referrer if a referral code was used
+    // Record referral and award voucher to referrer if a USER referral code
+    // was used. Global promos (WELCOME10) have no referrer to credit — skip.
     const referralCode = metadata.referral_code;
-    if (referralCode && buyerProfileId) {
+    if (referralCode && buyerProfileId && !isGlobalPromoCode(referralCode)) {
       await recordReferralAndAwardVoucher({
         supabase,
         referralCode,

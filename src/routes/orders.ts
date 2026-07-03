@@ -22,10 +22,10 @@ import {
 } from "../types/transactions.js";
 import { isFirstCompletedOrder, awardReferralCredits } from "../lib/referrals.js";
 import { createOrder, OrderServiceError } from "../services/orderService.js";
-import { getStripe } from "../lib/stripeClient.js";
 import {
   releasePayoutForOrder,
   cancelPayoutForOrder,
+  refundOrderPayment,
 } from "../services/payoutService.js";
 
 const orders = new Hono();
@@ -1181,12 +1181,12 @@ orders.post("/:id/reject", clerkMiddleware, requireProfile, async (c) => {
     return c.json({ error: "Failed to reject order" }, 500);
   }
 
-  // Attempt Stripe refund (fire-and-forget). With escrow this is a clean
-  // refund from Kifaayat's balance — no clawback from a seller's Connect
-  // account, no negative-balance risk on their side.
+  // Attempt Stripe refund (fire-and-forget). refundOrderPayment picks the
+  // right mode: destination charges reverse the transfer to reclaim funds
+  // from the seller's balance; platform-balance charges refund directly.
   if (order.stripe_payment_intent_id) {
-    getStripe().refunds.create({ payment_intent: order.stripe_payment_intent_id }).catch(
-      (err) => console.error(`Stripe refund failed for order ${orderId}:`, err)
+    refundOrderPayment(order.stripe_payment_intent_id).catch((err) =>
+      console.error(`Stripe refund failed for order ${orderId}:`, err)
     );
   }
 

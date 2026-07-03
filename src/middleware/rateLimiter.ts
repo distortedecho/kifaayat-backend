@@ -71,7 +71,7 @@ export const authLimiter: MiddlewareHandler = rateLimiter({
  */
 export const aiLimiter: MiddlewareHandler = rateLimiter({
   windowMs: ONE_MINUTE,
-  limit: 10,
+  limit: 15,
   standardHeaders: "draft-6",
   keyGenerator: userOrIpKey,
   message: { error: "AI rate limit exceeded. Please slow down." },

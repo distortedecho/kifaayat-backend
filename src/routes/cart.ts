@@ -685,8 +685,7 @@ cart.post("/checkout", clerkMiddleware, requireProfile, async (c) => {
           const paidTemplate = orderPaidNotification(
             `Order #${orderNumber}`,
             groupTotal,
-            currency,
-            group.seller_payout
+            currency
           );
           await createNotification({
             user_id: group.seller_id,
@@ -724,6 +723,16 @@ cart.post("/checkout", clerkMiddleware, requireProfile, async (c) => {
   }
 
   // ---- Normal charge: create PaymentIntent with reduced amount ----
+  //
+  // NOTE: unlike single-item checkout (routes/stripe.ts), the cart is
+  // NOT a destination charge. A cart spans multiple sellers but a
+  // destination charge can only name one `on_behalf_of`/destination.
+  // So the cart stays on the platform-balance model: funds land in
+  // Kifaayat's balance and are transferred per-seller on delivery
+  // (payoutService's legacy transfer path). That path is cross-border
+  // restricted, so cross-border cart items only work once we split the
+  // cart into one destination-charge PaymentIntent per seller — a
+  // known follow-up (needs frontend multi-confirm support).
   try {
     const paymentIntent = await getStripe().paymentIntents.create({
       amount: chargeAmount,

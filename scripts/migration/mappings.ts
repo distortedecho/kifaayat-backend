@@ -6,6 +6,8 @@
 // be a single map / function in this file, not inlined logic.
 // ============================================================
 
+import fs from "node:fs";
+
 // Note: We deliberately use `string` rather than the app's narrower
 // `ListingCategory` type for these maps — the DB schema's CHECK
 // constraint allows additional values (Jewellery, Anarkali, Sharara,
@@ -63,6 +65,53 @@ export const SHARETRIBE_CATEGORY_MAP: Record<string, string> = {
 export function mapCategory(sharetribeCat: string | null | undefined): string | null {
   if (!sharetribeCat) return null;
   return SHARETRIBE_CATEGORY_MAP[sharetribeCat] ?? null;
+}
+
+// Category + sub-category (client's data-mapping review, Jul 2026). Granular
+// Sharetribe categoryLevel2 → (category, sub_category):
+//   - jewellery/footwear values carry a sub-category
+//   - bags/belts/accessories → NEW "Accessories" category
+//   - otherjewellery / jewelleryother / otherfootwear → "Other"
+// Anything unmapped / missing → { Other, null }.
+const SHARETRIBE_CATEGORY_SUB: Record<
+  string,
+  { category: string; sub_category: string | null }
+> = {
+  salwarsuits: { category: "Suit/Salwar", sub_category: null },
+  lehengas: { category: "Lehenga", sub_category: null },
+  sarees: { category: "Saree", sub_category: null },
+  indowestern: { category: "Indowestern", sub_category: null },
+  menswear: { category: "Menswear", sub_category: null },
+  blouses: { category: "Blouse", sub_category: null },
+  kids: { category: "Kidswear", sub_category: null },
+  otherclothing: { category: "Other", sub_category: null },
+  necklace: { category: "Jewellery", sub_category: "Necklace/Necklace sets" },
+  earrings: { category: "Jewellery", sub_category: "Earrings" },
+  bangles: { category: "Jewellery", sub_category: "Bangles" },
+  earringtika: { category: "Jewellery", sub_category: "Earring & Tika Sets" },
+  womensfootwear: { category: "Footwear", sub_category: "Women's Footwear" },
+  mensfootwear: { category: "Footwear", sub_category: "Men's Footwear" },
+  bags: { category: "Accessories", sub_category: "Bags/Clutches" },
+  belts: { category: "Accessories", sub_category: "Belts" },
+  otheraccessories: { category: "Accessories", sub_category: "Other accessories" },
+  otherjewellery: { category: "Other", sub_category: null },
+  jewelleryother: { category: "Other", sub_category: null },
+  otherfootwear: { category: "Other", sub_category: null },
+};
+
+export function mapCategoryAndSub(sharetribeCat: string | null | undefined): {
+  category: string;
+  sub_category: string | null;
+} {
+  if (!sharetribeCat) return { category: "Other", sub_category: null };
+  return (
+    SHARETRIBE_CATEGORY_SUB[sharetribeCat] ?? { category: "Other", sub_category: null }
+  );
+}
+
+/** Categories where the dry-cleaning field doesn't apply (client decision). */
+export function dryCleaningApplies(category: string): boolean {
+  return category !== "Jewellery" && category !== "Accessories";
 }
 
 // ============================================================
@@ -346,6 +395,90 @@ export function cleanDesigner(
     .toString()
     .trim()
     .replace(/\s+/g, " ");
+}
+
+// ============================================================
+// Designer cleanup via the client's canonical CSV (Column C + Origin)
+// ============================================================
+// The client sent "designer clean up - designer-brand.csv":
+//   Raw Value | Match Key (normalized) | Canonical Name | Origin
+// We match a listing's raw designer (free-text, or designerID slug resolved
+// to a name) against the Match Key and take the Canonical Name + Origin.
+// Not in the CSV / blank canonical → BLANK the designer (client decision).
+
+export const DESIGNER_CSV_DEFAULT = "designer clean up - designer-brand.csv";
+
+export type DesignerResolution = {
+  designer_name: string | null;
+  designer_origin: string | null; // 'Indian' | 'Pakistani' | null
+};
+
+export type DesignerCsvMap = Map<
+  string,
+  { canonical: string | null; origin: string | null }
+>;
+
+/** Same normalisation as the CSV's Match Key column. */
+const designerNorm = (s: string): string =>
+  s.toLowerCase().replace(/[^a-z0-9]/g, "");
+
+/** Quote-aware CSV line parser (handles embedded commas in "..." fields). */
+function parseCsvLine(line: string): string[] {
+  const out: string[] = [];
+  let cur = "";
+  let inQ = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (inQ) {
+      if (ch === '"') {
+        if (line[i + 1] === '"') { cur += '"'; i++; } else inQ = false;
+      } else cur += ch;
+    } else if (ch === '"') inQ = true;
+    else if (ch === ",") { out.push(cur); cur = ""; }
+    else cur += ch;
+  }
+  out.push(cur);
+  return out;
+}
+
+/** Load the designer CSV into a matchKey → { canonical, origin } map. */
+export function loadDesignerCsv(path: string): DesignerCsvMap {
+  const map: DesignerCsvMap = new Map();
+  const lines = fs.readFileSync(path, "utf8").split(/\r?\n/).filter(Boolean);
+  lines.shift(); // header
+  for (const line of lines) {
+    const [, matchKey, canonicalRaw, originRaw] = parseCsvLine(line);
+    if (!matchKey) continue;
+    const canonical = canonicalRaw && canonicalRaw.trim() ? canonicalRaw.trim() : null;
+    const origin =
+      originRaw === "Indian" || originRaw === "Pakistani" ? originRaw : null;
+    map.set(matchKey, { canonical, origin });
+  }
+  return map;
+}
+
+/**
+ * Resolve a listing's designer against the canonical CSV. Prefers free-text
+ * `designer`; falls back to a `designerID` slug resolved to its name. Not in
+ * the CSV → blanked.
+ */
+export function resolveDesigner(
+  csv: DesignerCsvMap,
+  designerFree: string | null | undefined,
+  designerID: string | null | undefined
+): DesignerResolution {
+  let raw: string | null = null;
+  if (designerFree && designerFree.toString().trim()) {
+    raw = designerFree.toString().trim();
+  } else if (designerID) {
+    const slugName = DESIGNER_SLUG_MAP[designerID.toLowerCase()];
+    if (slugName && slugName !== "Other") raw = slugName;
+  }
+  if (!raw) return { designer_name: null, designer_origin: null };
+
+  const hit = csv.get(designerNorm(raw));
+  if (!hit) return { designer_name: null, designer_origin: null };
+  return { designer_name: hit.canonical, designer_origin: hit.origin };
 }
 
 // ============================================================

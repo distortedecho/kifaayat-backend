@@ -230,7 +230,12 @@ export async function createNotification(
         userId: params.user_id,
         title: params.title,
         body: params.body,
-        data: params.data,
+        // Always stamp the notification `type` into the push data so the
+        // app can route the tap deterministically (e.g. order_paid →
+        // seller new-order screen, welcome_back → migration modal). The
+        // type lives in the DB row's column but isn't otherwise in the
+        // push payload the OS hands the app on tap.
+        data: { type: params.type, ...(params.data || {}) },
       }).catch((err) => {
         console.error("Push notification error (fire-and-forget):", err);
       });
@@ -314,17 +319,13 @@ export function offerExpiredNotification(
 export function orderPaidNotification(
   listingTitle: string,
   amount: number,
-  currency: string,
-  sellerPayout: number,
-  shippingCost?: number
+  currency: string
 ): NotificationTemplate {
-  const totalEarnings = sellerPayout + (shippingCost || 0);
-  const earningsText = shippingCost && shippingCost > 0
-    ? `${formatPrice(totalEarnings, currency)} (incl. ${formatPrice(shippingCost, currency)} shipping)`
-    : formatPrice(sellerPayout, currency);
+  // Just the sale + what it sold for — no shipping/earnings breakdown (the
+  // seller sees the exact payout on the order detail screen).
   return {
     title: "You Made a Sale!",
-    body: `"${listingTitle}" was purchased for ${formatPrice(amount, currency)}. Ship it to earn ${earningsText}.`,
+    body: `"${listingTitle}" was purchased for ${formatPrice(amount, currency)}.`,
   };
 }
 

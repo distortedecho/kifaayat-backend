@@ -327,8 +327,28 @@ admin.get("/listings/pending", async (c) => {
           paypal_email: (sellerRaw.paypal_email as string | null) ?? null,
         })
       : null;
+    // Distinguish the seller's CHOSEN method from what's payable right now.
+    //   payout_method_resolved — payable-now method (falls back off an
+    //     incomplete Stripe to Wise/PayPal); use for the manual-payout flow.
+    //   payout_method_chosen   — what the seller actually selected.
+    //   stripe_status          — not_connected | incomplete | complete.
+    // The admin UI should show the CHOSEN method + stripe_status badge so an
+    // incomplete-Stripe seller reads as "Stripe · onboarding incomplete", not
+    // silently as "PayPal".
+    const stripeStatus = sellerRaw
+      ? !sellerRaw.stripe_account_id
+        ? "not_connected"
+        : sellerRaw.stripe_onboarding_complete
+        ? "complete"
+        : "incomplete"
+      : "not_connected";
     const seller = sellerRaw
-      ? { ...sellerRaw, payout_method_resolved: resolved }
+      ? {
+          ...sellerRaw,
+          payout_method_resolved: resolved,
+          payout_method_chosen: (sellerRaw.payout_method as string | null) ?? null,
+          stripe_status: stripeStatus,
+        }
       : null;
     const photos = (listing.listing_photos as Array<{ position: number }> | null) || [];
     return {
@@ -525,11 +545,12 @@ admin.post("/listings/batch", async (c) => {
       }
 
       const seller = listing.profiles;
-      if (action === "approve" && !resolveSellerPayoutMethod(seller)) {
-        results.push({ id, success: false, error: "Seller has not set up a payout method (Stripe / Wise / PayPal)" });
-        continue;
-      }
-
+      // Approval is a CONTENT decision. Payout readiness is NOT gated here —
+      // the admin sees the seller's payout status (payout_method_chosen /
+      // stripe_status) and decides. If the seller's chosen payout isn't ready
+      // the listing still can't be PURCHASED (checkout enforces that via
+      // resolveSellerPayoutMethod), so no money is ever taken for a payee we
+      // can't pay. This matches "publish/approve freely, gate at purchase".
       const updatePayload: Record<string, unknown> =
         action === "approve"
           ? { status: "active", rejection_reason: null }

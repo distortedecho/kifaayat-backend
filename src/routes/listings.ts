@@ -6,8 +6,10 @@ import { getProfileByClerkId } from "../lib/profiles.js";
 import { createSupabaseAdmin } from "../lib/supabase.js";
 import { computeRiskScore } from "../lib/risk-scoring.js";
 import { summarizeZodError } from "../lib/validation.js";
+import { ACCEPTED_OFFER_PAYMENT_HOURS } from "../types/transactions.js";
 import {
   LISTING_CATEGORIES,
+  CATEGORY_SIZE_TYPE,
   LISTING_CONDITIONS,
   OCCASION_TAGS,
   REQUIRED_MEASUREMENTS,
@@ -42,15 +44,19 @@ const createCommentSchema = z.object({
 // ============================================================
 
 const createListingSchema = z.object({
-  title: z.string().min(1, "Title is required").max(200, "Title must be 200 characters or less"),
+  // Core fields are OPTIONAL at the schema level so a draft can be saved
+  // with just photos/video. They're required to PUBLISH — enforced by the
+  // superRefine below (status === "active") and by validateListingCompleteness
+  // on the draft→pending_review transition.
+  title: z.string().max(200, "Title must be 200 characters or less").optional(),
   description: z.string().max(2000, "Description must be 2000 characters or less").optional(),
-  category: z.enum(LISTING_CATEGORIES as unknown as [string, ...string[]]),
+  category: z.enum(LISTING_CATEGORIES as unknown as [string, ...string[]]).optional(),
   // Optional second-level taxonomy. Only valid for Jewellery, Other,
   // and Footwear (see SUB_CATEGORIES_BY_CATEGORY). Pair is validated
   // in a top-level refine() below so a Saree can never silently get
   // tagged "Bangles". Empty string is normalised to null.
   sub_category: z.string().max(100).nullable().optional(),
-  condition: z.enum(LISTING_CONDITIONS as unknown as [string, ...string[]]),
+  condition: z.enum(LISTING_CONDITIONS as unknown as [string, ...string[]]).optional(),
   measurements: z
     .object({
       bust: z.string().optional(),
@@ -68,7 +74,7 @@ const createListingSchema = z.object({
     .array(z.enum(OCCASION_TAGS as unknown as [string, ...string[]]))
     .optional(),
   colors: z.array(z.string()).optional(),
-  price_amount: z.number().int().nonnegative("Price must be a non-negative integer (in cents)"),
+  price_amount: z.number().int().nonnegative("Price must be a non-negative integer (in cents)").optional(),
   price_currency: z.enum(["AUD", "USD", "NZD", "CAD", "GBP"]).optional(),
   original_price_amount: z.number().int().positive().optional(),
   negotiable: z.boolean().optional(),
@@ -107,13 +113,28 @@ const createListingSchema = z.object({
   video_url: z.string().url().optional(),
   video_storage_path: z.string().optional(),
 }).refine(
-  (data) => isValidSubCategoryPair(data.category, data.sub_category),
+  // Skip the pair check when there's no category yet (draft in progress).
+  (data) => !data.category || isValidSubCategoryPair(data.category, data.sub_category),
   {
     message:
       "sub_category is not valid for this category. Either omit it or pick one from the category's allowed list.",
     path: ["sub_category"],
   }
-);
+).superRefine((data, ctx) => {
+  // Publishing (status "active") requires the core fields; a draft doesn't.
+  if (data.status !== "active") return;
+  const required: Array<[boolean, string, string]> = [
+    [!data.title || data.title.trim().length === 0, "title", "Title is required to publish"],
+    [!data.category, "category", "Category is required to publish"],
+    [!data.condition, "condition", "Condition is required to publish"],
+    [data.price_amount === undefined || data.price_amount === null, "price_amount", "Price is required to publish"],
+  ];
+  for (const [missing, path, message] of required) {
+    if (missing) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: [path], message });
+    }
+  }
+});
 
 const updateListingSchema = z.object({
   title: z.string().min(1).max(200).optional(),
@@ -236,8 +257,15 @@ async function validateListingCompleteness(
     missing.push("negotiable");
   }
 
-  // estimated_size required for every category (all 9 have size_type set).
-  if (!listingData.estimated_size) missing.push("estimated_size");
+  // estimated_size is required only for sized categories. Jewellery and
+  // Accessories are sizeless (CATEGORY_SIZE_TYPE = null), so don't demand it
+  // — that was blocking those listings from publishing.
+  const needsSize =
+    !!listingData.category &&
+    CATEGORY_SIZE_TYPE[listingData.category as ListingCategory] != null;
+  if (needsSize && !listingData.estimated_size) {
+    missing.push("estimated_size");
+  }
 
   // Check photo count (only product photos count toward the minimum)
   const supabase = createSupabaseAdmin();
@@ -311,6 +339,7 @@ listings.get("/me", clerkMiddleware, requireProfile, async (c) => {
     .from("listings")
     .select("*, listing_photos(*)")
     .eq("seller_id", profile.id)
+    .is("deleted_at", null)
     .order("created_at", { ascending: false })
     .limit(limit);
 
@@ -430,19 +459,24 @@ listings.post("/", clerkMiddleware, requireProfile, async (c) => {
     );
   }
 
-  // Validate category-dependent measurements
-  const missingMeasurements = validateMeasurements(
-    input.category as ListingCategory,
-    input.measurements as Measurements | undefined
-  );
-  if (missingMeasurements.length > 0) {
-    return c.json(
-      {
-        error: "Missing required measurements for this category",
-        details: { measurements: missingMeasurements },
-      },
-      400
+  // Validate category-dependent measurements — only when publishing. A
+  // draft may not have a category yet, and we don't block draft-saving on
+  // measurements. Completeness (incl. measurements) is re-checked on the
+  // draft→pending_review transition.
+  if (input.status === "active" && input.category) {
+    const missingMeasurements = validateMeasurements(
+      input.category as ListingCategory,
+      input.measurements as Measurements | undefined
     );
+    if (missingMeasurements.length > 0) {
+      return c.json(
+        {
+          error: "Missing required measurements for this category",
+          details: { measurements: missingMeasurements },
+        },
+        400
+      );
+    }
   }
 
   // Insert listing
@@ -450,15 +484,16 @@ listings.post("/", clerkMiddleware, requireProfile, async (c) => {
     .from("listings")
     .insert({
       seller_id: profile.id,
-      title: input.title,
+      // Core fields may be null on a draft — filled in before publish.
+      title: input.title ?? null,
       description: input.description || null,
-      category: input.category,
+      category: input.category ?? null,
       sub_category: input.sub_category || null,
-      condition: input.condition,
+      condition: input.condition ?? null,
       measurements: input.measurements || {},
       occasion_tags: input.occasion_tags || [],
       colors: input.colors || [],
-      price_amount: input.price_amount,
+      price_amount: input.price_amount ?? null,
       price_currency: input.price_currency || "AUD",
       original_price_amount: input.original_price_amount || null,
       negotiable: input.negotiable || false,
@@ -522,6 +557,7 @@ listings.get("/:id", optionalClerkMiddleware, async (c) => {
     .from("listings")
     .select("*, listing_photos(*), profiles!listings_seller_id_fkey(id, display_name, avatar_url, location, trust_tier)")
     .eq("id", listingId)
+    .is("deleted_at", null)
     .single();
 
   if (error || !listing) {
@@ -538,6 +574,7 @@ listings.get("/:id", optionalClerkMiddleware, async (c) => {
   //      checkout, then re-opened it via the notification would see a
   //      404 because the listing flipped to 'reserved' on offer accept
   //      and no order exists yet.
+  let viewerProfileId: string | null = null;
   if (listing.status !== "active") {
     const clerkUserId = c.get("clerkUserId");
     if (!clerkUserId) {
@@ -547,6 +584,7 @@ listings.get("/:id", optionalClerkMiddleware, async (c) => {
     if (!profile) {
       return c.json({ error: "Listing not found" }, 404);
     }
+    viewerProfileId = profile.id;
 
     const isSeller = profile.id === listing.seller_id;
 
@@ -599,6 +637,14 @@ listings.get("/:id", optionalClerkMiddleware, async (c) => {
     allPhotos.find((p) => p.photo_type === "receipt") || null;
   const seller = listing.profiles || null;
 
+  // For the OWNER viewing their own RESERVED listing, explain why it's
+  // reserved + surface the relevant order/offer so the app can show accurate
+  // copy and (for a paid order awaiting acceptance) deep-link to it.
+  const reservation =
+    listing.status === "reserved" && viewerProfileId === listing.seller_id
+      ? await computeReservation(supabase, listingId)
+      : null;
+
   const result = {
     ...listing,
     measurements: normaliseMeasurements(listing.measurements),
@@ -606,12 +652,78 @@ listings.get("/:id", optionalClerkMiddleware, async (c) => {
     brand_tag_photo,
     receipt_photo,
     seller,
+    reservation,
     listing_photos: undefined,
     profiles: undefined,
   };
 
   return c.json({ listing: result });
 });
+
+/**
+ * Explain a reserved listing's sub-state for the owner. reserved is
+ * overloaded, so we disambiguate:
+ *   - awaiting_seller_acceptance — a buyer PAID; seller must accept/decline
+ *     (has a deadline; auto-declines + refunds if missed).
+ *   - order_in_progress — seller already accepted; order is being fulfilled.
+ *   - awaiting_buyer_payment — seller accepted an offer; buyer must pay.
+ *   - cart_hold — reserved by a cart checkout; releases if abandoned.
+ */
+async function computeReservation(
+  supabase: ReturnType<typeof createSupabaseAdmin>,
+  listingId: string
+): Promise<{
+  reason:
+    | "awaiting_seller_acceptance"
+    | "order_in_progress"
+    | "awaiting_buyer_payment"
+    | "cart_hold";
+  order_id?: string;
+  offer_id?: string;
+  deadline?: string | null;
+}> {
+  // In-flight order on this listing?
+  const { data: order } = await supabase
+    .from("orders")
+    .select("id, status, seller_accepted_at, seller_deadline_at, created_at")
+    .eq("listing_id", listingId)
+    .in("status", ["paid", "shipped", "delivered"])
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (order) {
+    if (order.status === "paid" && !order.seller_accepted_at) {
+      return {
+        reason: "awaiting_seller_acceptance",
+        order_id: order.id as string,
+        deadline: (order.seller_deadline_at as string | null) ?? null,
+      };
+    }
+    return { reason: "order_in_progress", order_id: order.id as string, deadline: null };
+  }
+
+  // Accepted offer awaiting the buyer's payment?
+  const { data: offer } = await supabase
+    .from("offers")
+    .select("id, updated_at")
+    .eq("listing_id", listingId)
+    .eq("status", "accepted")
+    .order("updated_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (offer) {
+    const acceptedAt = new Date(offer.updated_at as string).getTime();
+    const deadline = new Date(
+      acceptedAt + ACCEPTED_OFFER_PAYMENT_HOURS * 60 * 60 * 1000
+    ).toISOString();
+    return { reason: "awaiting_buyer_payment", offer_id: offer.id as string, deadline };
+  }
+
+  // Reserved with no order/offer → a cart checkout is holding it.
+  return { reason: "cart_hold", deadline: null };
+}
 
 /**
  * Coerce all measurement values to strings so the mobile app's
@@ -864,6 +976,98 @@ listings.put("/:id", clerkMiddleware, requireProfile, async (c) => {
 });
 
 /**
+ * DELETE /api/listings/:id
+ * Real delete (distinct from PATCH /:id/status → deactivated).
+ *
+ *   - No orders reference it        → HARD delete (row gone; photos,
+ *     wishlists, offers, comments cascade away).
+ *   - Orders reference it           → SOFT delete (deleted_at + status
+ *     'deactivated'). We MUST NOT hard-delete: orders.listing_id is
+ *     ON DELETE CASCADE, so removing the row would wipe order history.
+ *   - Reserved / in-flight order    → blocked (can't delete mid-sale).
+ *
+ * Only the owning seller can delete. Soft-deleted listings drop out of
+ * GET /me and GET /:id; search already excludes non-active.
+ */
+listings.delete("/:id", clerkMiddleware, requireProfile, async (c) => {
+  const profile = c.get("profile");
+  const listingId = c.req.param("id");
+  const supabase = createSupabaseAdmin();
+
+  const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  if (!uuidRegex.test(listingId)) {
+    return c.json({ error: "Invalid listing ID format" }, 400);
+  }
+
+  const { data: existing, error: fetchError } = await supabase
+    .from("listings")
+    .select("id, seller_id, status")
+    .eq("id", listingId)
+    .is("deleted_at", null)
+    .single();
+
+  if (fetchError || !existing) {
+    return c.json({ error: "Listing not found" }, 404);
+  }
+  if (existing.seller_id !== profile.id) {
+    return c.json({ error: "You can only delete your own listings" }, 403);
+  }
+
+  // A reserved listing has a buyer mid-checkout (accepted offer / awaiting
+  // payment) — deleting it would break their purchase.
+  if (existing.status === "reserved") {
+    return c.json(
+      { error: "This listing is reserved for a buyer and can't be deleted right now." },
+      409
+    );
+  }
+
+  // Inspect orders on this listing.
+  const { data: orders } = await supabase
+    .from("orders")
+    .select("id, status")
+    .eq("listing_id", listingId);
+
+  const inFlight = (orders || []).some((o) =>
+    ["paid", "shipped", "delivered"].includes(o.status as string)
+  );
+  if (inFlight) {
+    return c.json(
+      { error: "This listing has an active order and can't be deleted until it's completed or cancelled." },
+      409
+    );
+  }
+
+  const hasOrders = (orders || []).length > 0;
+
+  if (hasOrders) {
+    // Soft delete — preserve order history (hard delete would cascade it away).
+    const { error: updErr } = await supabase
+      .from("listings")
+      .update({ status: "deactivated", deleted_at: new Date().toISOString() })
+      .eq("id", listingId)
+      .eq("seller_id", profile.id);
+    if (updErr) {
+      console.error("Error soft-deleting listing:", updErr);
+      return c.json({ error: "Failed to delete listing" }, 500);
+    }
+    return c.json({ deleted: true, mode: "soft" });
+  }
+
+  // Hard delete — no orders, so child rows cascade cleanly.
+  const { error: delErr } = await supabase
+    .from("listings")
+    .delete()
+    .eq("id", listingId)
+    .eq("seller_id", profile.id);
+  if (delErr) {
+    console.error("Error deleting listing:", delErr);
+    return c.json({ error: "Failed to delete listing" }, 500);
+  }
+  return c.json({ deleted: true, mode: "hard" });
+});
+
+/**
  * PATCH /api/listings/:id/status
  * Update listing status with transition validation.
  */
@@ -910,6 +1114,22 @@ listings.patch("/:id/status", clerkMiddleware, requireProfile, async (c) => {
   // Enforce valid transitions
   const allowedTransitions = VALID_TRANSITIONS[existing.status] || [];
   if (!allowedTransitions.includes(newStatus)) {
+    // Common real-world hit: seller taps "Close" while the listing is
+    // momentarily 'reserved' (buyer mid-checkout, or a paid order awaiting
+    // the seller's acceptance). reserved→deactivated is intentionally
+    // disallowed — closing would strand the buyer. Return a SPECIFIC 409
+    // + machine code so the FE can show real copy and safely retry once the
+    // reservation clears, rather than the generic "Could not update" toast.
+    if (existing.status === "reserved" && newStatus === "deactivated") {
+      return c.json(
+        {
+          error:
+            "This listing is reserved by a buyer right now, so it can't be closed. It frees up automatically if the buyer doesn't complete the purchase — try again shortly.",
+          code: "listing_reserved",
+        },
+        409
+      );
+    }
     return c.json(
       {
         error: `Invalid status transition from '${existing.status}' to '${newStatus}'`,

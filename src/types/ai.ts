@@ -39,6 +39,12 @@ export interface AIAnalysisResponse {
   // sub_category null when Gemini was not sure or category has no
   // sub-categories. Frontend treats null as "blank, seller picks".
   sub_category?: AIField<string | null>;
+
+  // True when the photos appear to show more than one DISTINCT item
+  // (e.g. a saree AND shoes AND jewellery). The analysis still returns a
+  // best-effort read of the primary item, but the FE should prompt the
+  // seller to list items separately / re-shoot a single item.
+  multiple_items_detected?: boolean;
 }
 
 /**

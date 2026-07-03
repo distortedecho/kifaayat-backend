@@ -17,7 +17,13 @@
 import PgBoss from "pg-boss";
 import { createNotification } from "./notifications.js";
 import { sendEmail } from "./email.js";
-import { runAutoCompleteOrders, runIsoMatchingRefresh, autoRejectOrder } from "./cron.js";
+import {
+  runAutoCompleteOrders,
+  runIsoMatchingRefresh,
+  autoRejectOrder,
+  releaseExpiredAcceptedOffers,
+} from "./cron.js";
+import { retryStripePayoutRelease } from "../services/payoutService.js";
 import { matchISOPost } from "../routes/ai.js";
 import { logger } from "./logger.js";
 
@@ -29,7 +35,14 @@ export const JOB_SEND_EMAIL = "send-email";
 export const JOB_PROCESS_ISO_MATCH = "process-iso-match";
 export const JOB_AUTO_COMPLETE_ORDERS = "auto-complete-orders";
 export const JOB_ISO_MATCHING_REFRESH = "iso-matching-refresh";
+// Sweep accepted-but-unpaid offers past their payment window: expire the
+// offer + free the reserved listing back to active.
+export const JOB_RELEASE_EXPIRED_OFFERS = "release-expired-offers";
 export const JOB_AUTO_REJECT_ORDER = "auto-reject-order";
+// Retry a Stripe destination-charge payout that was deferred because the
+// seller's funds were still in `pending` (Stripe's ~2-day settlement) at
+// release time. Re-attempts the payout once the funds have cleared.
+export const JOB_RETRY_STRIPE_PAYOUT = "retry-stripe-payout";
 
 // ------------------------------------------------------------
 // Job payload types
@@ -54,6 +67,14 @@ export interface ProcessIsoMatchJobData {
 
 export interface AutoRejectOrderJobData {
   orderId: string;
+}
+
+export interface RetryStripePayoutJobData {
+  orderId: string;
+  // How many times we've already retried — bounds the defer loop so a
+  // permanently-stuck payout eventually lands in 'failed' for admin review
+  // instead of retrying forever.
+  attempt: number;
 }
 
 // ------------------------------------------------------------
@@ -187,6 +208,10 @@ export async function initJobQueue(): Promise<void> {
     await runIsoMatchingRefresh();
   });
 
+  await boss.work(JOB_RELEASE_EXPIRED_OFFERS, { batchSize: 1 }, async () => {
+    await releaseExpiredAcceptedOffers();
+  });
+
   await boss.work<AutoRejectOrderJobData>(
     JOB_AUTO_REJECT_ORDER,
     { batchSize: 1 },
@@ -196,6 +221,25 @@ export async function initJobQueue(): Promise<void> {
           await autoRejectOrder(job.data.orderId);
         } catch (err) {
           logger.error("jobs.auto_reject_order_failed", {
+            jobId: job.id,
+            orderId: job.data.orderId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+          throw err;
+        }
+      }
+    }
+  );
+
+  await boss.work<RetryStripePayoutJobData>(
+    JOB_RETRY_STRIPE_PAYOUT,
+    { batchSize: 1 },
+    async (jobs) => {
+      for (const job of jobs) {
+        try {
+          await retryStripePayoutRelease(job.data.orderId, job.data.attempt);
+        } catch (err) {
+          logger.error("jobs.retry_stripe_payout_failed", {
             jobId: job.id,
             orderId: job.data.orderId,
             error: err instanceof Error ? err.message : String(err),
@@ -226,6 +270,8 @@ export async function scheduleRecurringJobs(): Promise<void> {
     await boss.schedule(JOB_AUTO_COMPLETE_ORDERS, "0 */6 * * *");
     // ISO matching refresh daily at 3am UTC
     await boss.schedule(JOB_ISO_MATCHING_REFRESH, "0 3 * * *");
+    // Release accepted-but-unpaid offers hourly (24h payment window).
+    await boss.schedule(JOB_RELEASE_EXPIRED_OFFERS, "0 * * * *");
     logger.info("jobs.recurring_registered");
   } catch (err) {
     logger.error("jobs.schedule_failed", {

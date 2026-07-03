@@ -32,6 +32,7 @@ export const LISTING_CATEGORIES = [
   "Menswear",
   "Kidswear",
   "Footwear",
+  "Accessories",
   "Other",
 ] as const;
 export type ListingCategory = (typeof LISTING_CATEGORIES)[number];
@@ -58,7 +59,9 @@ export const SUB_CATEGORIES_BY_CATEGORY: Partial<
     "Bangles",
     "Other Jewellery",
   ],
-  Other: ["Bags/Clutches", "Belts", "Other accessories"],
+  // Accessories is its own category (bags/belts/etc). Its sub-categories
+  // moved here from "Other" per the client's taxonomy.
+  Accessories: ["Bags/Clutches", "Belts", "Other accessories"],
   Footwear: ["Men's Footwear", "Women's Footwear", "Other"],
 } as const;
 
@@ -356,6 +359,8 @@ export const CATEGORY_SIZE_TYPE: Record<ListingCategory, SizeType | null> = {
   // Jewellery has no sizing — necklaces / earrings / bangles don't follow
   // clothing-size conventions.
   Jewellery: null,
+  // Accessories (bags/belts) are sizeless too.
+  Accessories: null,
   Other: "womens",
 };
 
@@ -421,6 +426,8 @@ export const LISTING_CATEGORY_CONFIG: Record<ListingCategory, CategoryFieldConfi
   // Jewellery is sizeless — no estimated_size required; no fabric / dry-cleaning
   // / measurements / alteration apply to jewellery items.
   Jewellery:     { size_type: null,                shows_items_included: false, shows_fabric: false, shows_dry_cleaning: false, shows_measurements: false, shows_alteration: false, required_fields: [...UNIVERSAL_REQUIRED] },
+  // Accessories (bags/belts) — sizeless, no fabric/dry-cleaning/measurements.
+  Accessories:   { size_type: null,                shows_items_included: false, shows_fabric: false, shows_dry_cleaning: false, shows_measurements: false, shows_alteration: false, required_fields: [...UNIVERSAL_REQUIRED] },
   Other:         { size_type: "womens",            shows_items_included: false, shows_fabric: false, shows_dry_cleaning: false, shows_measurements: false, shows_alteration: false, required_fields: WITH_SIZE },
 };
 
@@ -456,6 +463,7 @@ export const REQUIRED_MEASUREMENTS: Record<
   Kidswear: ["chest", "length", "age_range"],
   Footwear: [],
   Jewellery: [],
+  Accessories: [],
   Other: [],
 };
 
