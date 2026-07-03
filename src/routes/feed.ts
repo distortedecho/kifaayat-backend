@@ -144,19 +144,13 @@ function toListingSummary(
   const profiles = row.profiles as Record<string, unknown> | null;
   const photos = row.listing_photos as Array<Record<string, unknown>> | null;
 
-  // Cover = the lowest-position PRODUCT photo. brand_tag / receipt photos
-  // are seller-side authenticity proofs and must never be a card image
-  // (falls back to any photo only if a listing somehow has no product one).
-  // has_proof_of_purchase = a receipt photo exists on the listing.
+  // Find cover photo (position=0) or first photo
   let coverUrl: string | null = null;
   let hasProofOfPurchase = false;
   if (photos && photos.length > 0) {
-    const products = photos.filter(
-      (p) => ((p.photo_type as string | null) ?? "product") === "product"
-    );
-    const pool = products.length > 0 ? products : photos;
-    const cover = pool.find((p) => p.position === 0) || pool[0];
+    const cover = photos.find((p) => p.position === 0) || photos[0];
     coverUrl = (cover.url as string) || null;
+    // Additive signal only — a receipt photo means proof of purchase.
     hasProofOfPurchase = photos.some((p) => p.photo_type === "receipt");
   }
 
