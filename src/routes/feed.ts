@@ -31,6 +31,10 @@ interface ListingSummary {
   badges: string[];
   seller_trust_tier: number;
   is_boosted: boolean;
+  // True when the seller uploaded a proof-of-purchase receipt photo
+  // (listing_photos.photo_type = 'receipt'). Drives the "Receipt verified"
+  // pill on cards.
+  has_proof_of_purchase: boolean;
 }
 
 interface ISOPostSummary {
@@ -79,7 +83,7 @@ interface CategoryCount {
 // in non-local feeds AND so the frontend can render a "Ships internationally"
 // badge on each card.
 const LISTING_SELECT =
-  "id, title, price_amount, price_currency, original_price_amount, category, condition, estimated_size, size_type, designer_name, international_shipping, created_at, listing_photos(url, position), profiles!listings_seller_id_fkey(display_name, location, trust_tier)";
+  "id, title, price_amount, price_currency, original_price_amount, category, condition, estimated_size, size_type, designer_name, international_shipping, created_at, listing_photos(url, position, photo_type), profiles!listings_seller_id_fkey(display_name, location, trust_tier)";
 
 // ============================================================
 // Helpers
@@ -140,11 +144,20 @@ function toListingSummary(
   const profiles = row.profiles as Record<string, unknown> | null;
   const photos = row.listing_photos as Array<Record<string, unknown>> | null;
 
-  // Find cover photo (position=0) or first photo
+  // Cover = the lowest-position PRODUCT photo. brand_tag / receipt photos
+  // are seller-side authenticity proofs and must never be a card image
+  // (falls back to any photo only if a listing somehow has no product one).
+  // has_proof_of_purchase = a receipt photo exists on the listing.
   let coverUrl: string | null = null;
+  let hasProofOfPurchase = false;
   if (photos && photos.length > 0) {
-    const cover = photos.find((p) => p.position === 0) || photos[0];
+    const products = photos.filter(
+      (p) => ((p.photo_type as string | null) ?? "product") === "product"
+    );
+    const pool = products.length > 0 ? products : photos;
+    const cover = pool.find((p) => p.position === 0) || pool[0];
     coverUrl = (cover.url as string) || null;
+    hasProofOfPurchase = photos.some((p) => p.photo_type === "receipt");
   }
 
   const trustTier = profiles ? ((profiles.trust_tier as number) ?? 0) : 0;
@@ -182,6 +195,7 @@ function toListingSummary(
     ),
     seller_trust_tier: trustTier,
     is_boosted: boostedIds ? boostedIds.has(row.id as string) : false,
+    has_proof_of_purchase: hasProofOfPurchase,
   };
 }
 
