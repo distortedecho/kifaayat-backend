@@ -35,6 +35,9 @@ interface ListingSummary {
   // (listing_photos.photo_type = 'receipt'). Drives the "Receipt verified"
   // pill on cards.
   has_proof_of_purchase: boolean;
+  // The listing's SECOND product photo, for the web card's hover-swap.
+  // null when the listing has only one photo (FE omits the hover then).
+  second_photo_url: string | null;
 }
 
 interface ISOPostSummary {
@@ -146,12 +149,21 @@ function toListingSummary(
 
   // Find cover photo (position=0) or first photo
   let coverUrl: string | null = null;
+  let secondPhotoUrl: string | null = null;
   let hasProofOfPurchase = false;
   if (photos && photos.length > 0) {
     const cover = photos.find((p) => p.position === 0) || photos[0];
     coverUrl = (cover.url as string) || null;
     // Additive signal only — a receipt photo means proof of purchase.
     hasProofOfPurchase = photos.some((p) => p.photo_type === "receipt");
+    // Second product photo (by position) for the web hover-swap. Excludes
+    // brand_tag / receipt proofs; null when there's only one product photo.
+    const products = photos
+      .filter((p) => ((p.photo_type as string | null) ?? "product") === "product")
+      .sort(
+        (a, b) => ((a.position as number) ?? 0) - ((b.position as number) ?? 0)
+      );
+    secondPhotoUrl = products.length > 1 ? (products[1].url as string) || null : null;
   }
 
   const trustTier = profiles ? ((profiles.trust_tier as number) ?? 0) : 0;
@@ -190,6 +202,7 @@ function toListingSummary(
     seller_trust_tier: trustTier,
     is_boosted: boostedIds ? boostedIds.has(row.id as string) : false,
     has_proof_of_purchase: hasProofOfPurchase,
+    second_photo_url: secondPhotoUrl,
   };
 }
 
