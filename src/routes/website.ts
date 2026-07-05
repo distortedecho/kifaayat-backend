@@ -98,8 +98,13 @@ website.get("/in-demand", optionalClerkMiddleware, async (c) => {
   const ids = rows.map((l) => l.id);
 
   // One query for all photos of these listings: pick the cover (lowest
-  // product position) and detect whether a receipt photo exists.
+  // product position), the second product photo (for the web hover-swap),
+  // and detect whether a receipt photo exists. Photos arrive ordered by
+  // position ascending, so the 1st product photo seen is the cover and the
+  // 2nd is the hover image.
   const coverByListing: Record<string, string> = {};
+  const secondByListing: Record<string, string> = {};
+  const productSeen: Record<string, number> = {};
   const hasReceipt: Set<string> = new Set();
   if (ids.length > 0) {
     const { data: photos } = await supabase
@@ -111,8 +116,11 @@ website.get("/in-demand", optionalClerkMiddleware, async (c) => {
       const lid = p.listing_id as string;
       if (p.photo_type === "receipt") {
         hasReceipt.add(lid);
-      } else if ((p.photo_type ?? "product") === "product" && !(lid in coverByListing)) {
-        coverByListing[lid] = p.url as string;
+      } else if ((p.photo_type ?? "product") === "product") {
+        const n = (productSeen[lid] ?? 0) + 1;
+        productSeen[lid] = n;
+        if (n === 1) coverByListing[lid] = p.url as string;
+        else if (n === 2) secondByListing[lid] = p.url as string;
       }
     }
   }
@@ -142,6 +150,8 @@ website.get("/in-demand", optionalClerkMiddleware, async (c) => {
       condition: l.condition,
       designer_name: l.designer_name ?? null,
       cover_photo_url: coverByListing[id] ?? null,
+      // Second product photo for the web hover-swap; null → FE omits hover.
+      second_photo_url: secondByListing[id] ?? null,
       saves_recent: l.saves_recent,
       tags,
     };
