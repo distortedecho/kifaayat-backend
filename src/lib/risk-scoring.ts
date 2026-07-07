@@ -95,7 +95,7 @@ async function computeSellerHistoryScore(
   // Fetch seller profile
   const { data: profile } = await supabase
     .from("profiles")
-    .select("created_at, trust_tier, stripe_onboarding_complete")
+    .select("created_at, seller_quality, stripe_onboarding_complete")
     .eq("id", sellerId)
     .single();
 
@@ -108,9 +108,11 @@ async function computeSellerHistoryScore(
   else if (daysSinceCreation < 30) score += 10;
   else if (daysSinceCreation < 90) score += 5;
 
-  // Trust tier scoring: lower tier = higher risk
-  const tier = (profile.trust_tier as number) ?? 0;
-  score += (3 - tier) * 10; // tier 0 = +30, tier 1 = +20, tier 2 = +10, tier 3 = +0
+  // Seller-quality scoring: lower admin-assigned quality = higher risk.
+  // Replaces the retiring trust_tier term. Unassigned (null) is treated as
+  // neutral (2.5) until an operator rates the seller.
+  const sq = (profile.seller_quality as number | null) ?? 2.5;
+  score += Math.round((5 - sq) * 6); // quality 0 = +30, 2.5 = +15, 5 = +0
 
   // Rejection count: listings with status=draft AND rejection_reason IS NOT NULL
   const { count: rejectionCount } = await supabase

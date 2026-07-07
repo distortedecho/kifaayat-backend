@@ -3,6 +3,7 @@ import { z } from "zod";
 import { clerkMiddleware, optionalClerkMiddleware } from "../middleware/clerk.js";
 import { getProfileByClerkId } from "../lib/profiles.js";
 import { createSupabaseAdmin } from "../lib/supabase.js";
+import { findContactInfo } from "../lib/validation.js";
 import {
   createNotification,
   reviewRevealNotification,
@@ -18,6 +19,35 @@ import {
 } from "../types/transactions.js";
 
 const reviews = new Hono();
+
+// Conservative abusive-language list for review auto-flagging. Deliberately
+// small (clear slurs / harassment) to avoid false positives on honest
+// negative reviews — the admin makes the final call in the queue.
+const ABUSE_TERMS = [
+  "fuck",
+  "shit",
+  "bitch",
+  "bastard",
+  "asshole",
+  "scammer",
+  "fraud",
+  "thief",
+  "liar",
+];
+
+/**
+ * Returns a short flag reason if a review comment should be auto-flagged
+ * for moderation (off-platform contact info OR abusive language), else null.
+ */
+function detectReviewFlag(comment: string | null | undefined): string | null {
+  if (!comment) return null;
+  const contact = findContactInfo(comment);
+  if (contact) return `contains ${contact}`;
+  const lower = comment.toLowerCase();
+  const hit = ABUSE_TERMS.find((w) => new RegExp(`\\b${w}`, "i").test(lower));
+  if (hit) return "possible abusive language";
+  return null;
+}
 
 // ============================================================
 // Zod Schemas
@@ -199,6 +229,11 @@ reviews.post("/", clerkMiddleware, async (c) => {
     );
   }
 
+  // Auto-flag for moderation (Screen 15): off-platform contact info or
+  // abusive language in the comment routes the review to the admin queue.
+  // Sets flagged_at so GET /api/admin/reviews/flagged surfaces it.
+  const autoFlagReason = detectReviewFlag(comment);
+
   // Insert review
   const { data: newReview, error: insertError } = await supabase
     .from("reviews")
@@ -210,6 +245,9 @@ reviews.post("/", clerkMiddleware, async (c) => {
       rating,
       comment: comment || null,
       tags: tags || [],
+      ...(autoFlagReason
+        ? { flagged_at: new Date().toISOString(), flag_reason: autoFlagReason, flag_source: "auto" }
+        : {}),
     })
     .select()
     .single();

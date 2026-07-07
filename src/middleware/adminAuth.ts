@@ -1,16 +1,27 @@
 import { MiddlewareHandler } from "hono";
 import { createSupabaseAdmin } from "../lib/supabase.js";
+import {
+  hasPermission,
+  type AdminRole,
+  type AdminPermission,
+} from "../lib/adminRoles.js";
 
 declare module "hono" {
   interface ContextVariableMap {
     adminProfileId: string;
+    adminEmail: string;
+    adminRole: string;
+    adminPermissionsOverride: { grant?: string[]; deny?: string[] } | null;
   }
 }
 
 /**
  * Admin auth middleware using Supabase Auth.
- * Verifies the JWT, checks the user's email against ADMIN_EMAILS,
- * then resolves the admin profile ID from the profiles table.
+ * Verifies the JWT, checks ADMIN_EMAILS, resolves the profile id, and
+ * resolves the admin role (Phase 0.2). Members of ADMIN_EMAILS are
+ * auto-provisioned as `owner` in admin_users on first contact so nobody
+ * is locked out; ADMIN_EMAILS stays a fallback until the table is
+ * authoritative. Optional 2FA enforcement via ADMIN_ENFORCE_2FA.
  */
 export const adminAuthMiddleware: MiddlewareHandler = async (c, next) => {
   const authHeader = c.req.header("Authorization");
@@ -22,9 +33,10 @@ export const adminAuthMiddleware: MiddlewareHandler = async (c, next) => {
 
   try {
     const supabase = createSupabaseAdmin();
+    const claims = getJwtClaims(token);
 
     const { data: { user }, error } = await supabase.auth.admin.getUserById(
-      extractUserIdFromJwt(token)
+      claims.sub
     );
 
     if (error || !user) {
@@ -36,13 +48,49 @@ export const adminAuthMiddleware: MiddlewareHandler = async (c, next) => {
       .map((e) => e.trim().toLowerCase())
       .filter(Boolean);
 
-    if (adminEmails.length > 0 && !adminEmails.includes(user.email?.toLowerCase() || "")) {
-      return c.json({ error: "Forbidden: admin access required" }, 403);
+    const emailAllowed =
+      adminEmails.length === 0 || adminEmails.includes(user.email?.toLowerCase() || "");
+
+    // Resolve the admin_users row (role / override / status). Bootstrap an
+    // owner row for an allowlisted email that isn't in the table yet.
+    let adminRow: AdminRow | null = null;
+
+    const { data: existingAdmin } = await supabase
+      .from("admin_users")
+      .select("id, role, permissions_override, status")
+      .eq("supabase_user_id", user.id)
+      .maybeSingle();
+
+    if (existingAdmin) {
+      adminRow = existingAdmin as unknown as AdminRow;
+    } else if (emailAllowed && user.email) {
+      const { data: created } = await supabase
+        .from("admin_users")
+        .insert({
+          supabase_user_id: user.id,
+          email: user.email.toLowerCase(),
+          role: "owner",
+          status: "active",
+          last_login_at: new Date().toISOString(),
+        })
+        .select("id, role, permissions_override, status")
+        .single();
+      adminRow = (created as unknown as AdminRow) ?? null;
     }
 
-    // Resolve the profile that belongs to the authenticated user — not
-    // "any admin profile". The previous query returned an arbitrary
-    // admin row, which let any admin masquerade as any other.
+    // Access gate: must be allowlisted OR an active admin_users row.
+    if (!emailAllowed && !adminRow) {
+      return c.json({ error: "Forbidden: admin access required" }, 403);
+    }
+    if (adminRow && adminRow.status === "disabled") {
+      return c.json({ error: "Admin access disabled" }, 403);
+    }
+
+    // Optional 2FA enforcement — blocks until the member has an AAL2 session.
+    if (process.env.ADMIN_ENFORCE_2FA === "true" && claims.aal !== "aal2") {
+      return c.json({ error: "Two-factor authentication required", code: "2fa_required" }, 403);
+    }
+
     const { data: profile } = await supabase
       .from("profiles")
       .select("id")
@@ -50,16 +98,52 @@ export const adminAuthMiddleware: MiddlewareHandler = async (c, next) => {
       .single();
 
     c.set("adminProfileId", profile?.id || user.id);
+    if (user.email) c.set("adminEmail", user.email);
+    c.set("adminRole", adminRow?.role || (emailAllowed ? "owner" : "support"));
+    c.set("adminPermissionsOverride", adminRow?.permissions_override ?? null);
     await next();
   } catch {
     return c.json({ error: "Invalid or expired token" }, 401);
   }
 };
 
-function extractUserIdFromJwt(token: string): string {
+/**
+ * Route guard factory: 403s unless the caller's role (+ override) grants
+ * `permission`. Use AFTER adminAuthMiddleware.
+ *   admin.post("/transactions/:id/refund", requireAdminPermission("transactions.refund"), …)
+ */
+export function requireAdminPermission(
+  permission: AdminPermission
+): MiddlewareHandler {
+  return async (c, next) => {
+    const role = c.get("adminRole") as AdminRole | undefined;
+    const override = c.get("adminPermissionsOverride") as
+      | { grant?: string[]; deny?: string[] }
+      | null
+      | undefined;
+    if (!hasPermission(role, permission, override)) {
+      return c.json({ error: `Forbidden: '${permission}' required` }, 403);
+    }
+    await next();
+  };
+}
+
+interface AdminRow {
+  role: string;
+  permissions_override: { grant?: string[]; deny?: string[] } | null;
+  status: string;
+}
+
+interface JwtClaims {
+  sub: string;
+  aal?: string;
+  [k: string]: unknown;
+}
+
+function getJwtClaims(token: string): JwtClaims {
   const parts = token.split(".");
   if (parts.length !== 3) throw new Error("Invalid JWT");
   const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString());
   if (!payload.sub) throw new Error("Missing sub claim");
-  return payload.sub;
+  return payload as JwtClaims;
 }

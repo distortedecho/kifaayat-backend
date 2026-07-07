@@ -38,6 +38,7 @@ export const NOTIFICATION_TYPES = [
   "order_complete",
   "listing_approved",
   "listing_rejected",
+  "listing_updated",
   "review_reminder",
   "review_revealed",
   "tier_upgrade",

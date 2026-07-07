@@ -1,7 +1,8 @@
 import { Hono } from "hono";
 import Stripe from "stripe";
 import { z } from "zod";
-import { adminAuthMiddleware } from "../middleware/adminAuth.js";
+import { adminAuthMiddleware, requireAdminPermission } from "../middleware/adminAuth.js";
+import { ADMIN_PERMISSIONS, ROLE_PERMISSIONS, hasPermission, type AdminRole } from "../lib/adminRoles.js";
 import { createSupabaseAdmin } from "../lib/supabase.js";
 import {
   LISTING_CATEGORIES,
@@ -17,6 +18,8 @@ import {
   tierUpgradeNotification,
   tierDowngradeNotification,
   followedSellerNewListingNotification,
+  orderDeliveredNotification,
+  orderRejectedNotification,
 } from "../lib/notifications.js";
 import {
   getDashboardMetrics,
@@ -33,7 +36,14 @@ import {
   type TierThreshold,
 } from "../types/trust.js";
 import { NOTIFICATION_TYPES } from "../types/transactions.js";
-import { resolveSellerPayoutMethod } from "../services/payoutService.js";
+import {
+  resolveSellerPayoutMethod,
+  refundOrderPayment,
+  cancelPayoutForOrder,
+  releasePayoutForOrder,
+} from "../services/payoutService.js";
+import { auditFromContext } from "../lib/audit.js";
+import { hasDirectDb, getSql } from "../lib/db.js";
 
 const admin = new Hono();
 
@@ -121,6 +131,7 @@ admin.use("/dashboard", adminAuthMiddleware);
 admin.use("/dashboard/*", adminAuthMiddleware);
 admin.use("/settings", adminAuthMiddleware);
 admin.use("/settings/*", adminAuthMiddleware);
+admin.use("/referrals", adminAuthMiddleware);
 admin.use("/referrals/*", adminAuthMiddleware);
 admin.use("/analytics/*", adminAuthMiddleware);
 admin.use("/moderation/*", adminAuthMiddleware);
@@ -130,6 +141,19 @@ admin.use("/payouts/*", adminAuthMiddleware);
 admin.use("/notification-toggles", adminAuthMiddleware);
 admin.use("/notification-toggles/*", adminAuthMiddleware);
 admin.use("/sellers/*", adminAuthMiddleware);
+admin.use("/audit-log", adminAuthMiddleware);
+admin.use("/audit-log/*", adminAuthMiddleware);
+admin.use("/transactions", adminAuthMiddleware);
+admin.use("/transactions/*", adminAuthMiddleware);
+admin.use("/offers", adminAuthMiddleware);
+admin.use("/offers/*", adminAuthMiddleware);
+admin.use("/team", adminAuthMiddleware);
+admin.use("/team/*", adminAuthMiddleware);
+admin.use("/reviews", adminAuthMiddleware);
+admin.use("/reviews/*", adminAuthMiddleware);
+admin.use("/export/*", adminAuthMiddleware);
+admin.use("/content", adminAuthMiddleware);
+admin.use("/content/*", adminAuthMiddleware);
 
 // ============================================================
 // Helpers
@@ -431,6 +455,13 @@ admin.post("/listings/:id/approve", async (c) => {
     })();
   }
 
+  void auditFromContext(c, {
+    action: "listing.approve",
+    targetType: "listing",
+    targetId: listingId,
+    metadata: { title: listingRow.title ?? null, seller_id: sellerId ?? null },
+  });
+
   return c.json({ listing: result.listing });
 });
 
@@ -473,6 +504,14 @@ admin.post("/listings/:id/reject", async (c) => {
       rejectionReason: reason,
     }).catch((err) => console.error("[admin] Email error:", err));
   }
+
+  void auditFromContext(c, {
+    action: "listing.reject",
+    targetType: "listing",
+    targetId: listingId,
+    reason,
+    metadata: { title: (result.listing as Record<string, unknown>).title ?? null },
+  });
 
   return c.json({ listing: result.listing });
 });
@@ -633,6 +672,19 @@ admin.post("/listings/batch", async (c) => {
     }
   }
 
+  void auditFromContext(c, {
+    action: action === "approve" ? "listing.approve" : "listing.reject",
+    targetType: "listing",
+    targetId: null,
+    reason: reason ?? null,
+    metadata: {
+      batch: true,
+      requested: listing_ids.length,
+      succeeded: results.filter((r) => r.success).map((r) => r.id),
+      failed: results.filter((r) => !r.success).map((r) => r.id),
+    },
+  });
+
   return c.json({ results });
 });
 
@@ -701,6 +753,13 @@ admin.post("/listings", async (c) => {
     console.error("Error creating admin listing:", error);
     return c.json({ error: "Failed to create listing" }, 500);
   }
+
+  void auditFromContext(c, {
+    action: "listing.create",
+    targetType: "listing",
+    targetId: (listing as Record<string, unknown>).id as string,
+    metadata: { title: parsed.data.title, on_behalf_seller: adminProfileId },
+  });
 
   return c.json({ listing }, 201);
 });
@@ -804,7 +863,32 @@ admin.get("/listings/:id", async (c) => {
     profiles: undefined,
   };
 
-  return c.json({ listing: result });
+  // Phase 4 enrichment (Screen 04): every offer + transaction raised against
+  // this listing, and its public comments. Additive to the response.
+  const [offers, orders, comments] = await Promise.all([
+    supabase
+      .from("offers")
+      .select("id, amount, currency, status, round, offered_by, created_at, buyer_id")
+      .eq("listing_id", listingId)
+      .order("created_at", { ascending: false }),
+    supabase
+      .from("orders")
+      .select("id, order_number, amount, currency, status, buyer_id, created_at")
+      .eq("listing_id", listingId)
+      .order("created_at", { ascending: false }),
+    supabase
+      .from("listing_comments")
+      .select("*")
+      .eq("listing_id", listingId)
+      .order("created_at", { ascending: false }),
+  ]);
+
+  return c.json({
+    listing: result,
+    offers: offers.data ?? [],
+    transactions: orders.data ?? [],
+    comments: comments.data ?? [],
+  });
 });
 
 const adminUpdateListingSchema = z.object({
@@ -837,6 +921,10 @@ const adminUpdateListingSchema = z.object({
   curation_tags: z
     .array(z.enum(CURATION_TAGS as unknown as [string, ...string[]]))
     .optional(),
+  // Optional edit reason (Screen 05). Kept optional so curation-tag saves
+  // (which reuse this endpoint) don't break; recorded in the audit + diff
+  // when provided.
+  reason: z.string().max(1000).optional(),
 });
 
 // Shared handler so PUT and PATCH on the same path do the same thing.
@@ -854,15 +942,17 @@ const adminUpdateListingHandler = async (c: import("hono").Context) => {
     return c.json({ error: "Validation failed", details: parsed.error.flatten().fieldErrors }, 400);
   }
 
+  // Fetch the full current row so we can persist a before/after diff.
   const { data: existing, error: fetchError } = await supabase
     .from("listings")
-    .select("id")
+    .select("*")
     .eq("id", listingId)
     .single();
 
   if (fetchError || !existing) {
     return c.json({ error: "Listing not found" }, 404);
   }
+  const before = existing as Record<string, unknown>;
 
   const updateData: Record<string, unknown> = {};
   const input = parsed.data;
@@ -884,6 +974,12 @@ const adminUpdateListingHandler = async (c: import("hono").Context) => {
     return c.json({ error: "No fields to update" }, 400);
   }
 
+  // Before/after field diff (Screen 05) for the audit trail.
+  const diff: Record<string, { before: unknown; after: unknown }> = {};
+  for (const k of Object.keys(updateData)) {
+    diff[k] = { before: before[k] ?? null, after: updateData[k] };
+  }
+
   const { data: updated, error: updateError } = await supabase
     .from("listings")
     .update(updateData)
@@ -894,6 +990,27 @@ const adminUpdateListingHandler = async (c: import("hono").Context) => {
   if (updateError) {
     console.error("Error updating listing:", updateError);
     return c.json({ error: "Failed to update listing" }, 500);
+  }
+
+  void auditFromContext(c, {
+    action: "listing.edit",
+    targetType: "listing",
+    targetId: listingId,
+    reason: input.reason ?? null,
+    metadata: { fields: Object.keys(updateData), diff },
+  });
+
+  // Notify the seller when a content field (not just curation) changed
+  // (Screen 05: the reason is sent to them). Needs schema-34.
+  const contentChanged = Object.keys(updateData).some((k) => k !== "curation_tags");
+  if (contentChanged && before.seller_id) {
+    createNotification({
+      user_id: before.seller_id as string,
+      type: "listing_updated",
+      title: "Your listing was updated",
+      body: `An admin updated "${(updated as Record<string, unknown>).title}".${input.reason ? ` Reason: ${input.reason}` : ""}`,
+      data: { listing_id: listingId, role: "seller" },
+    }).catch(() => {});
   }
 
   return c.json({ listing: updated });
@@ -943,6 +1060,13 @@ admin.patch("/listings/:id/status", async (c) => {
     return c.json({ error: "Failed to update listing status" }, 500);
   }
 
+  void auditFromContext(c, {
+    action: "listing.status_change",
+    targetType: "listing",
+    targetId: listingId,
+    metadata: { from: existing.status, to: parsed.data.status },
+  });
+
   return c.json({ listing: updated });
 });
 
@@ -981,6 +1105,13 @@ admin.delete("/listings/:id", async (c) => {
     console.error("Error deleting listing:", deleteError);
     return c.json({ error: "Failed to delete listing" }, 500);
   }
+
+  void auditFromContext(c, {
+    action: "listing.delete",
+    targetType: "listing",
+    targetId: listingId,
+    metadata: { photos_removed: photos?.length ?? 0 },
+  });
 
   return c.json({ success: true });
 });
@@ -1085,6 +1216,13 @@ admin.post("/users/:id/suspend", async (c) => {
     return c.json({ error: "Failed to suspend user" }, 500);
   }
 
+  void auditFromContext(c, {
+    action: "user.suspend",
+    targetType: "user",
+    targetId: userId,
+    reason: parsed.data.reason,
+  });
+
   return c.json({ user });
 });
 
@@ -1106,6 +1244,12 @@ admin.post("/users/:id/unsuspend", async (c) => {
     console.error("Error unsuspending user:", error);
     return c.json({ error: "Failed to unsuspend user" }, 500);
   }
+
+  void auditFromContext(c, {
+    action: "user.unsuspend",
+    targetType: "user",
+    targetId: userId,
+  });
 
   return c.json({ user });
 });
@@ -1145,6 +1289,14 @@ admin.post("/users/:id/ban", async (c) => {
     .eq("seller_id", userId)
     .eq("status", "active");
 
+  void auditFromContext(c, {
+    action: "user.ban",
+    targetType: "user",
+    targetId: userId,
+    reason: parsed.data.reason,
+    metadata: { deactivated_active_listings: true },
+  });
+
   return c.json({ user });
 });
 
@@ -1166,6 +1318,12 @@ admin.post("/users/:id/unban", async (c) => {
     console.error("Error unbanning user:", error);
     return c.json({ error: "Failed to unban user" }, 500);
   }
+
+  void auditFromContext(c, {
+    action: "user.unban",
+    targetType: "user",
+    targetId: userId,
+  });
 
   return c.json({ user });
 });
@@ -1362,6 +1520,13 @@ admin.put("/settings", async (c) => {
     return c.json({ error: "Failed to update settings" }, 500);
   }
 
+  void auditFromContext(c, {
+    action: "settings.edit",
+    targetType: "settings",
+    targetId: "commission_rate",
+    metadata: { commission_rate: parsed.data.commission_rate },
+  });
+
   return c.json({ settings: { commission_rate: data.commission_rate } });
 });
 
@@ -1443,6 +1608,13 @@ admin.patch("/settings/tiers", async (c) => {
     return c.json({ error: "Failed to update tier settings" }, 500);
   }
 
+  void auditFromContext(c, {
+    action: "settings.edit",
+    targetType: "settings",
+    targetId: "tiers",
+    metadata: updatePayload,
+  });
+
   return c.json({
     tier_thresholds: data.tier_thresholds,
     tier_commission_rates: data.tier_commission_rates,
@@ -1492,6 +1664,64 @@ admin.patch("/users/:id/trust-tier", async (c) => {
     console.error("Error updating trust tier override:", error);
     return c.json({ error: "Failed to update trust tier" }, 500);
   }
+
+  return c.json({ user });
+});
+
+// ============================================================
+// Seller quality (Phase 0.4) — admin-only 0–5 rating (Screens 11/12)
+// ============================================================
+
+const sellerQualitySchema = z.object({
+  // 0.0–5.0 in 0.5 steps; null clears the rating.
+  seller_quality: z.number().min(0).max(5).nullable(),
+});
+
+/**
+ * PATCH /api/admin/users/:id/seller-quality
+ * Set/clear a seller's admin-only quality rating. Never shown to users.
+ */
+admin.patch("/users/:id/seller-quality", async (c) => {
+  const userId = c.req.param("id");
+  const supabase = createSupabaseAdmin();
+
+  const body = await c.req.json();
+  const parsed = sellerQualitySchema.safeParse(body);
+  if (!parsed.success) {
+    return c.json(
+      { error: "Validation failed", details: parsed.error.flatten().fieldErrors },
+      400
+    );
+  }
+
+  // Capture the prior value for the audit before/after.
+  const { data: before } = await supabase
+    .from("profiles")
+    .select("seller_quality")
+    .eq("id", userId)
+    .single();
+
+  const { data: user, error } = await supabase
+    .from("profiles")
+    .update({ seller_quality: parsed.data.seller_quality })
+    .eq("id", userId)
+    .select("id, display_name, seller_quality")
+    .single();
+
+  if (error || !user) {
+    console.error("Error updating seller_quality:", error);
+    return c.json({ error: "Failed to update seller quality" }, 500);
+  }
+
+  void auditFromContext(c, {
+    action: "user.seller_quality_set",
+    targetType: "user",
+    targetId: userId,
+    metadata: {
+      before: before?.seller_quality ?? null,
+      after: parsed.data.seller_quality,
+    },
+  });
 
   return c.json({ user });
 });
@@ -1717,6 +1947,13 @@ admin.patch("/referrals/:userId/disable", async (c) => {
     return c.json({ error: "Failed to disable referral code" }, 500);
   }
 
+  void auditFromContext(c, {
+    action: "referral.disable",
+    targetType: "referral",
+    targetId: userId,
+    metadata: { code: codeRow.code },
+  });
+
   return c.json({ success: true, code: updated });
 });
 
@@ -1749,6 +1986,13 @@ admin.patch("/referrals/:userId/enable", async (c) => {
     console.error("Error enabling referral code:", updateError);
     return c.json({ error: "Failed to enable referral code" }, 500);
   }
+
+  void auditFromContext(c, {
+    action: "referral.enable",
+    targetType: "referral",
+    targetId: userId,
+    metadata: { code: codeRow.code },
+  });
 
   return c.json({ success: true, code: updated });
 });
@@ -2204,6 +2448,13 @@ admin.post("/moderation/warn", async (c) => {
       .in("entity_id", convMessageIds);
   }
 
+  void auditFromContext(c, {
+    action: "moderation.warn",
+    targetType: "message",
+    targetId: parsed.data.conversation_id,
+    metadata: { conversation_id: parsed.data.conversation_id },
+  });
+
   return c.json({ success: true });
 });
 
@@ -2270,6 +2521,13 @@ admin.post("/moderation/redact", async (c) => {
     .update({ status: "actioned", reviewed_at: new Date().toISOString() })
     .eq("id", flag.id);
 
+  void auditFromContext(c, {
+    action: "moderation.message_redact",
+    targetType: "message",
+    targetId: message.id as string,
+    metadata: { flag_id: flag.id },
+  });
+
   return c.json({ success: true });
 });
 
@@ -2325,6 +2583,13 @@ admin.post("/moderation/suspend", async (c) => {
     body: `Your account has been suspended: ${parsed.data.reason}`,
     data: { reason: parsed.data.reason, role: "system" },
   }).catch((err) => console.error("[admin] Suspension notification error:", err));
+
+  void auditFromContext(c, {
+    action: "moderation.suspend",
+    targetType: "user",
+    targetId: parsed.data.user_id,
+    reason: parsed.data.reason,
+  });
 
   return c.json({ success: true });
 });
@@ -2392,6 +2657,13 @@ admin.put("/settings/auto-approve", async (c) => {
     return c.json({ error: "Failed to update auto-approve config" }, 500);
   }
 
+  void auditFromContext(c, {
+    action: "settings.edit",
+    targetType: "settings",
+    targetId: "auto_approve",
+    metadata: { auto_approve_config: parsed.data.auto_approve_config },
+  });
+
   return c.json({ auto_approve_config: data.auto_approve_config });
 });
 
@@ -2455,6 +2727,13 @@ admin.post("/config/categories", async (c) => {
     return c.json({ error: "Failed to create category" }, 500);
   }
 
+  void auditFromContext(c, {
+    action: "taxonomy.edit",
+    targetType: "taxonomy",
+    targetId: (category as Record<string, unknown>)?.id as string,
+    metadata: { op: "category_create", name: parsed.data.name },
+  });
+
   return c.json({ category }, 201);
 });
 
@@ -2483,6 +2762,13 @@ admin.put("/config/categories/reorder", async (c) => {
       console.error(`Error reordering category ${parsed.data.order[i]}:`, error);
     }
   }
+
+  void auditFromContext(c, {
+    action: "taxonomy.edit",
+    targetType: "taxonomy",
+    targetId: null,
+    metadata: { op: "category_reorder", order: parsed.data.order },
+  });
 
   return c.json({ success: true });
 });
@@ -2521,6 +2807,13 @@ admin.put("/config/categories/:id", async (c) => {
     return c.json({ error: "Failed to update category" }, 500);
   }
 
+  void auditFromContext(c, {
+    action: "taxonomy.edit",
+    targetType: "taxonomy",
+    targetId: categoryId,
+    metadata: { op: "category_update", changes: updatePayload },
+  });
+
   return c.json({ category });
 });
 
@@ -2538,6 +2831,13 @@ admin.delete("/config/categories/:id", async (c) => {
     console.error("Error soft-deleting category:", error);
     return c.json({ error: "Failed to delete category" }, 500);
   }
+
+  void auditFromContext(c, {
+    action: "taxonomy.edit",
+    targetType: "taxonomy",
+    targetId: categoryId,
+    metadata: { op: "category_delete" },
+  });
 
   return c.json({ success: true });
 });
@@ -2743,6 +3043,13 @@ admin.post("/config/editorial-tags", async (c) => {
     return c.json({ error: "Failed to create editorial tag" }, 500);
   }
 
+  void auditFromContext(c, {
+    action: "taxonomy.edit",
+    targetType: "taxonomy",
+    targetId: (tag as Record<string, unknown>)?.id as string,
+    metadata: { op: "editorial_tag_create", name: parsed.data.name },
+  });
+
   return c.json({ tag }, 201);
 });
 
@@ -2778,6 +3085,13 @@ admin.put("/config/editorial-tags/:id", async (c) => {
     return c.json({ error: "Failed to update editorial tag" }, 500);
   }
 
+  void auditFromContext(c, {
+    action: "taxonomy.edit",
+    targetType: "taxonomy",
+    targetId: tagId,
+    metadata: { op: "editorial_tag_update", changes: updatePayload },
+  });
+
   return c.json({ tag });
 });
 
@@ -2795,6 +3109,13 @@ admin.delete("/config/editorial-tags/:id", async (c) => {
     console.error("Error soft-deleting editorial tag:", error);
     return c.json({ error: "Failed to delete editorial tag" }, 500);
   }
+
+  void auditFromContext(c, {
+    action: "taxonomy.edit",
+    targetType: "taxonomy",
+    targetId: tagId,
+    metadata: { op: "editorial_tag_delete" },
+  });
 
   return c.json({ success: true });
 });
@@ -3242,6 +3563,18 @@ admin.post("/payouts/:id/mark-sent", async (c) => {
     return c.json({ error: "Failed to mark payout sent" }, 500);
   }
 
+  void auditFromContext(c, {
+    action: "payout.mark_sent",
+    targetType: "payout",
+    targetId: payoutId,
+    metadata: {
+      method: payout.method,
+      external_reference: parsed.data.external_reference,
+      amount_cents: (updated as Record<string, unknown>)?.amount_cents ?? null,
+      currency: (updated as Record<string, unknown>)?.currency ?? null,
+    },
+  });
+
   return c.json({ payout: updated });
 });
 
@@ -3300,6 +3633,13 @@ admin.post("/payouts/:id/mark-failed", async (c) => {
     console.error("Error marking payout failed:", updateError);
     return c.json({ error: "Failed to mark payout failed" }, 500);
   }
+
+  void auditFromContext(c, {
+    action: "payout.mark_failed",
+    targetType: "payout",
+    targetId: payoutId,
+    reason: parsed.data.failure_reason,
+  });
 
   return c.json({ payout: updated });
 });
@@ -3363,6 +3703,12 @@ admin.post("/payouts/:id/retry", async (c) => {
       .select("*")
       .eq("id", payoutId)
       .single();
+    void auditFromContext(c, {
+      action: "payout.retry",
+      targetType: "payout",
+      targetId: payoutId,
+      metadata: { method: "stripe" },
+    });
     return c.json({ payout: refreshed });
   }
 
@@ -3379,7 +3725,1808 @@ admin.post("/payouts/:id/retry", async (c) => {
     return c.json({ error: "Failed to retry payout" }, 500);
   }
 
+  void auditFromContext(c, {
+    action: "payout.retry",
+    targetType: "payout",
+    targetId: payoutId,
+    metadata: { method: payout.method },
+  });
+
   return c.json({ payout: updated });
+});
+
+// ============================================================
+// Audit log (Screen 23) — read-only, append-only trail
+// ============================================================
+
+/**
+ * GET /api/admin/audit-log
+ * Paginated, read-only view of the immutable admin action trail.
+ * Filters: actor (id or email substring), action, target_type, from, to.
+ * (Permission-gated to `audit.read` once roles land in Phase 0.2.)
+ */
+admin.get("/audit-log", async (c) => {
+  const supabase = createSupabaseAdmin();
+  const page = Math.max(parseInt(c.req.query("page") || "1", 10) || 1, 1);
+  const limit = Math.min(parseInt(c.req.query("limit") || "50", 10) || 50, 200);
+  const from = (page - 1) * limit;
+
+  let query = supabase
+    .from("admin_audit_log")
+    .select("*", { count: "exact" })
+    .order("created_at", { ascending: false })
+    .range(from, from + limit - 1);
+
+  const action = c.req.query("action");
+  if (action) query = query.eq("action", action);
+  const targetType = c.req.query("target_type");
+  if (targetType) query = query.eq("target_type", targetType);
+  const targetId = c.req.query("target_id");
+  if (targetId) query = query.eq("target_id", targetId);
+  const actor = c.req.query("actor");
+  if (actor) {
+    // actor may be a UUID (actor_id) or an email fragment. Only apply the
+    // uuid equality when it actually looks like one — otherwise Postgres
+    // rejects the cast — and always allow the email substring match.
+    const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(actor);
+    query = isUuid
+      ? query.or(`actor_id.eq.${actor},actor_email.ilike.%${actor}%`)
+      : query.ilike("actor_email", `%${actor}%`);
+  }
+  const fromDate = c.req.query("from");
+  if (fromDate) query = query.gte("created_at", fromDate);
+  const toDate = c.req.query("to");
+  if (toDate) query = query.lte("created_at", toDate);
+
+  const { data, error, count } = await query;
+  if (error) {
+    console.error("Error loading audit log:", error);
+    return c.json({ error: "Failed to load audit log" }, 500);
+  }
+
+  return c.json({ entries: data ?? [], total: count ?? 0, page, limit });
+});
+
+// ============================================================
+// Transactions & offers (Phase 1) — Screens 07/08/09
+// New admin surface; the app/web use /api/orders + /api/offers (untouched).
+// ============================================================
+
+// FE tabs → order statuses. "offers" is a separate ledger (below). There's
+// no distinct "refunded" status — a refunded order lands in "cancelled".
+const TX_TAB_STATUS: Record<string, string[]> = {
+  awaiting_shipment: ["paid"],
+  in_transit: ["shipped"],
+  delivered: ["delivered"],
+  completed: ["complete"],
+  refunded: ["cancelled"],
+};
+
+/**
+ * GET /api/admin/transactions
+ * Sales + offers ledger (Screen 07). tab=all|offers|awaiting_shipment|
+ * in_transit|delivered|completed|refunded, plus region / from / to / search
+ * (ref or buyer email) / pagination. Commission (the 15% Kifaayat keeps) is
+ * returned per row.
+ */
+admin.get("/transactions", async (c) => {
+  const supabase = createSupabaseAdmin();
+  const tab = c.req.query("tab") || "all";
+  const page = Math.max(parseInt(c.req.query("page") || "1", 10) || 1, 1);
+  const limit = Math.min(parseInt(c.req.query("limit") || "50", 10) || 50, 100);
+  const offset = (page - 1) * limit;
+  const search = c.req.query("search")?.trim();
+  const region = c.req.query("region");
+  const fromDate = c.req.query("from");
+  const toDate = c.req.query("to");
+
+  // --- Offers ledger ---
+  if (tab === "offers") {
+    const sellerEmbed = region
+      ? "seller:profiles!offers_seller_id_fkey!inner(display_name, location)"
+      : "seller:profiles!offers_seller_id_fkey(display_name, location)";
+    let q = supabase
+      .from("offers")
+      .select(
+        "id, listing_id, amount, currency, status, round, created_at, offered_by, " +
+          "listings!offers_listing_id_fkey(title), " +
+          "buyer:profiles!offers_buyer_id_fkey(display_name), " +
+          sellerEmbed,
+        { count: "exact" }
+      )
+      .order("created_at", { ascending: false })
+      .range(offset, offset + limit - 1);
+    if (region) q = q.eq("seller.location", region);
+    if (fromDate) q = q.gte("created_at", fromDate);
+    if (toDate) q = q.lte("created_at", toDate);
+
+    const { data, error, count } = await q;
+    if (error) {
+      console.error("Error loading offers ledger:", error);
+      return c.json({ error: "Failed to load offers" }, 500);
+    }
+    const items = (data ?? []).map((o) => {
+      const r = o as unknown as Record<string, unknown>;
+      return {
+        kind: "offer" as const,
+        id: r.id,
+        ref: `OFFER-${String(r.id).slice(0, 8)}`,
+        listing: (r.listings as Record<string, unknown> | null)?.title ?? null,
+        buyer: (r.buyer as Record<string, unknown> | null)?.display_name ?? null,
+        seller: (r.seller as Record<string, unknown> | null)?.display_name ?? null,
+        seller_location: (r.seller as Record<string, unknown> | null)?.location ?? null,
+        amount: r.amount,
+        currency: r.currency,
+        commission: null,
+        state: r.status,
+        round: r.round,
+        created_at: r.created_at,
+      };
+    });
+    return c.json({ items, total: count ?? 0, page, limit });
+  }
+
+  // --- Sales (orders) ledger ---
+  const sellerEmbed = region
+    ? "seller:profiles!orders_seller_id_fkey!inner(display_name, location)"
+    : "seller:profiles!orders_seller_id_fkey(display_name, location)";
+  let q = supabase
+    .from("orders")
+    .select(
+      "id, order_number, amount, currency, commission_amount, seller_payout, status, created_at, " +
+        "listings!orders_listing_id_fkey(title), " +
+        "buyer:profiles!orders_buyer_id_fkey(display_name), " +
+        sellerEmbed,
+      { count: "exact" }
+    )
+    .order("created_at", { ascending: false })
+    .range(offset, offset + limit - 1);
+
+  const statuses = TX_TAB_STATUS[tab];
+  if (statuses) q = q.in("status", statuses);
+  if (region) q = q.eq("seller.location", region);
+  if (fromDate) q = q.gte("created_at", fromDate);
+  if (toDate) q = q.lte("created_at", toDate);
+  // Search by order ref or buyer email (seller-name search is a follow-up —
+  // it needs a join filter or a denormalized column).
+  if (search) q = q.or(`order_number.ilike.%${search}%,buyer_email.ilike.%${search}%`);
+
+  const { data, error, count } = await q;
+  if (error) {
+    console.error("Error loading transactions:", error);
+    return c.json({ error: "Failed to load transactions" }, 500);
+  }
+  const items = (data ?? []).map((o) => {
+    const r = o as unknown as Record<string, unknown>;
+    return {
+      kind: "order" as const,
+      id: r.id,
+      ref: r.order_number,
+      listing: (r.listings as Record<string, unknown> | null)?.title ?? null,
+      buyer: (r.buyer as Record<string, unknown> | null)?.display_name ?? null,
+      seller: (r.seller as Record<string, unknown> | null)?.display_name ?? null,
+      seller_location: (r.seller as Record<string, unknown> | null)?.location ?? null,
+      amount: r.amount,
+      currency: r.currency,
+      commission: r.commission_amount,
+      seller_payout: r.seller_payout,
+      state: r.status,
+      created_at: r.created_at,
+    };
+  });
+  return c.json({ items, total: count ?? 0, page, limit });
+});
+
+/**
+ * GET /api/admin/transactions/:id
+ * Full transaction record (Screen 08): money breakdown, shipment, timeline,
+ * both parties. Mutating actions (refund / mark-delivered / force-advance)
+ * land in the next increment.
+ */
+admin.get("/transactions/:id", async (c) => {
+  const orderId = c.req.param("id");
+  const supabase = createSupabaseAdmin();
+
+  const { data: order, error } = await supabase
+    .from("orders")
+    .select(
+      "*, listings!orders_listing_id_fkey(id, title, listing_photos(url, position)), " +
+        "buyer:profiles!orders_buyer_id_fkey(id, display_name, email, location), " +
+        "seller:profiles!orders_seller_id_fkey(id, display_name, email, location)"
+    )
+    .eq("id", orderId)
+    .single();
+
+  if (error || !order) {
+    return c.json({ error: "Transaction not found" }, 404);
+  }
+  const o = order as unknown as Record<string, unknown>;
+
+  const money = {
+    sale: o.amount,
+    item: o.item_amount ?? null,
+    shipping: o.shipping_amount ?? null,
+    voucher_discount: o.voucher_discount ?? null,
+    commission_rate: o.commission_rate ?? null,
+    commission: o.commission_amount ?? null,
+    seller_payout: o.seller_payout ?? null,
+    currency: o.currency,
+    charge_id: o.stripe_payment_intent_id ?? null,
+    note: "Stripe processing fee is handled by Stripe and not stored here.",
+  };
+
+  const shipment = {
+    carrier: o.shipping_carrier ?? null,
+    tracking: o.shipping_tracking_number ?? null,
+    receipt_photo: o.shipping_receipt_photo_url ?? null,
+    shipped_at: o.shipped_at ?? null,
+    delivery_method: o.delivery_method ?? null,
+  };
+
+  // Reverse-chronological timeline built from the order's timestamps.
+  const events: Array<{ at: string; event: string }> = [];
+  const push = (at: unknown, event: string) => {
+    if (at) events.push({ at: at as string, event });
+  };
+  push(o.created_at, "Order placed / paid");
+  push(o.seller_accepted_at, "Seller accepted");
+  push(o.shipped_at, "Shipped");
+  push(o.delivered_at, "Delivered");
+  push(o.completed_at, "Completed");
+  if (o.status === "cancelled") push(o.updated_at, "Cancelled / refunded");
+  const timeline = events.sort((a, b) => b.at.localeCompare(a.at));
+
+  return c.json({ transaction: order, money, shipment, timeline });
+});
+
+// The forward order lifecycle. force-advance steps to the next state.
+const ORDER_PROGRESSION = ["paid", "shipped", "delivered", "complete"] as const;
+
+/**
+ * POST /api/admin/transactions/:id/refund
+ * Refund the buyer (Screen 08). Requires a reason, calls Stripe, cancels
+ * the payout ledger row, frees a still-reserved listing, notifies the
+ * buyer, and writes the audit trail. (Role-gating arrives with Phase 0.2.)
+ */
+admin.post("/transactions/:id/refund", requireAdminPermission("transactions.refund"), async (c) => {
+  const orderId = c.req.param("id");
+  const supabase = createSupabaseAdmin();
+
+  const parsed = z
+    .object({ reason: z.string().min(1, "A refund reason is required").max(1000) })
+    .safeParse(await c.req.json());
+  if (!parsed.success) {
+    return c.json(
+      { error: "Validation failed", details: parsed.error.flatten().fieldErrors },
+      400
+    );
+  }
+  const { reason } = parsed.data;
+
+  const { data: orderRow, error } = await supabase
+    .from("orders")
+    .select(
+      "id, status, stripe_payment_intent_id, listing_id, buyer_id, currency, amount, " +
+        "listings!orders_listing_id_fkey(title)"
+    )
+    .eq("id", orderId)
+    .single();
+  if (error || !orderRow) return c.json({ error: "Transaction not found" }, 404);
+  const order = orderRow as unknown as Record<string, unknown>;
+
+  if (order.status === "cancelled") {
+    return c.json({ error: "Order is already cancelled/refunded" }, 400);
+  }
+  if (!order.stripe_payment_intent_id) {
+    return c.json({ error: "Order has no payment to refund" }, 400);
+  }
+
+  // Refund via Stripe first — if this throws, we do NOT flip the order.
+  let refund;
+  try {
+    refund = await refundOrderPayment(order.stripe_payment_intent_id as string);
+  } catch (err) {
+    console.error("[admin] Refund failed:", err);
+    return c.json({ error: "Stripe refund failed" }, 502);
+  }
+
+  const priorStatus = order.status as string;
+  await supabase
+    .from("orders")
+    .update({
+      status: "cancelled",
+      seller_rejection_reason: reason,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", orderId);
+
+  // Free the listing if it's still reserved (unshipped); leave sold items alone.
+  await supabase
+    .from("listings")
+    .update({ status: "active", updated_at: new Date().toISOString() })
+    .eq("id", order.listing_id as string)
+    .eq("status", "reserved");
+
+  await cancelPayoutForOrder(orderId, `Refunded by admin: ${reason}`);
+
+  const listingTitle =
+    ((order.listings as Record<string, unknown> | null)?.title as string) || "your item";
+  if (order.buyer_id) {
+    createNotification({
+      user_id: order.buyer_id as string,
+      type: "order_rejected",
+      ...orderRejectedNotification(listingTitle, reason),
+      data: { order_id: orderId, listing_id: order.listing_id, role: "buyer" },
+    }).catch((e) => console.error("[admin] Refund notification error:", e));
+  }
+
+  void auditFromContext(c, {
+    action: "transaction.refund",
+    targetType: "order",
+    targetId: orderId,
+    reason,
+    metadata: {
+      refund_id: refund.id,
+      amount: order.amount,
+      currency: order.currency,
+      prior_status: priorStatus,
+    },
+  });
+
+  return c.json({ success: true, refund_id: refund.id });
+});
+
+/**
+ * POST /api/admin/transactions/:id/mark-delivered
+ * Operator marks an order delivered (Screen 08). Allowed from paid/shipped.
+ */
+admin.post("/transactions/:id/mark-delivered", async (c) => {
+  const orderId = c.req.param("id");
+  const supabase = createSupabaseAdmin();
+
+  const { data: orderRow, error } = await supabase
+    .from("orders")
+    .select("id, status, seller_id, listing_id, listings!orders_listing_id_fkey(title)")
+    .eq("id", orderId)
+    .single();
+  if (error || !orderRow) return c.json({ error: "Transaction not found" }, 404);
+  const order = orderRow as unknown as Record<string, unknown>;
+
+  if (!["paid", "shipped"].includes(order.status as string)) {
+    return c.json(
+      { error: `Cannot mark delivered from '${order.status}'` },
+      400
+    );
+  }
+
+  const now = new Date().toISOString();
+  const { error: updErr } = await supabase
+    .from("orders")
+    .update({ status: "delivered", delivered_at: now, updated_at: now })
+    .eq("id", orderId);
+  if (updErr) {
+    console.error("[admin] mark-delivered failed:", updErr);
+    return c.json({ error: "Failed to mark delivered" }, 500);
+  }
+
+  const listingTitle =
+    ((order.listings as Record<string, unknown> | null)?.title as string) || "the item";
+  if (order.seller_id) {
+    createNotification({
+      user_id: order.seller_id as string,
+      type: "order_delivered",
+      ...orderDeliveredNotification(listingTitle),
+      data: { order_id: orderId, listing_id: order.listing_id, role: "seller" },
+    }).catch((e) => console.error("[admin] Delivered notification error:", e));
+  }
+
+  void auditFromContext(c, {
+    action: "transaction.mark_delivered",
+    targetType: "order",
+    targetId: orderId,
+    metadata: { from: order.status },
+  });
+
+  return c.json({ success: true });
+});
+
+/**
+ * POST /api/admin/transactions/:id/force-advance
+ * Operator override that steps the order to the next lifecycle state
+ * (paid → shipped → delivered → complete). Requires a reason, audited.
+ * Advancing to `complete` releases the seller payout (mirrors normal
+ * completion). (Role-gating arrives with Phase 0.2.)
+ */
+admin.post("/transactions/:id/force-advance", requireAdminPermission("transactions.force_advance"), async (c) => {
+  const orderId = c.req.param("id");
+  const supabase = createSupabaseAdmin();
+
+  const parsed = z
+    .object({ reason: z.string().min(1, "A reason is required").max(1000) })
+    .safeParse(await c.req.json());
+  if (!parsed.success) {
+    return c.json(
+      { error: "Validation failed", details: parsed.error.flatten().fieldErrors },
+      400
+    );
+  }
+  const { reason } = parsed.data;
+
+  const { data: order, error } = await supabase
+    .from("orders")
+    .select("id, status, seller_id, listing_id")
+    .eq("id", orderId)
+    .single();
+  if (error || !order) return c.json({ error: "Transaction not found" }, 404);
+
+  const idx = ORDER_PROGRESSION.indexOf(order.status as (typeof ORDER_PROGRESSION)[number]);
+  if (idx === -1 || idx >= ORDER_PROGRESSION.length - 1) {
+    return c.json(
+      { error: `Cannot advance from '${order.status}' (terminal or off-lifecycle)` },
+      400
+    );
+  }
+  const nextStatus = ORDER_PROGRESSION[idx + 1];
+
+  const now = new Date().toISOString();
+  const updates: Record<string, unknown> = { status: nextStatus, updated_at: now };
+  if (nextStatus === "shipped") {
+    updates.shipped_at = now;
+    updates.auto_complete_at = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+  } else if (nextStatus === "delivered") {
+    updates.delivered_at = now;
+  } else if (nextStatus === "complete") {
+    updates.completed_at = now;
+  }
+
+  const { error: updErr } = await supabase.from("orders").update(updates).eq("id", orderId);
+  if (updErr) {
+    console.error("[admin] force-advance failed:", updErr);
+    return c.json({ error: "Failed to advance order" }, 500);
+  }
+
+  // Advancing to complete releases the seller payout, same as normal completion.
+  if (nextStatus === "complete") {
+    releasePayoutForOrder(orderId).catch((e) =>
+      console.error("[admin] force-advance payout release failed:", e)
+    );
+  }
+
+  void auditFromContext(c, {
+    action: "transaction.force_advance",
+    targetType: "order",
+    targetId: orderId,
+    reason,
+    metadata: { from: order.status, to: nextStatus },
+  });
+
+  return c.json({ success: true, status: nextStatus });
+});
+
+/**
+ * GET /api/admin/offers/:id
+ * Read-only offer-thread oversight (Screen 09): the full round history for
+ * this listing+buyer, both parties, outcome, and the lowest offer.
+ */
+admin.get("/offers/:id", async (c) => {
+  const offerId = c.req.param("id");
+  const supabase = createSupabaseAdmin();
+
+  const { data: offer, error } = await supabase
+    .from("offers")
+    .select(
+      "*, listings!offers_listing_id_fkey(id, title), " +
+        "buyer:profiles!offers_buyer_id_fkey(id, display_name), " +
+        "seller:profiles!offers_seller_id_fkey(id, display_name)"
+    )
+    .eq("id", offerId)
+    .single();
+
+  if (error || !offer) {
+    return c.json({ error: "Offer not found" }, 404);
+  }
+  const of = offer as unknown as Record<string, unknown>;
+
+  // The full negotiation = every offer on this listing from this buyer,
+  // in round order (each counter is a new row, offered_by = buyer|seller).
+  const { data: thread } = await supabase
+    .from("offers")
+    .select("id, amount, currency, status, round, offered_by, message, created_at")
+    .eq("listing_id", of.listing_id as string)
+    .eq("buyer_id", of.buyer_id as string)
+    .order("round", { ascending: true })
+    .order("created_at", { ascending: true });
+
+  const amounts = (thread ?? []).map((t) => (t as Record<string, unknown>).amount as number);
+  const lowest = amounts.length ? Math.min(...amounts) : (of.amount as number);
+
+  return c.json({
+    offer,
+    thread: thread ?? [],
+    outcome: of.status,
+    lowest_offer: lowest,
+  });
+});
+
+// ============================================================
+// Moderation: message hold/publish + reviews (Phase 3) — Screens 14/15
+// ============================================================
+
+/**
+ * POST /api/admin/moderation/publish
+ * Release a held message so the recipient can see it. (Reject = keep hidden
+ * uses the existing /moderation/redact, or set moderation_hidden below.)
+ */
+admin.post("/moderation/publish", requireAdminPermission("moderation.act"), async (c) => {
+  const supabase = createSupabaseAdmin();
+  const parsed = z
+    .object({ message_id: z.string().uuid(), action: z.enum(["publish", "hide"]).default("publish") })
+    .safeParse(await c.req.json());
+  if (!parsed.success) {
+    return c.json({ error: "Validation failed", details: parsed.error.flatten().fieldErrors }, 400);
+  }
+  const { message_id, action } = parsed.data;
+
+  const { data, error } = await supabase
+    .from("messages")
+    .update({
+      moderation_hold: false,
+      moderation_hidden: action === "hide",
+      moderated_by: c.get("adminProfileId"),
+      moderated_at: new Date().toISOString(),
+    })
+    .eq("id", message_id)
+    .select("id, conversation_id")
+    .single();
+  if (error || !data) return c.json({ error: "Message not found" }, 404);
+
+  // Resolve any pending flag on this message.
+  await supabase
+    .from("fraud_flags")
+    .update({ status: "reviewed", reviewed_at: new Date().toISOString() })
+    .eq("entity_type", "message")
+    .eq("entity_id", message_id)
+    .eq("status", "pending");
+
+  void auditFromContext(c, {
+    action: action === "publish" ? "moderation.message_publish" : "moderation.message_redact",
+    targetType: "message",
+    targetId: message_id,
+  });
+  return c.json({ success: true });
+});
+
+/**
+ * GET /api/admin/reviews/flagged
+ * Reviews flagged by a seller or auto-detected, not yet hidden.
+ */
+admin.get("/reviews/flagged", async (c) => {
+  const supabase = createSupabaseAdmin();
+  const { data, error } = await supabase
+    .from("reviews")
+    .select(
+      "id, rating, comment, reviewer_role, flagged_at, flag_reason, flag_source, dispute_status, created_at, " +
+        "reviewer:profiles!reviews_reviewer_id_fkey(id, display_name), " +
+        "reviewee:profiles!reviews_reviewee_id_fkey(id, display_name)"
+    )
+    .not("flagged_at", "is", null)
+    .is("hidden_at", null)
+    .order("flagged_at", { ascending: false })
+    .limit(100);
+  if (error) {
+    console.error("Error loading flagged reviews:", error);
+    return c.json({ error: "Failed to load flagged reviews" }, 500);
+  }
+  return c.json({ reviews: data ?? [] });
+});
+
+/**
+ * POST /api/admin/reviews/:id/hide
+ * Hide a review from the public profile (kept on record + audit).
+ */
+admin.post("/reviews/:id/hide", requireAdminPermission("moderation.act"), async (c) => {
+  const reviewId = c.req.param("id");
+  const supabase = createSupabaseAdmin();
+  const parsed = z.object({ reason: z.string().max(500).optional() }).safeParse(await c.req.json().catch(() => ({})));
+  const reason = parsed.success ? parsed.data.reason : undefined;
+
+  const { data, error } = await supabase
+    .from("reviews")
+    .update({
+      hidden_at: new Date().toISOString(),
+      hidden_by: c.get("adminProfileId"),
+      visible: false,
+    })
+    .eq("id", reviewId)
+    .select("id")
+    .single();
+  if (error || !data) return c.json({ error: "Review not found" }, 404);
+
+  void auditFromContext(c, {
+    action: "review.hide",
+    targetType: "review",
+    targetId: reviewId,
+    reason: reason ?? null,
+  });
+  return c.json({ success: true });
+});
+
+/**
+ * POST /api/admin/reviews/:id/dispute
+ * Open or resolve an in-console dispute on a review.
+ */
+admin.post("/reviews/:id/dispute", requireAdminPermission("moderation.act"), async (c) => {
+  const reviewId = c.req.param("id");
+  const supabase = createSupabaseAdmin();
+  const parsed = z
+    .object({ status: z.enum(["open", "resolved"]), note: z.string().max(1000).optional() })
+    .safeParse(await c.req.json());
+  if (!parsed.success) {
+    return c.json({ error: "Validation failed", details: parsed.error.flatten().fieldErrors }, 400);
+  }
+
+  const { data, error } = await supabase
+    .from("reviews")
+    .update({ dispute_status: parsed.data.status })
+    .eq("id", reviewId)
+    .select("id")
+    .single();
+  if (error || !data) return c.json({ error: "Review not found" }, 404);
+
+  void auditFromContext(c, {
+    action: "review.dispute",
+    targetType: "review",
+    targetId: reviewId,
+    reason: parsed.data.note ?? null,
+    metadata: { status: parsed.data.status },
+  });
+  return c.json({ success: true });
+});
+
+// ============================================================
+// User record (Phase 2) — Screens 11/12
+// ============================================================
+
+/**
+ * GET /api/admin/users/:id
+ * Full user record: profile + payout setup + seller_quality + cross-linked
+ * counts (listings, purchases, sales, reviews) + referral code.
+ */
+admin.get("/users/:id", async (c) => {
+  const userId = c.req.param("id");
+  const supabase = createSupabaseAdmin();
+
+  const { data: profile, error } = await supabase
+    .from("profiles")
+    .select("*")
+    .eq("id", userId)
+    .single();
+  if (error || !profile) return c.json({ error: "User not found" }, 404);
+
+  const [listings, purchases, sales, reviews, refCode] = await Promise.all([
+    supabase.from("listings").select("id", { count: "exact", head: true }).eq("seller_id", userId),
+    supabase.from("orders").select("id", { count: "exact", head: true }).eq("buyer_id", userId),
+    supabase.from("orders").select("id", { count: "exact", head: true }).eq("seller_id", userId),
+    supabase.from("reviews").select("id", { count: "exact", head: true }).eq("reviewee_id", userId),
+    supabase.from("referral_codes").select("code, disabled").eq("user_id", userId).maybeSingle(),
+  ]);
+
+  const p = profile as Record<string, unknown>;
+  return c.json({
+    user: profile,
+    verification: {
+      stripe_status: p.stripe_onboarding_complete
+        ? "complete"
+        : p.stripe_account_id
+          ? "incomplete"
+          : "not_connected",
+    },
+    seller_quality: p.seller_quality ?? null,
+    counts: {
+      listings: listings.count ?? 0,
+      purchases: purchases.count ?? 0,
+      sales: sales.count ?? 0,
+      reviews: reviews.count ?? 0,
+    },
+    referral_code: refCode.data ?? null,
+  });
+});
+
+/**
+ * PATCH /api/admin/users/:id
+ * Edit account details (audited). Limited to safe display fields.
+ */
+admin.patch("/users/:id", requireAdminPermission("users.ban"), async (c) => {
+  const userId = c.req.param("id");
+  const supabase = createSupabaseAdmin();
+  const parsed = z
+    .object({
+      display_name: z.string().min(1).max(120).optional(),
+      location: z.enum(["AU", "US", "NZ", "CA", "GB"]).nullable().optional(),
+      bio: z.string().max(1000).nullable().optional(),
+    })
+    .safeParse(await c.req.json());
+  if (!parsed.success) {
+    return c.json({ error: "Validation failed", details: parsed.error.flatten().fieldErrors }, 400);
+  }
+  const updates: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(parsed.data)) if (v !== undefined) updates[k] = v;
+  if (Object.keys(updates).length === 0) return c.json({ error: "No fields to update" }, 400);
+
+  const { data, error } = await supabase
+    .from("profiles")
+    .update(updates)
+    .eq("id", userId)
+    .select("id, display_name, location, bio")
+    .single();
+  if (error || !data) return c.json({ error: "User not found" }, 404);
+
+  void auditFromContext(c, {
+    action: "user.edit",
+    targetType: "user",
+    targetId: userId,
+    metadata: { changes: updates },
+  });
+  return c.json({ user: data });
+});
+
+/**
+ * POST /api/admin/users/:id/reset-password
+ * Revoke the user's Clerk sessions (force re-auth everywhere). Emailing a
+ * reset link is a Clerk client flow; this is the server-side security action.
+ */
+admin.post("/users/:id/reset-password", requireAdminPermission("users.ban"), async (c) => {
+  const userId = c.req.param("id");
+  const supabase = createSupabaseAdmin();
+  const { data: profile } = await supabase
+    .from("profiles")
+    .select("clerk_id")
+    .eq("id", userId)
+    .single();
+  if (!profile?.clerk_id) return c.json({ error: "User has no Clerk account" }, 404);
+
+  let revoked = 0;
+  try {
+    const { createClerkClient } = await import("@clerk/backend");
+    const clerk = createClerkClient({ secretKey: process.env.CLERK_SECRET_KEY || "" });
+    const sessions = await clerk.sessions.getSessionList({ userId: profile.clerk_id as string });
+    const list = (Array.isArray(sessions) ? sessions : sessions.data) as Array<{ id: string }>;
+    for (const s of list) {
+      await clerk.sessions.revokeSession(s.id).catch(() => {});
+      revoked += 1;
+    }
+  } catch (err) {
+    console.error("[admin] reset-password (revoke sessions) failed:", err);
+    return c.json({ error: "Failed to revoke sessions" }, 500);
+  }
+
+  void auditFromContext(c, {
+    action: "user.reset_password",
+    targetType: "user",
+    targetId: userId,
+    metadata: { sessions_revoked: revoked },
+  });
+  return c.json({ success: true, sessions_revoked: revoked });
+});
+
+/**
+ * POST /api/admin/users/:id/mask
+ * Mint a Clerk sign-in token so the operator can act AS this user
+ * (impersonation). Sensitive — role-gated + audited.
+ */
+admin.post("/users/:id/mask", requireAdminPermission("users.mask"), async (c) => {
+  const userId = c.req.param("id");
+  const supabase = createSupabaseAdmin();
+  const { data: profile } = await supabase
+    .from("profiles")
+    .select("clerk_id")
+    .eq("id", userId)
+    .single();
+  if (!profile?.clerk_id) return c.json({ error: "User has no Clerk account" }, 404);
+
+  let token: string | null = null;
+  try {
+    const { createClerkClient } = await import("@clerk/backend");
+    const clerk = createClerkClient({ secretKey: process.env.CLERK_SECRET_KEY || "" });
+    const signIn = await clerk.signInTokens.createSignInToken({
+      userId: profile.clerk_id as string,
+      expiresInSeconds: 600,
+    });
+    token = signIn.token;
+  } catch (err) {
+    console.error("[admin] mask (sign-in token) failed:", err);
+    return c.json({ error: "Failed to create mask token" }, 500);
+  }
+
+  void auditFromContext(c, {
+    action: "user.mask",
+    targetType: "user",
+    targetId: userId,
+  });
+  return c.json({ sign_in_token: token, expires_in_seconds: 600 });
+});
+
+/**
+ * DELETE /api/admin/users/:id
+ * Permanent delete — owner only. Removes the profile (cascades their data)
+ * and the Clerk account. Danger zone, always audited.
+ */
+admin.delete("/users/:id", requireAdminPermission("users.delete"), async (c) => {
+  const userId = c.req.param("id");
+  const supabase = createSupabaseAdmin();
+  const { data: profile } = await supabase
+    .from("profiles")
+    .select("id, clerk_id, email")
+    .eq("id", userId)
+    .single();
+  if (!profile) return c.json({ error: "User not found" }, 404);
+
+  // Delete the Clerk account first (best-effort), then the profile (cascades).
+  if (profile.clerk_id) {
+    try {
+      const { createClerkClient } = await import("@clerk/backend");
+      const clerk = createClerkClient({ secretKey: process.env.CLERK_SECRET_KEY || "" });
+      await clerk.users.deleteUser(profile.clerk_id as string);
+    } catch (err) {
+      console.error("[admin] delete Clerk user failed (continuing):", err);
+    }
+  }
+
+  const { error } = await supabase.from("profiles").delete().eq("id", userId);
+  if (error) {
+    console.error("[admin] user delete failed:", error);
+    return c.json({ error: "Failed to delete user" }, 500);
+  }
+
+  void auditFromContext(c, {
+    action: "user.delete",
+    targetType: "user",
+    targetId: userId,
+    metadata: { email: profile.email, clerk_id: profile.clerk_id },
+  });
+  return c.json({ success: true });
+});
+
+// ============================================================
+// Referrals dashboard (Phase 2) — Screen 13
+// ============================================================
+
+/**
+ * GET /api/admin/referrals
+ * Metrics (active codes, referral signups 30d, conversion, reward issued)
+ * + the code table.
+ */
+admin.get("/referrals", async (c) => {
+  const supabase = createSupabaseAdmin();
+  const thirtyDaysAgo = new Date(Date.now() - 30 * 864e5).toISOString();
+
+  const [activeCodes, signups30d, converted, codes] = await Promise.all([
+    supabase.from("referral_codes").select("id", { count: "exact", head: true }).eq("disabled", false),
+    supabase.from("referrals").select("id", { count: "exact", head: true }).gte("created_at", thirtyDaysAgo),
+    supabase.from("referrals").select("id", { count: "exact", head: true }).eq("status", "qualified"),
+    supabase
+      .from("referral_codes")
+      .select("id, code, code_type, campaign_name, user_id, disabled, created_at")
+      .order("created_at", { ascending: false })
+      .limit(100),
+  ]);
+
+  const { count: totalRefs } = await supabase
+    .from("referrals")
+    .select("id", { count: "exact", head: true });
+  const conversion =
+    (totalRefs ?? 0) > 0 ? Math.round(((converted.count ?? 0) / (totalRefs ?? 1)) * 100) : 0;
+
+  return c.json({
+    metrics: {
+      active_codes: activeCodes.count ?? 0,
+      signups_30d: signups30d.count ?? 0,
+      conversion_pct: conversion,
+      qualified_total: converted.count ?? 0,
+    },
+    codes: codes.data ?? [],
+  });
+});
+
+/**
+ * POST /api/admin/referrals/campaign
+ * Mint a one-off campaign code (no owner). User/influencer codes still
+ * auto-issue on signup.
+ */
+admin.post("/referrals/campaign", async (c) => {
+  const supabase = createSupabaseAdmin();
+  const parsed = z
+    .object({
+      code: z.string().min(3).max(40).regex(/^[A-Za-z0-9_-]+$/),
+      campaign_name: z.string().min(1).max(120),
+    })
+    .safeParse(await c.req.json());
+  if (!parsed.success) {
+    return c.json({ error: "Validation failed", details: parsed.error.flatten().fieldErrors }, 400);
+  }
+
+  const { data, error } = await supabase
+    .from("referral_codes")
+    .insert({
+      user_id: null,
+      code: parsed.data.code.toUpperCase(),
+      code_type: "campaign",
+      campaign_name: parsed.data.campaign_name,
+      disabled: false,
+    })
+    .select("id, code, code_type, campaign_name")
+    .single();
+
+  if (error) {
+    if ((error as { code?: string }).code === "23505") {
+      return c.json({ error: "That code already exists" }, 409);
+    }
+    console.error("Error creating campaign code:", error);
+    return c.json({ error: "Failed to create campaign code" }, 500);
+  }
+
+  void auditFromContext(c, {
+    action: "referral.enable",
+    targetType: "referral",
+    targetId: (data as Record<string, unknown>).id as string,
+    metadata: { op: "campaign_create", code: data.code, campaign: parsed.data.campaign_name },
+  });
+  return c.json({ code: data }, 201);
+});
+
+// ============================================================
+// Dashboard honest metrics (Phase 6) — Screen 01
+// Two live counters + the "nine metrics" (Health / Leaks / Growth). Two of
+// the leak metrics (inquiry→purchase, seller response rate) are stubbed
+// null pending inquiry/response tracking + a definition sign-off (§8.2).
+// ============================================================
+
+admin.get("/dashboard/metrics", async (c) => {
+  if (!hasDirectDb()) return c.json({ error: "Service unavailable" }, 503);
+  const sql = getSql();
+
+  try {
+    const [counters] = await sql`
+      SELECT
+        (SELECT COUNT(*) FROM listings WHERE status = 'active')::int AS active_listings,
+        (SELECT COUNT(*) FROM profiles)::int AS total_users`;
+
+    const [health] = await sql`
+      SELECT
+        COALESCE(SUM(amount) FILTER (WHERE status <> 'cancelled'), 0)::bigint AS gmv,
+        COALESCE(SUM(commission_amount) FILTER (WHERE status <> 'cancelled' AND created_at >= NOW() - INTERVAL '7 days'), 0)::bigint AS revenue_this_week,
+        COUNT(*) FILTER (WHERE status <> 'cancelled' AND created_at >= NOW() - INTERVAL '7 days')::int AS weekly_orders,
+        COUNT(DISTINCT buyer_id)::int AS distinct_buyers,
+        COUNT(DISTINCT seller_id)::int AS distinct_sellers
+      FROM orders`;
+
+    const [liquidity] = await sql`
+      SELECT
+        ROUND(
+          COUNT(*) FILTER (WHERE status = 'sold')::numeric
+          / NULLIF(COUNT(*), 0) * 100, 1
+        )::float AS liquidity_rate
+      FROM listings
+      WHERE created_at <= NOW() - INTERVAL '90 days'`;
+
+    const [stripe] = await sql`
+      SELECT
+        ROUND(
+          COUNT(*) FILTER (WHERE stripe_onboarding_complete)::numeric
+          / NULLIF(COUNT(*), 0) * 100, 1
+        )::float AS stripe_activation
+      FROM profiles
+      WHERE id IN (SELECT DISTINCT seller_id FROM listings)`;
+
+    const [growth] = await sql`
+      SELECT
+        (SELECT COUNT(*) FROM (
+           SELECT buyer_id FROM orders GROUP BY buyer_id
+           HAVING MIN(created_at) >= NOW() - INTERVAL '30 days'
+         ) t)::int AS new_buyers,
+        (SELECT COUNT(DISTINCT buyer_id) FROM orders
+           WHERE created_at >= NOW() - INTERVAL '30 days')::int AS active_buyers`;
+
+    const buyersPerSeller =
+      health.distinct_sellers > 0
+        ? Math.round((health.distinct_buyers / health.distinct_sellers) * 100) / 100
+        : 0;
+
+    return c.json({
+      counters: {
+        active_listings: counters.active_listings,
+        total_users: counters.total_users,
+      },
+      metrics: {
+        health: {
+          gmv: Number(health.gmv),
+          revenue_this_week: Number(health.revenue_this_week),
+          weekly_orders: health.weekly_orders,
+          buyers_per_seller: buyersPerSeller,
+          liquidity_rate: liquidity.liquidity_rate ?? 0,
+        },
+        leaks: {
+          // Stubbed — need inquiry logging + a confirmed definition (§8.2).
+          inquiry_to_purchase: null,
+          seller_response_rate: null,
+          stripe_activation: stripe.stripe_activation ?? 0,
+        },
+        growth: {
+          new_buyers: growth.new_buyers,
+          active_buyers: growth.active_buyers,
+        },
+      },
+      note:
+        "inquiry_to_purchase + seller_response_rate are pending inquiry/response tracking and definition sign-off (§8.2).",
+    });
+  } catch (err) {
+    console.error("[admin] dashboard metrics failed:", err);
+    return c.json({ error: "Failed to compute metrics" }, 500);
+  }
+});
+
+// ============================================================
+// Content suite (Phase 5) — Screens 16–19
+// Push copy, email templates, website/help pages, blog. content.edit gated.
+// ============================================================
+
+// ---- Push notifications (Screen 16) ----
+admin.get("/content/push", async (c) => {
+  const supabase = createSupabaseAdmin();
+  const { data } = await supabase
+    .from("push_campaigns")
+    .select("*")
+    .order("created_at", { ascending: false })
+    .limit(100);
+  return c.json({ campaigns: data ?? [] });
+});
+
+admin.post("/content/push", requireAdminPermission("content.edit"), async (c) => {
+  const supabase = createSupabaseAdmin();
+  const parsed = z
+    .object({
+      title: z.string().min(1).max(120),
+      body: z.string().min(1).max(500),
+      deep_link: z.string().max(300).optional(),
+      audience: z.object({ market: z.string().optional(), segment: z.string().optional() }).optional(),
+      scheduled_at: z.string().datetime().optional(),
+    })
+    .safeParse(await c.req.json());
+  if (!parsed.success) {
+    return c.json({ error: "Validation failed", details: parsed.error.flatten().fieldErrors }, 400);
+  }
+  const { data, error } = await supabase
+    .from("push_campaigns")
+    .insert({
+      title: parsed.data.title,
+      body: parsed.data.body,
+      deep_link: parsed.data.deep_link ?? null,
+      audience: parsed.data.audience ?? {},
+      status: parsed.data.scheduled_at ? "scheduled" : "draft",
+      scheduled_at: parsed.data.scheduled_at ?? null,
+      created_by: c.get("adminProfileId"),
+    })
+    .select("*")
+    .single();
+  if (error) return c.json({ error: "Failed to create push" }, 500);
+  return c.json({ campaign: data }, 201);
+});
+
+admin.post("/content/push/:id/send", requireAdminPermission("content.edit"), async (c) => {
+  const id = c.req.param("id");
+  const supabase = createSupabaseAdmin();
+  const { data: camp } = await supabase.from("push_campaigns").select("*").eq("id", id).single();
+  if (!camp) return c.json({ error: "Campaign not found" }, 404);
+  if (camp.status === "sent") return c.json({ error: "Already sent" }, 400);
+
+  const appId = process.env.ONESIGNAL_APP_ID;
+  const restKey = process.env.ONESIGNAL_REST_API_KEY;
+  if (!appId || !restKey) {
+    return c.json({ error: "OneSignal not configured" }, 503);
+  }
+
+  // Broadcast to subscribed users. Market/segment targeting can be refined
+  // later via OneSignal tag filters once devices carry a market tag.
+  let onesignalId: string | null = null;
+  try {
+    const payload: Record<string, unknown> = {
+      app_id: appId,
+      included_segments: ["Subscribed Users"],
+      headings: { en: camp.title },
+      contents: { en: camp.body },
+    };
+    if (camp.deep_link) payload.url = camp.deep_link;
+    const res = await fetch("https://onesignal.com/api/v1/notifications", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Basic ${restKey}` },
+      body: JSON.stringify(payload),
+    });
+    const json = (await res.json()) as { id?: string; errors?: unknown };
+    if (!res.ok) {
+      console.error("[admin] push send failed:", json);
+      return c.json({ error: "Push send failed" }, 502);
+    }
+    onesignalId = json.id ?? null;
+  } catch (err) {
+    console.error("[admin] push send error:", err);
+    return c.json({ error: "Push send failed" }, 502);
+  }
+
+  await supabase
+    .from("push_campaigns")
+    .update({ status: "sent", sent_at: new Date().toISOString(), onesignal_id: onesignalId })
+    .eq("id", id);
+
+  void auditFromContext(c, {
+    action: "content.publish",
+    targetType: "content",
+    targetId: id,
+    metadata: { kind: "push", onesignal_id: onesignalId },
+  });
+  return c.json({ success: true, onesignal_id: onesignalId });
+});
+
+// ---- Email templates (Screen 17) ----
+admin.get("/content/email-templates", async (c) => {
+  const supabase = createSupabaseAdmin();
+  const { data } = await supabase
+    .from("email_templates")
+    .select("id, key, subject, version, updated_at")
+    .order("key", { ascending: true });
+  return c.json({ templates: data ?? [] });
+});
+
+admin.get("/content/email-templates/:key", async (c) => {
+  const supabase = createSupabaseAdmin();
+  const { data, error } = await supabase
+    .from("email_templates")
+    .select("*")
+    .eq("key", c.req.param("key"))
+    .maybeSingle();
+  if (error) return c.json({ error: "Failed to load template" }, 500);
+  return c.json({ template: data });
+});
+
+admin.put("/content/email-templates/:key", requireAdminPermission("content.edit"), async (c) => {
+  const key = c.req.param("key");
+  const supabase = createSupabaseAdmin();
+  const parsed = z
+    .object({
+      subject: z.string().min(1).max(300),
+      heading: z.string().max(300).optional(),
+      body: z.string().min(1),
+    })
+    .safeParse(await c.req.json());
+  if (!parsed.success) {
+    return c.json({ error: "Validation failed", details: parsed.error.flatten().fieldErrors }, 400);
+  }
+
+  const { data: existing } = await supabase.from("email_templates").select("*").eq("key", key).maybeSingle();
+  let result;
+  if (existing) {
+    // Snapshot the current version before overwriting (rollback support).
+    await supabase.from("email_template_versions").insert({
+      template_id: existing.id,
+      version: existing.version,
+      subject: existing.subject,
+      heading: existing.heading,
+      body: existing.body,
+      created_by: c.get("adminProfileId"),
+    });
+    const { data } = await supabase
+      .from("email_templates")
+      .update({
+        subject: parsed.data.subject,
+        heading: parsed.data.heading ?? null,
+        body: parsed.data.body,
+        version: (existing.version as number) + 1,
+        updated_by: c.get("adminProfileId"),
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", existing.id)
+      .select("*")
+      .single();
+    result = data;
+  } else {
+    const { data } = await supabase
+      .from("email_templates")
+      .insert({
+        key,
+        subject: parsed.data.subject,
+        heading: parsed.data.heading ?? null,
+        body: parsed.data.body,
+        updated_by: c.get("adminProfileId"),
+      })
+      .select("*")
+      .single();
+    result = data;
+  }
+
+  void auditFromContext(c, {
+    action: "content.publish",
+    targetType: "content",
+    targetId: key,
+    metadata: { kind: "email_template" },
+  });
+  return c.json({ template: result });
+});
+
+admin.get("/content/email-templates/:key/versions", async (c) => {
+  const supabase = createSupabaseAdmin();
+  const { data: tpl } = await supabase.from("email_templates").select("id").eq("key", c.req.param("key")).maybeSingle();
+  if (!tpl) return c.json({ versions: [] });
+  const { data } = await supabase
+    .from("email_template_versions")
+    .select("version, subject, heading, created_at")
+    .eq("template_id", tpl.id)
+    .order("version", { ascending: false });
+  return c.json({ versions: data ?? [] });
+});
+
+admin.post("/content/email-templates/:key/rollback", requireAdminPermission("content.edit"), async (c) => {
+  const key = c.req.param("key");
+  const supabase = createSupabaseAdmin();
+  const parsed = z.object({ version: z.number().int().positive() }).safeParse(await c.req.json());
+  if (!parsed.success) return c.json({ error: "version required" }, 400);
+
+  const { data: tpl } = await supabase.from("email_templates").select("*").eq("key", key).single();
+  if (!tpl) return c.json({ error: "Template not found" }, 404);
+  const { data: snap } = await supabase
+    .from("email_template_versions")
+    .select("*")
+    .eq("template_id", tpl.id)
+    .eq("version", parsed.data.version)
+    .single();
+  if (!snap) return c.json({ error: "Version not found" }, 404);
+
+  // Snapshot current, then restore the target snapshot as a new version.
+  await supabase.from("email_template_versions").insert({
+    template_id: tpl.id,
+    version: tpl.version,
+    subject: tpl.subject,
+    heading: tpl.heading,
+    body: tpl.body,
+    created_by: c.get("adminProfileId"),
+  });
+  const { data } = await supabase
+    .from("email_templates")
+    .update({
+      subject: snap.subject,
+      heading: snap.heading,
+      body: snap.body,
+      version: (tpl.version as number) + 1,
+      updated_by: c.get("adminProfileId"),
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", tpl.id)
+    .select("*")
+    .single();
+
+  void auditFromContext(c, {
+    action: "content.publish",
+    targetType: "content",
+    targetId: key,
+    metadata: { kind: "email_template", rolled_back_to: parsed.data.version },
+  });
+  return c.json({ template: data });
+});
+
+// ---- Website / help pages (Screen 18) ----
+admin.get("/content/pages", async (c) => {
+  const supabase = createSupabaseAdmin();
+  const { data } = await supabase
+    .from("website_pages")
+    .select("id, slug, title, status, version, published_at, updated_at")
+    .order("slug", { ascending: true });
+  return c.json({ pages: data ?? [] });
+});
+
+admin.get("/content/pages/:id", async (c) => {
+  const supabase = createSupabaseAdmin();
+  const { data } = await supabase.from("website_pages").select("*").eq("id", c.req.param("id")).maybeSingle();
+  if (!data) return c.json({ error: "Page not found" }, 404);
+  return c.json({ page: data });
+});
+
+admin.post("/content/pages", requireAdminPermission("content.edit"), async (c) => {
+  const supabase = createSupabaseAdmin();
+  const parsed = z
+    .object({
+      slug: z.string().min(1).max(100).regex(/^[a-z0-9-]+$/),
+      title: z.string().min(1).max(200),
+      body_md: z.string().default(""),
+      seo_title: z.string().max(200).optional(),
+      seo_description: z.string().max(400).optional(),
+    })
+    .safeParse(await c.req.json());
+  if (!parsed.success) {
+    return c.json({ error: "Validation failed", details: parsed.error.flatten().fieldErrors }, 400);
+  }
+  const { data, error } = await supabase
+    .from("website_pages")
+    .insert({ ...parsed.data, updated_by: c.get("adminProfileId") })
+    .select("*")
+    .single();
+  if (error) {
+    if ((error as { code?: string }).code === "23505") return c.json({ error: "Slug already exists" }, 409);
+    return c.json({ error: "Failed to create page" }, 500);
+  }
+  return c.json({ page: data }, 201);
+});
+
+admin.put("/content/pages/:id", requireAdminPermission("content.edit"), async (c) => {
+  const id = c.req.param("id");
+  const supabase = createSupabaseAdmin();
+  const parsed = z
+    .object({
+      title: z.string().min(1).max(200).optional(),
+      body_md: z.string().optional(),
+      seo_title: z.string().max(200).nullable().optional(),
+      seo_description: z.string().max(400).nullable().optional(),
+    })
+    .safeParse(await c.req.json());
+  if (!parsed.success) {
+    return c.json({ error: "Validation failed", details: parsed.error.flatten().fieldErrors }, 400);
+  }
+  const { data: existing } = await supabase.from("website_pages").select("*").eq("id", id).maybeSingle();
+  if (!existing) return c.json({ error: "Page not found" }, 404);
+
+  // Snapshot the current version.
+  await supabase.from("website_page_versions").insert({
+    page_id: id,
+    version: existing.version,
+    title: existing.title,
+    body_md: existing.body_md,
+    created_by: c.get("adminProfileId"),
+  });
+  const updates: Record<string, unknown> = {
+    version: (existing.version as number) + 1,
+    updated_by: c.get("adminProfileId"),
+    updated_at: new Date().toISOString(),
+  };
+  for (const [k, v] of Object.entries(parsed.data)) if (v !== undefined) updates[k] = v;
+
+  const { data } = await supabase.from("website_pages").update(updates).eq("id", id).select("*").single();
+  void auditFromContext(c, { action: "content.publish", targetType: "content", targetId: id, metadata: { kind: "page_edit" } });
+  return c.json({ page: data });
+});
+
+admin.post("/content/pages/:id/publish", requireAdminPermission("content.edit"), async (c) => {
+  const id = c.req.param("id");
+  const supabase = createSupabaseAdmin();
+  const { data, error } = await supabase
+    .from("website_pages")
+    .update({ status: "published", published_at: new Date().toISOString() })
+    .eq("id", id)
+    .select("id, slug, status")
+    .single();
+  if (error || !data) return c.json({ error: "Page not found" }, 404);
+  void auditFromContext(c, { action: "content.publish", targetType: "content", targetId: id, metadata: { kind: "page_publish", slug: data.slug } });
+  return c.json({ page: data });
+});
+
+// ---- Blog (Screen 19) ----
+admin.get("/content/blog", async (c) => {
+  const supabase = createSupabaseAdmin();
+  const { data } = await supabase
+    .from("blog_posts")
+    .select("id, slug, title, status, tags, scheduled_at, published_at, updated_at")
+    .order("created_at", { ascending: false })
+    .limit(200);
+  return c.json({ posts: data ?? [] });
+});
+
+admin.post("/content/blog", requireAdminPermission("content.edit"), async (c) => {
+  const supabase = createSupabaseAdmin();
+  const parsed = z
+    .object({
+      slug: z.string().min(1).max(120).regex(/^[a-z0-9-]+$/),
+      title: z.string().min(1).max(200),
+      body_md: z.string().default(""),
+      cover_image_url: z.string().url().optional(),
+      tags: z.array(z.string().max(40)).max(10).optional(),
+      scheduled_at: z.string().datetime().optional(),
+    })
+    .safeParse(await c.req.json());
+  if (!parsed.success) {
+    return c.json({ error: "Validation failed", details: parsed.error.flatten().fieldErrors }, 400);
+  }
+  const { data, error } = await supabase
+    .from("blog_posts")
+    .insert({
+      slug: parsed.data.slug,
+      title: parsed.data.title,
+      body_md: parsed.data.body_md,
+      cover_image_url: parsed.data.cover_image_url ?? null,
+      tags: parsed.data.tags ?? [],
+      status: parsed.data.scheduled_at ? "scheduled" : "draft",
+      scheduled_at: parsed.data.scheduled_at ?? null,
+      created_by: c.get("adminProfileId"),
+    })
+    .select("*")
+    .single();
+  if (error) {
+    if ((error as { code?: string }).code === "23505") return c.json({ error: "Slug already exists" }, 409);
+    return c.json({ error: "Failed to create post" }, 500);
+  }
+  return c.json({ post: data }, 201);
+});
+
+admin.put("/content/blog/:id", requireAdminPermission("content.edit"), async (c) => {
+  const id = c.req.param("id");
+  const supabase = createSupabaseAdmin();
+  const parsed = z
+    .object({
+      title: z.string().min(1).max(200).optional(),
+      body_md: z.string().optional(),
+      cover_image_url: z.string().url().nullable().optional(),
+      tags: z.array(z.string().max(40)).max(10).optional(),
+    })
+    .safeParse(await c.req.json());
+  if (!parsed.success) {
+    return c.json({ error: "Validation failed", details: parsed.error.flatten().fieldErrors }, 400);
+  }
+  const updates: Record<string, unknown> = { updated_at: new Date().toISOString() };
+  for (const [k, v] of Object.entries(parsed.data)) if (v !== undefined) updates[k] = v;
+  const { data, error } = await supabase.from("blog_posts").update(updates).eq("id", id).select("*").single();
+  if (error || !data) return c.json({ error: "Post not found" }, 404);
+  return c.json({ post: data });
+});
+
+admin.post("/content/blog/:id/publish", requireAdminPermission("content.edit"), async (c) => {
+  const id = c.req.param("id");
+  const supabase = createSupabaseAdmin();
+  const { data, error } = await supabase
+    .from("blog_posts")
+    .update({ status: "published", published_at: new Date().toISOString() })
+    .eq("id", id)
+    .select("id, slug, status")
+    .single();
+  if (error || !data) return c.json({ error: "Post not found" }, 404);
+  void auditFromContext(c, { action: "content.publish", targetType: "content", targetId: id, metadata: { kind: "blog", slug: data.slug } });
+  return c.json({ post: data });
+});
+
+// ============================================================
+// Taxonomy (Phase 6) — Screen 20 (unified vocabularies)
+// ============================================================
+
+/**
+ * GET /api/admin/config/taxonomy
+ * All five vocabularies in one payload with listing counts. Categories +
+ * editorial tags are DB-managed (CRUD elsewhere); sizes/occasions/curated
+ * are code-locked enums (surfaced read-only with counts); designers are
+ * their own large table (count + managed via /api/designers typeahead).
+ */
+admin.get("/config/taxonomy", async (c) => {
+  const supabase = createSupabaseAdmin();
+
+  const [categories, editorialTags, sizeRows, curatedCounts, designerCount] =
+    await Promise.all([
+      supabase.from("categories").select("*").order("display_order", { ascending: true }),
+      supabase.from("editorial_tags").select("*").order("name", { ascending: true }),
+      supabase.from("listings").select("estimated_size").eq("status", "active"),
+      // curation_tags is an array column — count via containment.
+      (async () => {
+        const out: Record<string, number> = {};
+        await Promise.all(
+          (CURATION_TAGS as readonly string[]).map(async (t) => {
+            const { count } = await supabase
+              .from("listings")
+              .select("id", { count: "exact", head: true })
+              .contains("curation_tags", [t])
+              .eq("status", "active");
+            out[t] = count ?? 0;
+          })
+        );
+        return out;
+      })(),
+      supabase.from("designers").select("id", { count: "exact", head: true }),
+    ]);
+
+  // Size counts from the active listings' estimated_size values.
+  const sizeCounts: Record<string, number> = {};
+  for (const r of (sizeRows.data ?? []) as Array<{ estimated_size: string | null }>) {
+    const s = r.estimated_size;
+    if (s) sizeCounts[s] = (sizeCounts[s] ?? 0) + 1;
+  }
+
+  return c.json({
+    vocabularies: {
+      categories: { managed: true, values: categories.data ?? [] },
+      editorial_tags: { managed: true, values: editorialTags.data ?? [] },
+      sizes: { managed: false, locked: true, counts: sizeCounts },
+      occasions: {
+        managed: false,
+        locked: true,
+        values: OCCASION_TAGS,
+      },
+      curated_edits: { managed: false, locked: true, counts: curatedCounts },
+      designers: { managed: true, count: designerCount.count ?? 0, via: "/api/designers" },
+    },
+  });
+});
+
+// ============================================================
+// Settings policies (Phase 6) — Screen 21
+// ============================================================
+
+/**
+ * GET /api/admin/settings/policies
+ * Commercial levers + core policies (cooling-off, min price, regions, flags).
+ */
+admin.get("/settings/policies", async (c) => {
+  const supabase = createSupabaseAdmin();
+  const { data, error } = await supabase
+    .from("admin_settings")
+    .select(
+      "commission_rate, cooling_off_days, min_listing_price_cents, active_regions, " +
+        "require_receipt_for_designer, no_publish_without_review, hide_fees_from_sellers"
+    )
+    .limit(1)
+    .single();
+  if (error) {
+    console.error("Error loading policies:", error);
+    return c.json({ error: "Failed to load policies" }, 500);
+  }
+  return c.json({ policies: data });
+});
+
+/**
+ * PATCH /api/admin/settings/policies
+ */
+admin.patch("/settings/policies", requireAdminPermission("settings.edit"), async (c) => {
+  const supabase = createSupabaseAdmin();
+  const parsed = z
+    .object({
+      cooling_off_days: z.number().int().min(0).max(60).optional(),
+      min_listing_price_cents: z.number().int().min(0).optional(),
+      active_regions: z.array(z.enum(["AU", "US", "NZ", "CA", "GB"])).min(1).optional(),
+      require_receipt_for_designer: z.boolean().optional(),
+      no_publish_without_review: z.boolean().optional(),
+      hide_fees_from_sellers: z.boolean().optional(),
+    })
+    .safeParse(await c.req.json());
+  if (!parsed.success) {
+    return c.json({ error: "Validation failed", details: parsed.error.flatten().fieldErrors }, 400);
+  }
+  const updates: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(parsed.data)) if (v !== undefined) updates[k] = v;
+  if (Object.keys(updates).length === 0) return c.json({ error: "No fields to update" }, 400);
+
+  const { data: existing } = await supabase.from("admin_settings").select("id").limit(1).single();
+  if (!existing) return c.json({ error: "Settings not found" }, 404);
+
+  const { data, error } = await supabase
+    .from("admin_settings")
+    .update(updates)
+    .eq("id", existing.id)
+    .select(
+      "cooling_off_days, min_listing_price_cents, active_regions, " +
+        "require_receipt_for_designer, no_publish_without_review, hide_fees_from_sellers"
+    )
+    .single();
+  if (error) {
+    console.error("Error updating policies:", error);
+    return c.json({ error: "Failed to update policies" }, 500);
+  }
+
+  void auditFromContext(c, {
+    action: "settings.edit",
+    targetType: "settings",
+    targetId: "policies",
+    metadata: updates,
+  });
+  return c.json({ policies: data });
+});
+
+// ============================================================
+// Data export (Phase 6) — Screen 24 (CSV, PII-gated, audited)
+// ============================================================
+
+function toCsv(rows: Record<string, unknown>[], columns: string[]): string {
+  const esc = (v: unknown) => {
+    if (v === null || v === undefined) return "";
+    const s = typeof v === "object" ? JSON.stringify(v) : String(v);
+    return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+  const header = columns.join(",");
+  const body = rows.map((r) => columns.map((col) => esc(r[col])).join(",")).join("\n");
+  return `${header}\n${body}`;
+}
+
+// Non-PII vs PII columns per dataset.
+const EXPORT_SPECS: Record<
+  string,
+  { table: string; base: string[]; pii: string[] }
+> = {
+  users: {
+    table: "profiles",
+    base: ["id", "display_name", "location", "created_at", "seller_quality"],
+    pii: ["email", "phone"],
+  },
+  listings: {
+    table: "listings",
+    base: ["id", "title", "category", "status", "price_amount", "price_currency", "seller_id", "created_at"],
+    pii: [],
+  },
+  transactions: {
+    table: "orders",
+    base: ["id", "order_number", "status", "amount", "currency", "commission_amount", "seller_payout", "created_at"],
+    pii: ["buyer_email"],
+  },
+};
+
+/**
+ * POST /api/admin/export/:dataset
+ * CSV export of users | listings | transactions. PII columns are OFF by
+ * default and require the `export.pii` permission + ?pii=true. Every export
+ * is audited.
+ */
+admin.post("/export/:dataset", requireAdminPermission("export.run"), async (c) => {
+  const dataset = c.req.param("dataset");
+  const spec = EXPORT_SPECS[dataset];
+  if (!spec) return c.json({ error: "Unknown dataset" }, 400);
+
+  const wantPii = c.req.query("pii") === "true";
+  const role = c.get("adminRole") as AdminRole | undefined;
+  const override = c.get("adminPermissionsOverride") as { grant?: string[]; deny?: string[] } | null | undefined;
+  const piiAllowed = wantPii && hasPermission(role, "export.pii", override);
+  const columns = piiAllowed ? [...spec.base, ...spec.pii] : spec.base;
+
+  const supabase = createSupabaseAdmin();
+  const { data, error } = await supabase
+    .from(spec.table)
+    .select(columns.join(","))
+    .limit(50000);
+  if (error) {
+    console.error("Export query failed:", error);
+    return c.json({ error: "Export failed" }, 500);
+  }
+
+  const csv = toCsv((data ?? []) as unknown as Record<string, unknown>[], columns);
+
+  void auditFromContext(c, {
+    action: "export.run",
+    targetType: "export",
+    targetId: dataset,
+    metadata: { rows: data?.length ?? 0, pii: piiAllowed, requested_pii: wantPii },
+  });
+
+  return new Response(csv, {
+    headers: {
+      "Content-Type": "text/csv; charset=utf-8",
+      "Content-Disposition": `attachment; filename="${dataset}-export.csv"`,
+    },
+  });
+});
+
+// ============================================================
+// Team & access (Phase 0.2) — Screen 22
+// ============================================================
+
+/**
+ * GET /api/admin/team
+ * List admin members + the role→permission matrix (for the FE to render).
+ */
+admin.get("/team", async (c) => {
+  const supabase = createSupabaseAdmin();
+  const { data, error } = await supabase
+    .from("admin_users")
+    .select("id, email, role, status, two_factor_enabled, invited_by, created_at, last_login_at")
+    .order("created_at", { ascending: true });
+  if (error) {
+    console.error("Error loading team:", error);
+    return c.json({ error: "Failed to load team" }, 500);
+  }
+  return c.json({
+    members: data ?? [],
+    permissions: ADMIN_PERMISSIONS,
+    role_matrix: ROLE_PERMISSIONS,
+  });
+});
+
+/**
+ * POST /api/admin/team/invite  (owner only)
+ * Pre-provision a member by email + role. They gain access on first login
+ * (their supabase_user_id is stamped then). 2FA is enforced separately.
+ */
+admin.post("/team/invite", requireAdminPermission("team.manage"), async (c) => {
+  const supabase = createSupabaseAdmin();
+  const parsed = z
+    .object({
+      email: z.string().email(),
+      role: z.enum(["admin", "moderator", "support"]),
+    })
+    .safeParse(await c.req.json());
+  if (!parsed.success) {
+    return c.json({ error: "Validation failed", details: parsed.error.flatten().fieldErrors }, 400);
+  }
+
+  // Invited rows carry a placeholder supabase_user_id until first login
+  // stamps the real one (keyed on email in the middleware bootstrap path).
+  const { data, error } = await supabase
+    .from("admin_users")
+    .insert({
+      supabase_user_id: crypto.randomUUID(),
+      email: parsed.data.email.toLowerCase(),
+      role: parsed.data.role,
+      status: "invited",
+      invited_by: c.get("adminProfileId"),
+    })
+    .select("id, email, role, status")
+    .single();
+
+  if (error) {
+    if ((error as { code?: string }).code === "23505") {
+      return c.json({ error: "That email is already a team member" }, 409);
+    }
+    console.error("Error inviting team member:", error);
+    return c.json({ error: "Failed to invite member" }, 500);
+  }
+
+  void auditFromContext(c, {
+    action: "team.invite",
+    targetType: "team",
+    targetId: (data as Record<string, unknown>).id as string,
+    metadata: { email: parsed.data.email, role: parsed.data.role },
+  });
+  return c.json({ member: data }, 201);
+});
+
+/**
+ * PATCH /api/admin/team/:id/role  (owner only)
+ */
+admin.patch("/team/:id/role", requireAdminPermission("team.manage"), async (c) => {
+  const memberId = c.req.param("id");
+  const supabase = createSupabaseAdmin();
+  const parsed = z
+    .object({ role: z.enum(["owner", "admin", "moderator", "support"]) })
+    .safeParse(await c.req.json());
+  if (!parsed.success) {
+    return c.json({ error: "Validation failed", details: parsed.error.flatten().fieldErrors }, 400);
+  }
+
+  const { data, error } = await supabase
+    .from("admin_users")
+    .update({ role: parsed.data.role })
+    .eq("id", memberId)
+    .select("id, email, role")
+    .single();
+  if (error || !data) {
+    return c.json({ error: "Member not found" }, 404);
+  }
+
+  void auditFromContext(c, {
+    action: "team.role_change",
+    targetType: "team",
+    targetId: memberId,
+    metadata: { role: parsed.data.role },
+  });
+  return c.json({ member: data });
+});
+
+/**
+ * POST /api/admin/team/:id/disable  (owner only)
+ */
+admin.post("/team/:id/disable", requireAdminPermission("team.manage"), async (c) => {
+  const memberId = c.req.param("id");
+  const supabase = createSupabaseAdmin();
+  const { data, error } = await supabase
+    .from("admin_users")
+    .update({ status: "disabled" })
+    .eq("id", memberId)
+    .select("id, email, status")
+    .single();
+  if (error || !data) return c.json({ error: "Member not found" }, 404);
+
+  void auditFromContext(c, {
+    action: "team.role_change",
+    targetType: "team",
+    targetId: memberId,
+    metadata: { status: "disabled" },
+  });
+  return c.json({ member: data });
 });
 
 export default admin;

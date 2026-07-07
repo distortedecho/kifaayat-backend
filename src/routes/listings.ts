@@ -5,6 +5,7 @@ import { requireProfile } from "../middleware/requireProfile.js";
 import { getProfileByClerkId } from "../lib/profiles.js";
 import { createSupabaseAdmin } from "../lib/supabase.js";
 import { computeRiskScore } from "../lib/risk-scoring.js";
+import { computeQualityScore } from "../lib/quality-score.js";
 import { summarizeZodError } from "../lib/validation.js";
 import { ACCEPTED_OFFER_PAYMENT_HOURS } from "../types/transactions.js";
 import {
@@ -1217,10 +1218,13 @@ listings.patch("/:id/status", clerkMiddleware, requireProfile, async (c) => {
     return c.json({ error: "Failed to update listing status" }, 500);
   }
 
-  // Trigger async risk scoring when listing enters pending_review
+  // Trigger async risk + quality scoring when listing enters pending_review
   if (newStatus === "pending_review") {
     computeRiskScore(listingId).catch((err) =>
       console.error("Risk scoring failed:", err)
+    );
+    computeQualityScore(listingId).catch((err) =>
+      console.error("Quality scoring failed:", err)
     );
   }
 
