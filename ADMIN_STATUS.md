@@ -95,6 +95,45 @@ psql "$DATABASE_URL" -f src/db/schema-34.sql   # listing_updated notification ty
 - `ADMIN_ENFORCE_2FA` — `true` to require an AAL2 (MFA) Supabase session for all
   admin routes. Default off.
 - OneSignal (`ONESIGNAL_APP_ID`, `ONESIGNAL_REST_API_KEY`) — required for push send.
+- `ADMIN_APP_URL` — the admin FE base URL (e.g. `http://localhost:5173` dev,
+  `https://<admin-domain>` prod). Used to build the invite email's redirect. See runbook.
+
+---
+
+## Runbook — inviting team members (Screen 22)
+
+Admins log in via **Supabase Auth** (email + password). Inviting a member creates
+their Supabase Auth account + an `admin_users` row, and emails them a link to set
+a password. Their role's permissions apply on first login (row flips
+`invited → active`). One-time setup is required or the invite link 404s.
+
+### Flow
+1. Owner invites `x@email.com` + role → `POST /api/admin/team/invite`.
+2. Backend creates the Supabase Auth user, emails a **set-password link**, and
+   inserts the `admin_users` row (`status: invited`). Re-inviting a pending member
+   is idempotent (re-sends, no error).
+3. Person clicks the link → lands on the FE **`/accept-invite`** page → sets a
+   password → logs in. First request activates their row.
+
+### One-time setup (required)
+1. **Supabase → Auth → URL Configuration**
+   - **Site URL** = the admin FE URL (dev `http://localhost:5173`, prod the deployed URL).
+   - **Redirect URLs** allowlist → add `<ADMIN_APP_URL>/accept-invite` for dev **and** prod.
+     A `redirectTo` not on the allowlist is ignored → link falls back to the Site URL
+     (that's the `localhost:3000` "site can't be reached" symptom).
+2. **Backend env** → `ADMIN_APP_URL=<admin FE base URL>` on the admin backend service.
+3. **Supabase → Auth → SMTP** (recommended) → point at Resend so invite emails send
+   from `@kifaayat.shop` reliably (built-in email is rate-limited).
+4. **Admin FE `/accept-invite` page** (FE task):
+   - Supabase JS client with `detectSessionInUrl: true` auto-consumes the
+     `#access_token` fragment and establishes a session.
+   - Show a "set your password" form → `await supabase.auth.updateUser({ password })`.
+   - Redirect to the dashboard on success.
+
+### Unblock a member invited before this setup (no FE work)
+Supabase → **Authentication → Users** → their email → **Send password recovery**
+(or set a password) → they log in at the admin login with email + password. The
+middleware's email-claim links them to their invited row and activates it.
 
 ## Guarantees held throughout
 - **Zero changes to public/app endpoints.** App + website fully safe.

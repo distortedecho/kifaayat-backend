@@ -12,6 +12,8 @@ declare module "hono" {
     adminEmail: string;
     adminRole: string;
     adminPermissionsOverride: { grant?: string[]; deny?: string[] } | null;
+    // The admin_users.id row (distinct from adminProfileId which is profiles.id).
+    adminUserId: string | null;
   }
 }
 
@@ -54,6 +56,7 @@ export const adminAuthMiddleware: MiddlewareHandler = async (c, next) => {
     // Resolve the admin_users row (role / override / status). Bootstrap an
     // owner row for an allowlisted email that isn't in the table yet.
     let adminRow: AdminRow | null = null;
+    const nowIso = new Date().toISOString();
 
     const { data: existingAdmin } = await supabase
       .from("admin_users")
@@ -63,19 +66,43 @@ export const adminAuthMiddleware: MiddlewareHandler = async (c, next) => {
 
     if (existingAdmin) {
       adminRow = existingAdmin as unknown as AdminRow;
-    } else if (emailAllowed && user.email) {
-      const { data: created } = await supabase
+      // First login after an invite → activate the row.
+      if (adminRow.status === "invited") {
+        await supabase
+          .from("admin_users")
+          .update({ status: "active", last_login_at: nowIso })
+          .eq("id", adminRow.id);
+        adminRow.status = "active";
+      }
+    } else if (user.email) {
+      // Claim an invited row created before this Supabase id was known
+      // (safety net if the auth id ever differs from what was stored).
+      const { data: byEmail } = await supabase
         .from("admin_users")
-        .insert({
-          supabase_user_id: user.id,
-          email: user.email.toLowerCase(),
-          role: "owner",
-          status: "active",
-          last_login_at: new Date().toISOString(),
-        })
         .select("id, role, permissions_override, status")
-        .single();
-      adminRow = (created as unknown as AdminRow) ?? null;
+        .ilike("email", user.email)
+        .maybeSingle();
+      if (byEmail) {
+        await supabase
+          .from("admin_users")
+          .update({ supabase_user_id: user.id, status: "active", last_login_at: nowIso })
+          .eq("id", (byEmail as { id: string }).id);
+        adminRow = { ...(byEmail as unknown as AdminRow), status: "active" };
+      } else if (emailAllowed) {
+        // Bootstrap an owner row for an ADMIN_EMAILS member.
+        const { data: created } = await supabase
+          .from("admin_users")
+          .insert({
+            supabase_user_id: user.id,
+            email: user.email.toLowerCase(),
+            role: "owner",
+            status: "active",
+            last_login_at: nowIso,
+          })
+          .select("id, role, permissions_override, status")
+          .single();
+        adminRow = (created as unknown as AdminRow) ?? null;
+      }
     }
 
     // Access gate: must be allowlisted OR an active admin_users row.
@@ -101,6 +128,7 @@ export const adminAuthMiddleware: MiddlewareHandler = async (c, next) => {
     if (user.email) c.set("adminEmail", user.email);
     c.set("adminRole", adminRow?.role || (emailAllowed ? "owner" : "support"));
     c.set("adminPermissionsOverride", adminRow?.permissions_override ?? null);
+    c.set("adminUserId", adminRow?.id ?? null);
     await next();
   } catch {
     return c.json({ error: "Invalid or expired token" }, 401);
@@ -129,6 +157,7 @@ export function requireAdminPermission(
 }
 
 interface AdminRow {
+  id: string;
   role: string;
   permissions_override: { grant?: string[]; deny?: string[] } | null;
   status: string;

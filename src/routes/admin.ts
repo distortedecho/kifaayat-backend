@@ -154,6 +154,7 @@ admin.use("/reviews/*", adminAuthMiddleware);
 admin.use("/export/*", adminAuthMiddleware);
 admin.use("/content", adminAuthMiddleware);
 admin.use("/content/*", adminAuthMiddleware);
+admin.use("/me", adminAuthMiddleware);
 
 // ============================================================
 // Helpers
@@ -1177,12 +1178,22 @@ admin.get("/users", async (c) => {
     }
   }
 
-  const users = (profiles || []).map((profile) => ({
-    ...profile,
-    listing_count: listingCountMap.get(profile.id as string) || 0,
-    order_count: orderCountMap.get(profile.id as string) || 0,
-    total_sales_amount: orderTotalMap.get(profile.id as string) || 0,
-  }));
+  const users = (profiles || []).map((profile) => {
+    const p = profile as Record<string, unknown>;
+    return {
+      ...profile,
+      listing_count: listingCountMap.get(profile.id as string) || 0,
+      order_count: orderCountMap.get(profile.id as string) || 0,
+      total_sales_amount: orderTotalMap.get(profile.id as string) || 0,
+      // Verification pill (Screen 11) — computed so the list matches the
+      // detail. Buyers with no Connect account read "not_connected".
+      stripe_status: p.stripe_onboarding_complete
+        ? "complete"
+        : p.stripe_account_id
+          ? "incomplete"
+          : "not_connected",
+    };
+  });
 
   return c.json({ items: users, users, total: count || 0, page, limit });
 });
@@ -3823,14 +3834,14 @@ admin.get("/transactions", async (c) => {
   // --- Offers ledger ---
   if (tab === "offers") {
     const sellerEmbed = region
-      ? "seller:profiles!offers_seller_id_fkey!inner(display_name, location)"
-      : "seller:profiles!offers_seller_id_fkey(display_name, location)";
+      ? "seller:profiles!offers_seller_id_fkey!inner(id, display_name, location)"
+      : "seller:profiles!offers_seller_id_fkey(id, display_name, location)";
     let q = supabase
       .from("offers")
       .select(
         "id, listing_id, amount, currency, status, round, created_at, offered_by, " +
-          "listings!offers_listing_id_fkey(title), " +
-          "buyer:profiles!offers_buyer_id_fkey(display_name), " +
+          "listings!offers_listing_id_fkey(id, title), " +
+          "buyer:profiles!offers_buyer_id_fkey(id, display_name), " +
           sellerEmbed,
         { count: "exact" }
       )
@@ -3847,14 +3858,19 @@ admin.get("/transactions", async (c) => {
     }
     const items = (data ?? []).map((o) => {
       const r = o as unknown as Record<string, unknown>;
+      const listing = r.listings as Record<string, unknown> | null;
+      const buyer = r.buyer as Record<string, unknown> | null;
+      const seller = r.seller as Record<string, unknown> | null;
       return {
         kind: "offer" as const,
         id: r.id,
         ref: `OFFER-${String(r.id).slice(0, 8)}`,
-        listing: (r.listings as Record<string, unknown> | null)?.title ?? null,
-        buyer: (r.buyer as Record<string, unknown> | null)?.display_name ?? null,
-        seller: (r.seller as Record<string, unknown> | null)?.display_name ?? null,
-        seller_location: (r.seller as Record<string, unknown> | null)?.location ?? null,
+        listing: listing ? { id: listing.id, title: listing.title } : null,
+        buyer: buyer ? { id: buyer.id, display_name: buyer.display_name } : null,
+        seller: seller
+          ? { id: seller.id, display_name: seller.display_name, location: seller.location }
+          : null,
+        seller_location: seller?.location ?? null,
         amount: r.amount,
         currency: r.currency,
         commission: null,
@@ -3868,14 +3884,14 @@ admin.get("/transactions", async (c) => {
 
   // --- Sales (orders) ledger ---
   const sellerEmbed = region
-    ? "seller:profiles!orders_seller_id_fkey!inner(display_name, location)"
-    : "seller:profiles!orders_seller_id_fkey(display_name, location)";
+    ? "seller:profiles!orders_seller_id_fkey!inner(id, display_name, location)"
+    : "seller:profiles!orders_seller_id_fkey(id, display_name, location)";
   let q = supabase
     .from("orders")
     .select(
       "id, order_number, amount, currency, commission_amount, seller_payout, status, created_at, " +
-        "listings!orders_listing_id_fkey(title), " +
-        "buyer:profiles!orders_buyer_id_fkey(display_name), " +
+        "listings!orders_listing_id_fkey(id, title), " +
+        "buyer:profiles!orders_buyer_id_fkey(id, display_name), " +
         sellerEmbed,
       { count: "exact" }
     )
@@ -3898,14 +3914,19 @@ admin.get("/transactions", async (c) => {
   }
   const items = (data ?? []).map((o) => {
     const r = o as unknown as Record<string, unknown>;
+    const listing = r.listings as Record<string, unknown> | null;
+    const buyer = r.buyer as Record<string, unknown> | null;
+    const seller = r.seller as Record<string, unknown> | null;
     return {
       kind: "order" as const,
       id: r.id,
       ref: r.order_number,
-      listing: (r.listings as Record<string, unknown> | null)?.title ?? null,
-      buyer: (r.buyer as Record<string, unknown> | null)?.display_name ?? null,
-      seller: (r.seller as Record<string, unknown> | null)?.display_name ?? null,
-      seller_location: (r.seller as Record<string, unknown> | null)?.location ?? null,
+      listing: listing ? { id: listing.id, title: listing.title } : null,
+      buyer: buyer ? { id: buyer.id, display_name: buyer.display_name } : null,
+      seller: seller
+        ? { id: seller.id, display_name: seller.display_name, location: seller.location }
+        : null,
+      seller_location: seller?.location ?? null,
       amount: r.amount,
       currency: r.currency,
       commission: r.commission_amount,
@@ -4600,15 +4621,10 @@ admin.get("/referrals", async (c) => {
   const supabase = createSupabaseAdmin();
   const thirtyDaysAgo = new Date(Date.now() - 30 * 864e5).toISOString();
 
-  const [activeCodes, signups30d, converted, codes] = await Promise.all([
+  const [activeCodes, signups30d, converted] = await Promise.all([
     supabase.from("referral_codes").select("id", { count: "exact", head: true }).eq("disabled", false),
     supabase.from("referrals").select("id", { count: "exact", head: true }).gte("created_at", thirtyDaysAgo),
     supabase.from("referrals").select("id", { count: "exact", head: true }).eq("status", "qualified"),
-    supabase
-      .from("referral_codes")
-      .select("id, code, code_type, campaign_name, user_id, disabled, created_at")
-      .order("created_at", { ascending: false })
-      .limit(100),
   ]);
 
   const { count: totalRefs } = await supabase
@@ -4617,6 +4633,51 @@ admin.get("/referrals", async (c) => {
   const conversion =
     (totalRefs ?? 0) > 0 ? Math.round(((converted.count ?? 0) / (totalRefs ?? 1)) * 100) : 0;
 
+  // Per-code attribution: count signups + qualified (converted) per code id.
+  const { data: allRefs } = await supabase
+    .from("referrals")
+    .select("referral_code_id, status");
+  const statsByCode = new Map<string, { signups: number; qualified: number }>();
+  for (const r of allRefs ?? []) {
+    const cid = (r as Record<string, unknown>).referral_code_id as string | null;
+    if (!cid) continue;
+    const s = statsByCode.get(cid) ?? { signups: 0, qualified: 0 };
+    s.signups += 1;
+    if ((r as Record<string, unknown>).status === "qualified") s.qualified += 1;
+    statsByCode.set(cid, s);
+  }
+
+  // Codes list = campaign codes (admin-minted) + any code that actually drove
+  // a signup. User codes with zero referrals are omitted (there are thousands
+  // — auto-issued on signup). Sorted by signups desc.
+  const activeCodeIds = [...statsByCode.keys()];
+  let codeQuery = supabase
+    .from("referral_codes")
+    .select("id, code, code_type, campaign_name, user_id, disabled, created_at");
+  codeQuery =
+    activeCodeIds.length > 0
+      ? codeQuery.or(`code_type.eq.campaign,id.in.(${activeCodeIds.join(",")})`)
+      : codeQuery.eq("code_type", "campaign");
+  const { data: codeRows } = await codeQuery.limit(500);
+  const codesWithStats = (codeRows ?? [])
+    .map((code) => {
+      const s = statsByCode.get((code as Record<string, unknown>).id as string);
+      return { ...code, signups: s?.signups ?? 0, qualified: s?.qualified ?? 0 };
+    })
+    .sort((a, b) => b.signups - a.signups);
+
+  // Recent referral events (who referred whom, via which code) so the admin
+  // can drill in. referral_code_id maps each event to a row in `codes`.
+  const { data: recent } = await supabase
+    .from("referrals")
+    .select(
+      "id, status, created_at, qualified_at, referral_code_id, " +
+        "referrer:profiles!referrals_referrer_id_fkey(id, display_name), " +
+        "referred:profiles!referrals_referred_id_fkey(id, display_name)"
+    )
+    .order("created_at", { ascending: false })
+    .limit(100);
+
   return c.json({
     metrics: {
       active_codes: activeCodes.count ?? 0,
@@ -4624,7 +4685,8 @@ admin.get("/referrals", async (c) => {
       conversion_pct: conversion,
       qualified_total: converted.count ?? 0,
     },
-    codes: codes.data ?? [],
+    codes: codesWithStats,
+    recent: recent ?? [],
   });
 });
 
@@ -5401,6 +5463,28 @@ admin.post("/export/:dataset", requireAdminPermission("export.run"), async (c) =
   });
 });
 
+/**
+ * GET /api/admin/me
+ * The current admin's identity, role, and RESOLVED permission list — so the
+ * FE can gate buttons per role without re-deriving the matrix.
+ */
+admin.get("/me", async (c) => {
+  const role = c.get("adminRole") as AdminRole | undefined;
+  const override = c.get("adminPermissionsOverride") as
+    | { grant?: string[]; deny?: string[] }
+    | null
+    | undefined;
+  const permissions = (ADMIN_PERMISSIONS as readonly string[]).filter((p) =>
+    hasPermission(role, p as (typeof ADMIN_PERMISSIONS)[number], override)
+  );
+  return c.json({
+    id: c.get("adminProfileId"),
+    email: c.get("adminEmail") ?? null,
+    role: role ?? null,
+    permissions,
+  });
+});
+
 // ============================================================
 // Team & access (Phase 0.2) — Screen 22
 // ============================================================
@@ -5443,26 +5527,77 @@ admin.post("/team/invite", requireAdminPermission("team.manage"), async (c) => {
     return c.json({ error: "Validation failed", details: parsed.error.flatten().fieldErrors }, 400);
   }
 
-  // Invited rows carry a placeholder supabase_user_id until first login
-  // stamps the real one (keyed on email in the middleware bootstrap path).
-  const { data, error } = await supabase
-    .from("admin_users")
-    .insert({
-      supabase_user_id: crypto.randomUUID(),
-      email: parsed.data.email.toLowerCase(),
-      role: parsed.data.role,
-      status: "invited",
-      invited_by: c.get("adminProfileId"),
-    })
-    .select("id, email, role, status")
-    .single();
+  const email = parsed.data.email.toLowerCase();
 
-  if (error) {
-    if ((error as { code?: string }).code === "23505") {
-      return c.json({ error: "That email is already a team member" }, 409);
+  // Create (or find) the Supabase Auth user so they can actually log in.
+  // inviteUserByEmail emails them a link to set a password. redirectTo makes
+  // the link land on the admin FE's accept-invite page (else it falls back
+  // to Supabase's Site URL, which defaults to localhost:3000).
+  const adminAppUrl = process.env.ADMIN_APP_URL; // e.g. https://admin.kifaayat.shop
+  const inviteOpts = adminAppUrl
+    ? { redirectTo: `${adminAppUrl.replace(/\/$/, "")}/accept-invite` }
+    : undefined;
+  let supabaseUserId: string;
+  try {
+    const { data: invited, error: inviteErr } =
+      await supabase.auth.admin.inviteUserByEmail(email, inviteOpts);
+    if (inviteErr || !invited?.user) throw inviteErr ?? new Error("no user");
+    supabaseUserId = invited.user.id;
+  } catch {
+    // Already a Supabase user (e.g. they signed in before) — find them.
+    const { data: list } = await supabase.auth.admin.listUsers();
+    const existing = list?.users?.find(
+      (u) => u.email?.toLowerCase() === email
+    );
+    if (!existing) {
+      return c.json({ error: "Could not create or find the auth user" }, 500);
     }
-    console.error("Error inviting team member:", error);
-    return c.json({ error: "Failed to invite member" }, 500);
+    supabaseUserId = existing.id;
+  }
+
+  // Upsert by email so re-inviting a not-yet-activated member just re-sends
+  // (and refreshes their Supabase id + role) instead of erroring.
+  const { data: existingRow } = await supabase
+    .from("admin_users")
+    .select("id, status")
+    .ilike("email", email)
+    .maybeSingle();
+
+  if (existingRow && existingRow.status === "active") {
+    return c.json({ error: "That email is already an active team member" }, 409);
+  }
+
+  let data;
+  if (existingRow) {
+    const { data: upd, error: updErr } = await supabase
+      .from("admin_users")
+      .update({ supabase_user_id: supabaseUserId, role: parsed.data.role, status: "invited" })
+      .eq("id", (existingRow as { id: string }).id)
+      .select("id, email, role, status")
+      .single();
+    if (updErr) {
+      console.error("Error re-inviting team member:", updErr);
+      return c.json({ error: "Failed to re-invite member" }, 500);
+    }
+    data = upd;
+  } else {
+    const { data: ins, error } = await supabase
+      .from("admin_users")
+      .insert({
+        supabase_user_id: supabaseUserId,
+        email,
+        role: parsed.data.role,
+        status: "invited",
+        // FK → admin_users(id); use the inviter's admin_users row.
+        invited_by: c.get("adminUserId") ?? null,
+      })
+      .select("id, email, role, status")
+      .single();
+    if (error) {
+      console.error("Error inviting team member:", error);
+      return c.json({ error: "Failed to invite member" }, 500);
+    }
+    data = ins;
   }
 
   void auditFromContext(c, {

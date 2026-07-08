@@ -312,4 +312,69 @@ website.get("/top-sellers", optionalClerkMiddleware, async (c) => {
   }
 });
 
+// ============================================================
+// CMS — published pages & blog (authored in the admin Content suite)
+// Only status = 'published' rows are served; drafts/scheduled are hidden.
+// ============================================================
+
+/**
+ * GET /api/website/pages/:slug
+ * A published marketing/help page (About, FAQ, returns, auth policy, …).
+ */
+website.get("/pages/:slug", optionalClerkMiddleware, async (c) => {
+  const supabase = createSupabaseAdmin();
+  const { data, error } = await supabase
+    .from("website_pages")
+    .select("slug, title, body_md, seo_title, seo_description, published_at, updated_at")
+    .eq("slug", c.req.param("slug"))
+    .eq("status", "published")
+    .maybeSingle();
+  if (error) {
+    console.error("[website/pages] query failed:", error);
+    return c.json({ error: "Failed to load page" }, 500);
+  }
+  if (!data) return c.json({ error: "Page not found" }, 404);
+  return c.json({ page: data });
+});
+
+/**
+ * GET /api/website/blog?limit=
+ * Published blog posts, newest first (list view — no body).
+ */
+website.get("/blog", optionalClerkMiddleware, async (c) => {
+  const supabase = createSupabaseAdmin();
+  const limit = Math.min(parseInt(c.req.query("limit") || "20", 10) || 20, 50);
+  const { data, error } = await supabase
+    .from("blog_posts")
+    .select("slug, title, cover_image_url, tags, published_at")
+    .eq("status", "published")
+    .order("published_at", { ascending: false })
+    .limit(limit);
+  if (error) {
+    console.error("[website/blog] query failed:", error);
+    return c.json({ error: "Failed to load posts" }, 500);
+  }
+  return c.json({ posts: data ?? [] });
+});
+
+/**
+ * GET /api/website/blog/:slug
+ * A single published blog post (full body).
+ */
+website.get("/blog/:slug", optionalClerkMiddleware, async (c) => {
+  const supabase = createSupabaseAdmin();
+  const { data, error } = await supabase
+    .from("blog_posts")
+    .select("slug, title, body_md, cover_image_url, tags, published_at")
+    .eq("slug", c.req.param("slug"))
+    .eq("status", "published")
+    .maybeSingle();
+  if (error) {
+    console.error("[website/blog/:slug] query failed:", error);
+    return c.json({ error: "Failed to load post" }, 500);
+  }
+  if (!data) return c.json({ error: "Post not found" }, 404);
+  return c.json({ post: data });
+});
+
 export default website;
