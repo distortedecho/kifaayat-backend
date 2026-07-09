@@ -1,5 +1,6 @@
 import { createSupabaseAdmin } from "./supabase.js";
 import type { NotificationType } from "../types/transactions.js";
+import { sendNotificationEmail } from "./notification-email.js";
 
 // ============================================================
 // Types
@@ -240,6 +241,14 @@ export async function createNotification(
         console.error("Push notification error (fire-and-forget):", err);
       });
     }
+
+    // 5. Transactional email (order lifecycle). Self-contained bridge — no
+    // trigger changes needed; it reads data.order_id and renders the email.
+    void sendNotificationEmail({
+      userId: params.user_id,
+      type: params.type,
+      data: params.data ?? null,
+    });
   } catch (err) {
     console.error("createNotification error (fire-and-forget):", err);
   }
