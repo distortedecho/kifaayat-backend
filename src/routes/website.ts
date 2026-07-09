@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import { z } from "zod";
 import { optionalClerkMiddleware } from "../middleware/clerk.js";
 import { createSupabaseAdmin } from "../lib/supabase.js";
 import { hasDirectDb, getSql } from "../lib/db.js";
@@ -375,6 +376,54 @@ website.get("/blog/:slug", optionalClerkMiddleware, async (c) => {
   }
   if (!data) return c.json({ error: "Post not found" }, 404);
   return c.json({ post: data });
+});
+
+// ============================================================
+// Newsletter signup (web footer)
+// ============================================================
+
+/**
+ * POST /api/website/newsletter
+ * Capture a footer newsletter signup. Idempotent: re-subscribing an existing
+ * email returns 200 (re-flips to 'subscribed'), never 409. 422 on bad email.
+ * Body: { email, source?, market? }
+ */
+website.post("/newsletter", optionalClerkMiddleware, async (c) => {
+  const parsed = z
+    .object({
+      email: z.string().email(),
+      source: z.string().max(80).optional(),
+      market: z.string().max(10).optional(),
+    })
+    .safeParse(await c.req.json().catch(() => ({})));
+
+  if (!parsed.success) {
+    return c.json({ ok: false, error: "Invalid email" }, 422);
+  }
+
+  const email = parsed.data.email.trim().toLowerCase();
+  const supabase = createSupabaseAdmin();
+
+  // Upsert by email: insert new, or re-subscribe an existing row.
+  const { error } = await supabase
+    .from("newsletter_subscribers")
+    .upsert(
+      {
+        email,
+        source: parsed.data.source ?? null,
+        market: parsed.data.market ? parsed.data.market.toUpperCase() : null,
+        status: "subscribed",
+        updated_at: new Date().toISOString(),
+      },
+      { onConflict: "email" }
+    );
+
+  if (error) {
+    console.error("[website/newsletter] upsert failed:", error);
+    return c.json({ ok: false, error: "Failed to subscribe" }, 500);
+  }
+
+  return c.json({ ok: true });
 });
 
 export default website;
