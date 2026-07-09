@@ -30,6 +30,7 @@ import config from "./routes/config.js";
 import addresses from "./routes/addresses.js";
 import website from "./routes/website.js";
 import designersRoute from "./routes/designers.js";
+import testEmail from "./routes/testEmail.js";
 import {
   initJobQueue,
   scheduleRecurringJobs,
@@ -219,6 +220,7 @@ v1.route("/listing-config", config);
 v1.route("/addresses", addresses);
 v1.route("/website", website);
 v1.route("/designers", designersRoute);
+v1.route("/test-email", testEmail);
 
 // Canonical versioned mount
 app.route("/api/v1", v1);
