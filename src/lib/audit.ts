@@ -22,6 +22,7 @@ export type AuditTargetType =
   | "payout"
   | "review"
   | "message"
+  | "listing_comment"
   | "settings"
   | "taxonomy"
   | "content"

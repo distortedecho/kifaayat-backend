@@ -92,6 +92,116 @@ const verdictFor = (score: number): Verdict =>
   score >= 70 ? "pass" : score >= 40 ? "near" : "fail";
 
 /**
+ * Lightweight, synchronous quality score for LIST endpoints (review queue,
+ * all-listings). Same deterministic checks as computeQualityScore but with NO
+ * Gemini vision call and NO extra DB queries — every input is already on the
+ * listing/seller row, so it's safe to run per-row in a list map.
+ *
+ * Returns a 0–100 roll-up + the per-check breakdown the review queue renders.
+ */
+export function deterministicQuality(input: {
+  productCount: number;
+  price: number | null;
+  originalPrice: number | null;
+  title?: string | null;
+  description?: string | null;
+  sellerCreatedAt?: string | null;
+  sellerQuality?: number | null;
+  updatedAt?: string | null;
+}): { score: number | null; checks: QualityCheck[] } {
+  // Display rows mirror Megha's Screen-03 breakdown exactly:
+  //   3+ clear images · Sharpness · Value for money · Seller activity · Last edited
+  const checks: QualityCheck[] = [];
+
+  // 1. 3+ clear images
+  const imgScore = input.productCount >= 3 ? 100 : input.productCount >= 2 ? 60 : 20;
+  checks.push({
+    key: "images",
+    label: "3+ clear images",
+    score: imgScore,
+    verdict: verdictFor(imgScore),
+    weight: 30,
+    detail: input.productCount >= 3 ? `${input.productCount}/${input.productCount}` : `${input.productCount}/3`,
+  });
+
+  // 2. Sharpness — needs Gemini vision, not assessed in the lightweight score.
+  checks.push({
+    key: "sharpness",
+    label: "Sharpness",
+    score: 0,
+    verdict: "unknown",
+    weight: 0,
+    detail: "not assessed",
+  });
+
+  // 3. Value for money
+  let vfmScore = 100;
+  let vfmDetail = "fair price";
+  if (input.originalPrice && input.price && input.originalPrice > 0 && input.price <= input.originalPrice) {
+    const depth = (input.originalPrice - input.price) / input.originalPrice;
+    vfmDetail = `${Math.round(depth * 100)}% off`;
+    vfmScore = depth <= 0.5 ? 100 : depth <= 0.8 ? 60 : 25;
+  }
+  checks.push({
+    key: "value_for_money",
+    label: "Value for money",
+    score: vfmScore,
+    verdict: verdictFor(vfmScore),
+    weight: 25,
+    detail: vfmDetail,
+  });
+
+  // 4. Seller activity
+  let days: number | null = null;
+  if (input.sellerCreatedAt) {
+    days = (Date.now() - new Date(input.sellerCreatedAt).getTime()) / (1000 * 60 * 60 * 24);
+  }
+  const sq = input.sellerQuality ?? null;
+  let actScore = 40;
+  let actDetail = "new";
+  if ((sq ?? 0) >= 3.5 || (days ?? 0) > 180) {
+    actScore = 100;
+    actDetail = "established";
+  } else if ((sq ?? 0) >= 2 || (days ?? 0) >= 30) {
+    actScore = 70;
+    actDetail = "active";
+  }
+  checks.push({
+    key: "seller_activity",
+    label: "Seller activity",
+    score: actScore,
+    verdict: verdictFor(actScore),
+    weight: 25,
+    detail: actDetail,
+  });
+
+  // 5. Last edited (display only — from the listing's updated_at)
+  let editedDetail = "—";
+  if (input.updatedAt) {
+    const hrs = (Date.now() - new Date(input.updatedAt).getTime()) / (1000 * 60 * 60);
+    editedDetail = hrs < 1 ? "just now" : hrs < 24 ? `${Math.floor(hrs)}h` : `${Math.floor(hrs / 24)}d`;
+  }
+  checks.push({
+    key: "last_edited",
+    label: "Last edited",
+    score: 100,
+    verdict: "pass",
+    weight: 0,
+    detail: editedDetail,
+  });
+
+  // Contact info in title/description is a hard penalty (not shown as a row).
+  const banned = findContactInfo(input.title || "") || findContactInfo(input.description || "");
+
+  const scored = checks.filter((ch) => ch.weight > 0 && ch.verdict !== "unknown");
+  const totalW = scored.reduce((s, ch) => s + ch.weight, 0);
+  let score =
+    totalW > 0 ? Math.round(scored.reduce((s, ch) => s + ch.score * ch.weight, 0) / totalW) : null;
+  if (banned && score != null) score = Math.min(score, 25);
+  return { score, checks };
+}
+
+/**
  * Compute + persist the quality-check breakdown for a listing.
  * Fire-and-forget: logs on failure, never throws to the caller.
  */

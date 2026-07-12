@@ -4,6 +4,7 @@ import { z } from "zod";
 import { adminAuthMiddleware, requireAdminPermission } from "../middleware/adminAuth.js";
 import { ADMIN_PERMISSIONS, ROLE_PERMISSIONS, hasPermission, type AdminRole } from "../lib/adminRoles.js";
 import { createSupabaseAdmin } from "../lib/supabase.js";
+import { sendEmail } from "../lib/email.js";
 import {
   LISTING_CATEGORIES,
   LISTING_CONDITIONS,
@@ -19,6 +20,8 @@ import {
   tierDowngradeNotification,
   followedSellerNewListingNotification,
   orderDeliveredNotification,
+  orderShippedNotification,
+  orderCompleteNotification,
   orderRejectedNotification,
 } from "../lib/notifications.js";
 import {
@@ -43,6 +46,9 @@ import {
   releasePayoutForOrder,
 } from "../services/payoutService.js";
 import { auditFromContext } from "../lib/audit.js";
+import { moderate } from "../lib/moderation.js";
+import { deterministicQuality } from "../lib/quality-score.js";
+import { broadcastMessageModerated } from "../services/conversationService.js";
 import { hasDirectDb, getSql } from "../lib/db.js";
 
 const admin = new Hono();
@@ -64,8 +70,13 @@ admin.post("/auth/login", async (c) => {
     return c.json({ error: "Invalid email or password" }, 400);
   }
 
+  // IMPORTANT: sign in on a DEDICATED client. signInWithPassword swaps that
+  // client's session to the end user, so any later PostgREST reads on it run as
+  // that user (RLS-restricted) instead of the service role. We keep a separate,
+  // untouched service-role client (`supabase`) for the admin_users lookups.
+  const supabaseAuth = createSupabaseAdmin();
   const supabase = createSupabaseAdmin();
-  const { data, error } = await supabase.auth.signInWithPassword({
+  const { data, error } = await supabaseAuth.auth.signInWithPassword({
     email: parsed.data.email,
     password: parsed.data.password,
   });
@@ -79,8 +90,29 @@ admin.post("/auth/login", async (c) => {
     .map((e) => e.trim().toLowerCase())
     .filter(Boolean);
 
-  if (adminEmails.length > 0 && !adminEmails.includes(data.user.email?.toLowerCase() || "")) {
-    return c.json({ error: "Forbidden: admin access required" }, 403);
+  const email = data.user.email?.toLowerCase() || "";
+  const emailAllowed = adminEmails.length === 0 || adminEmails.includes(email);
+
+  // ADMIN_EMAILS is only a bootstrap fallback — the source of truth is the
+  // admin_users table. Members added via invite (moderator/admin/support) live
+  // there, NOT in ADMIN_EMAILS, so also accept a non-disabled admin_users row.
+  // (This mirrors the access gate in adminAuthMiddleware.)
+  if (!emailAllowed) {
+    let { data: adminRow } = await supabase
+      .from("admin_users")
+      .select("id, status")
+      .eq("supabase_user_id", data.user.id)
+      .maybeSingle();
+    if (!adminRow && email) {
+      ({ data: adminRow } = await supabase
+        .from("admin_users")
+        .select("id, status")
+        .ilike("email", email)
+        .maybeSingle());
+    }
+    if (!adminRow || (adminRow as { status?: string }).status === "disabled") {
+      return c.json({ error: "Forbidden: admin access required" }, 403);
+    }
   }
 
   return c.json({
@@ -236,6 +268,8 @@ admin.get("/listings/all", async (c) => {
   const status = c.req.query("status") || "";
   const search = c.req.query("search") || "";
   const category = c.req.query("category") || "";
+  const region = c.req.query("region") || "";
+  const condition = c.req.query("condition") || "";
   const sort = c.req.query("sort") || "created_at";
   const order = c.req.query("order") || "desc";
   const page = parseInt(c.req.query("page") || "1", 10);
@@ -249,7 +283,7 @@ admin.get("/listings/all", async (c) => {
   let query = supabase
     .from("listings")
     .select(
-      "*, listing_photos(*), profiles!listings_seller_id_fkey(display_name, avatar_url, location)",
+      "*, listing_photos(*), profiles!listings_seller_id_fkey(display_name, avatar_url, location, created_at, seller_quality)",
       { count: "exact" }
     )
     .order(sortCol, { ascending })
@@ -267,6 +301,15 @@ admin.get("/listings/all", async (c) => {
     query = query.eq("category", category);
   }
 
+  // Region = denormalised seller_location (AU/CA/GB/NZ/US).
+  if (region && region !== "all") {
+    query = query.eq("seller_location", region);
+  }
+
+  if (condition && condition !== "all") {
+    query = query.eq("condition", condition);
+  }
+
   const { data: listings, error, count } = await query;
 
   if (error) {
@@ -274,15 +317,36 @@ admin.get("/listings/all", async (c) => {
     return c.json({ error: "Failed to fetch listings" }, 500);
   }
 
-  const result = (listings || []).map((listing) => ({
-    ...listing,
-    photos: (listing.listing_photos || []).sort(
-      (a: { position: number }, b: { position: number }) => a.position - b.position
-    ),
-    seller: listing.profiles || null,
-    listing_photos: undefined,
-    profiles: undefined,
-  }));
+  const result = (listings || []).map((listing) => {
+    const l = listing as Record<string, unknown>;
+    const photos = ((l.listing_photos as Array<{ position: number }>) || []).sort(
+      (a, b) => a.position - b.position
+    );
+    const seller = (l.profiles as Record<string, unknown> | null) || null;
+    const stored = (l.quality_checks as { score?: number } | null) || null;
+    // Prefer a persisted score (includes the vision check); else compute the
+    // lightweight deterministic score on the fly.
+    const quality =
+      stored && typeof stored.score === "number"
+        ? stored
+        : deterministicQuality({
+            productCount: photos.length,
+            price: (l.price_amount as number) ?? null,
+            originalPrice: (l.original_price_amount as number) ?? null,
+            title: l.title as string,
+            description: l.description as string,
+            sellerCreatedAt: (seller?.created_at as string) ?? null,
+            sellerQuality: (seller?.seller_quality as number) ?? null,
+          });
+    return {
+      ...listing,
+      photos,
+      seller,
+      quality,
+      listing_photos: undefined,
+      profiles: undefined,
+    };
+  });
 
   return c.json({ listings: result, total: count || 0, page, limit });
 });
@@ -318,7 +382,7 @@ admin.get("/listings/pending", async (c) => {
     .from("listings")
     .select(
       "*, listing_photos(*), profiles!listings_seller_id_fkey(" +
-        "display_name, avatar_url, location, payout_method, " +
+        "display_name, avatar_url, location, payout_method, created_at, seller_quality, " +
         "stripe_account_id, stripe_onboarding_complete, " +
         "wise_account_holder, wise_bank_country, wise_bank_currency, " +
         "wise_routing_code, wise_account_number, wise_account_type, paypal_email)",
@@ -376,10 +440,41 @@ admin.get("/listings/pending", async (c) => {
         }
       : null;
     const photos = (listing.listing_photos as Array<{ position: number }> | null) || [];
+    // Always use the deterministic breakdown here so the review queue shows the
+    // consistent Screen-03 rows (3+ images / sharpness / value / seller / last edited).
+    const quality = deterministicQuality({
+      productCount: photos.length,
+      price: (listing.price_amount as number) ?? null,
+      originalPrice: (listing.original_price_amount as number) ?? null,
+      title: listing.title as string,
+      description: listing.description as string,
+      sellerCreatedAt: (sellerRaw?.created_at as string) ?? null,
+      sellerQuality: (sellerRaw?.seller_quality as number) ?? null,
+      updatedAt: (listing.updated_at as string) ?? null,
+    });
+
+    // Overlay the real sharpness verdict from the full (Gemini) scorer when it
+    // was computed at listing-creation time — no extra API call here.
+    const storedChecks = (listing.quality_checks as { checks?: Array<Record<string, unknown>> } | null)?.checks;
+    const storedSharp = storedChecks?.find((c) => c.key === "sharpness");
+    if (storedSharp && storedSharp.verdict && storedSharp.verdict !== "unknown") {
+      const idx = quality.checks.findIndex((c) => c.key === "sharpness");
+      if (idx >= 0) {
+        quality.checks[idx] = {
+          key: "sharpness",
+          label: "Sharpness",
+          score: (storedSharp.score as number) ?? 0,
+          verdict: storedSharp.verdict as "pass" | "near" | "fail",
+          weight: 0,
+          detail: (storedSharp.detail as string) || "assessed",
+        };
+      }
+    }
     return {
       ...listing,
       photos: photos.sort((a, b) => a.position - b.position),
       seller,
+      quality,
       listing_photos: undefined,
       profiles: undefined,
     };
@@ -716,11 +811,15 @@ const adminCreateListingSchema = z.object({
   original_price_amount: z.number().int().positive().optional(),
   negotiable: z.boolean().optional(),
   shipping_info: z.string().max(500).optional(),
+  // Screen 06 · admin creates a listing on behalf of a seller. The listing is
+  // attributed to this seller and routes through the review queue.
+  seller_id: z.string().uuid(),
+  // "Save as draft" vs "Submit for review".
+  is_draft: z.boolean().optional(),
 });
 
 admin.post("/listings", async (c) => {
   const supabase = createSupabaseAdmin();
-  const adminProfileId = c.get("adminProfileId");
 
   const body = await c.req.json();
   const parsed = adminCreateListingSchema.safeParse(body);
@@ -729,10 +828,23 @@ admin.post("/listings", async (c) => {
     return c.json({ error: "Validation failed", details: parsed.error.flatten().fieldErrors }, 400);
   }
 
+  // Confirm the assigned seller exists.
+  const { data: seller, error: sellerErr } = await supabase
+    .from("profiles")
+    .select("id")
+    .eq("id", parsed.data.seller_id)
+    .single();
+  if (sellerErr || !seller) {
+    return c.json({ error: "Assigned seller not found" }, 400);
+  }
+
+  // Even admin-created listings route through review before publishing.
+  const status = parsed.data.is_draft ? "draft" : "pending_review";
+
   const { data: listing, error } = await supabase
     .from("listings")
     .insert({
-      seller_id: adminProfileId,
+      seller_id: parsed.data.seller_id,
       title: parsed.data.title,
       description: parsed.data.description || null,
       category: parsed.data.category,
@@ -745,7 +857,7 @@ admin.post("/listings", async (c) => {
       original_price_amount: parsed.data.original_price_amount || null,
       negotiable: parsed.data.negotiable ?? false,
       shipping_info: parsed.data.shipping_info || null,
-      status: "active",
+      status,
     })
     .select()
     .single();
@@ -759,7 +871,7 @@ admin.post("/listings", async (c) => {
     action: "listing.create",
     targetType: "listing",
     targetId: (listing as Record<string, unknown>).id as string,
-    metadata: { title: parsed.data.title, on_behalf_seller: adminProfileId },
+    metadata: { title: parsed.data.title, on_behalf_seller: parsed.data.seller_id, status },
   });
 
   return c.json({ listing }, 201);
@@ -834,6 +946,102 @@ admin.post("/listings/:id/photos", async (c) => {
   return c.json({ photo }, 201);
 });
 
+/**
+ * POST /api/admin/listings/:id/cover/remove-bg
+ * Store a background-removed cover (produced client-side). Reversible: the
+ * original photos are untouched — this is a separate `cover_processed` photo.
+ * Audited.
+ */
+admin.post("/listings/:id/cover/remove-bg", requireAdminPermission("listings.review"), async (c) => {
+  const listingId = c.req.param("id");
+  const supabase = createSupabaseAdmin();
+
+  const { data: listing } = await supabase
+    .from("listings")
+    .select("id, cover_bg_removed_path")
+    .eq("id", listingId)
+    .single();
+  if (!listing) return c.json({ error: "Listing not found" }, 404);
+
+  const formData = await c.req.formData();
+  const file = formData.get("photo") as File | null;
+  if (!file) return c.json({ error: "No image provided" }, 400);
+
+  // Remove any previous processed cover from storage first.
+  if (listing.cover_bg_removed_path) {
+    await supabase.storage.from("listing-photos").remove([listing.cover_bg_removed_path as string]);
+  }
+
+  const storagePath = `listings/${listingId}/cover_processed_${Date.now()}.png`;
+  const buffer = await file.arrayBuffer();
+  const { error: upErr } = await supabase.storage
+    .from("listing-photos")
+    .upload(storagePath, buffer, { contentType: "image/png", upsert: false });
+  if (upErr) {
+    console.error("Cover bg upload error:", upErr);
+    return c.json({ error: "Failed to upload processed cover" }, 500);
+  }
+  const { data: urlData } = supabase.storage.from("listing-photos").getPublicUrl(storagePath);
+
+  const { error: dbErr } = await supabase
+    .from("listings")
+    .update({
+      cover_bg_removed_url: urlData.publicUrl,
+      cover_bg_removed_path: storagePath,
+      cover_bg_removed_by: c.get("adminProfileId"),
+      cover_bg_removed_at: new Date().toISOString(),
+    })
+    .eq("id", listingId);
+  if (dbErr) {
+    console.error("Cover bg DB error:", dbErr);
+    await supabase.storage.from("listing-photos").remove([storagePath]);
+    return c.json({ error: "Failed to save processed cover" }, 500);
+  }
+
+  void auditFromContext(c, {
+    action: "listing.cover_bg_removed",
+    targetType: "listing",
+    targetId: listingId,
+  });
+  return c.json({ cover_bg_removed_url: urlData.publicUrl }, 201);
+});
+
+/**
+ * POST /api/admin/listings/:id/cover/revert
+ * Remove the background-removed cover, restoring the original photos. Audited.
+ */
+admin.post("/listings/:id/cover/revert", requireAdminPermission("listings.review"), async (c) => {
+  const listingId = c.req.param("id");
+  const supabase = createSupabaseAdmin();
+
+  const { data: listing } = await supabase
+    .from("listings")
+    .select("id, cover_bg_removed_path")
+    .eq("id", listingId)
+    .single();
+  if (!listing?.cover_bg_removed_path) {
+    return c.json({ error: "No processed cover to revert" }, 400);
+  }
+
+  await supabase.storage.from("listing-photos").remove([listing.cover_bg_removed_path as string]);
+  await supabase
+    .from("listings")
+    .update({
+      cover_bg_removed_url: null,
+      cover_bg_removed_path: null,
+      cover_bg_removed_by: null,
+      cover_bg_removed_at: null,
+    })
+    .eq("id", listingId);
+
+  void auditFromContext(c, {
+    action: "listing.cover_bg_reverted",
+    targetType: "listing",
+    targetId: listingId,
+  });
+  return c.json({ success: true });
+});
+
 // ============================================================
 // Admin Listing CRUD (get single, update, status change, delete)
 // ============================================================
@@ -845,7 +1053,7 @@ admin.get("/listings/:id", async (c) => {
   const { data: listing, error } = await supabase
     .from("listings")
     .select(
-      "*, listing_photos(*), profiles!listings_seller_id_fkey(id, display_name, avatar_url, location, stripe_onboarding_complete)"
+      "*, listing_photos(*), profiles!listings_seller_id_fkey(id, display_name, avatar_url, location, stripe_onboarding_complete, seller_quality, created_at)"
     )
     .eq("id", listingId)
     .single();
@@ -854,19 +1062,13 @@ admin.get("/listings/:id", async (c) => {
     return c.json({ error: "Listing not found" }, 404);
   }
 
-  const result = {
-    ...listing,
-    photos: (listing.listing_photos || []).sort(
-      (a: { position: number }, b: { position: number }) => a.position - b.position
-    ),
-    seller: listing.profiles || null,
-    listing_photos: undefined,
-    profiles: undefined,
-  };
+  const sellerRaw = (listing.profiles as Record<string, unknown> | null) || null;
+  const sellerId = sellerRaw?.id as string | undefined;
+  const thirtyAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
 
-  // Phase 4 enrichment (Screen 04): every offer + transaction raised against
-  // this listing, and its public comments. Additive to the response.
-  const [offers, orders, comments] = await Promise.all([
+  // Phase 4 enrichment (Screen 04): offers + transactions + comments on this
+  // listing, plus the seller's headline stats for the seller card.
+  const [offers, orders, comments, sellerListings, sellerGmv, sellerReviews] = await Promise.all([
     supabase
       .from("offers")
       .select("id, amount, currency, status, round, offered_by, created_at, buyer_id")
@@ -882,13 +1084,92 @@ admin.get("/listings/:id", async (c) => {
       .select("*")
       .eq("listing_id", listingId)
       .order("created_at", { ascending: false }),
+    sellerId
+      ? supabase.from("listings").select("id", { count: "exact", head: true }).eq("seller_id", sellerId)
+      : Promise.resolve({ count: 0 }),
+    sellerId
+      ? supabase.from("orders").select("amount").eq("seller_id", sellerId).gte("created_at", thirtyAgo).neq("status", "cancelled")
+      : Promise.resolve({ data: [] as Array<{ amount: number }> }),
+    sellerId
+      ? supabase.from("reviews").select("rating").eq("reviewee_id", sellerId)
+      : Promise.resolve({ data: [] as Array<{ rating: number }> }),
   ]);
+
+  const photos = (
+    (listing.listing_photos as Array<{ position: number; photo_type?: string | null }>) || []
+  ).sort((a, b) => a.position - b.position);
+  const productCount = photos.filter((p) => ((p.photo_type ?? "product") === "product")).length;
+
+  // Consistent Screen-03/04 quality breakdown + real sharpness overlay.
+  const quality = deterministicQuality({
+    productCount,
+    price: (listing.price_amount as number) ?? null,
+    originalPrice: (listing.original_price_amount as number) ?? null,
+    title: listing.title as string,
+    description: listing.description as string,
+    sellerCreatedAt: (sellerRaw?.created_at as string) ?? null,
+    sellerQuality: (sellerRaw?.seller_quality as number) ?? null,
+    updatedAt: (listing.updated_at as string) ?? null,
+  });
+  const storedChecks = (listing.quality_checks as { checks?: Array<Record<string, unknown>> } | null)?.checks;
+  const storedSharp = storedChecks?.find((cc) => cc.key === "sharpness");
+  if (storedSharp && storedSharp.verdict && storedSharp.verdict !== "unknown") {
+    const idx = quality.checks.findIndex((cc) => cc.key === "sharpness");
+    if (idx >= 0) {
+      quality.checks[idx] = {
+        key: "sharpness",
+        label: "Sharpness",
+        score: (storedSharp.score as number) ?? 0,
+        verdict: storedSharp.verdict as "pass" | "near" | "fail",
+        weight: 0,
+        detail: (storedSharp.detail as string) || "assessed",
+      };
+    }
+  }
+
+  const gmv30d = (sellerGmv.data || []).reduce((s, o) => s + (o.amount || 0), 0);
+  const ratings = (sellerReviews.data || []).map((r) => r.rating).filter((x) => x != null);
+  const avgRating = ratings.length ? ratings.reduce((a, b) => a + b, 0) / ratings.length : null;
+
+  const seller = sellerRaw
+    ? {
+        ...sellerRaw,
+        stripe_status: sellerRaw.stripe_onboarding_complete ? "complete" : "not_connected",
+        listing_count: (sellerListings as { count?: number }).count ?? 0,
+        gmv_30d: gmv30d,
+        rating: avgRating,
+        reviews_count: ratings.length,
+      }
+    : null;
+
+  // Comment authors + hidden state for the moderation ledger.
+  const commentRows = (comments.data ?? []) as Array<Record<string, unknown>>;
+  const authorIds = [...new Set(commentRows.map((cm) => cm.author_id).filter(Boolean))] as string[];
+  const nameMap: Record<string, string> = {};
+  if (authorIds.length > 0) {
+    const { data: authors } = await supabase.from("profiles").select("id, display_name").in("id", authorIds);
+    for (const a of authors || []) nameMap[a.id] = a.display_name || "Unknown";
+  }
+  const enrichedComments = commentRows.map((cm) => ({
+    ...cm,
+    author_name: cm.author_id ? nameMap[cm.author_id as string] || "Unknown" : null,
+    hidden: cm.hidden_at != null,
+  }));
+
+  const result = {
+    ...listing,
+    photos,
+    seller,
+    quality,
+    listing_photos: undefined,
+    profiles: undefined,
+  };
 
   return c.json({
     listing: result,
     offers: offers.data ?? [],
     transactions: orders.data ?? [],
-    comments: comments.data ?? [],
+    comments: enrichedComments,
   });
 });
 
@@ -1124,9 +1405,37 @@ admin.delete("/listings/:id", async (c) => {
 admin.get("/users", async (c) => {
   const supabase = createSupabaseAdmin();
   const search = c.req.query("search") || "";
+  const tab = (c.req.query("tab") || "all").toLowerCase(); // all|sellers|buyers|banned
+  const region = c.req.query("region") || "";
+  const verification = (c.req.query("verification") || "").toLowerCase(); // verified|unverified
+  const joined = (c.req.query("joined") || "all").toLowerCase(); // all|7d|30d
   const page = parseInt(c.req.query("page") || "1", 10);
   const limit = parseInt(c.req.query("limit") || "50", 10);
   const offset = (page - 1) * limit;
+
+  // Sellers vs buyers are defined by having any listing. Resolve the seller-id
+  // set once (used by the seller/buyer filter AND the tab counts).
+  const { data: sellerRows } = await supabase.from("listings").select("seller_id");
+  const sellerIds = [...new Set((sellerRows || []).map((r) => r.seller_id).filter(Boolean))] as string[];
+
+  // Absolute tab counts (unaffected by the current filters), like the wireframe.
+  const [allCount, bannedCount] = await Promise.all([
+    supabase.from("profiles").select("id", { count: "exact", head: true }),
+    supabase.from("profiles").select("id", { count: "exact", head: true }).not("banned_at", "is", null),
+  ]);
+  const counts = {
+    all: allCount.count ?? 0,
+    sellers: sellerIds.length,
+    buyers: Math.max((allCount.count ?? 0) - sellerIds.length, 0),
+    banned: bannedCount.count ?? 0,
+  };
+
+  const joinedSince =
+    joined === "7d"
+      ? new Date(Date.now() - 7 * 86400000).toISOString()
+      : joined === "30d"
+        ? new Date(Date.now() - 30 * 86400000).toISOString()
+        : null;
 
   let query = supabase
     .from("profiles")
@@ -1134,9 +1443,17 @@ admin.get("/users", async (c) => {
     .order("created_at", { ascending: false })
     .range(offset, offset + limit - 1);
 
-  if (search) {
-    query = query.ilike("display_name", `%${search}%`);
-  }
+  if (search) query = query.ilike("display_name", `%${search}%`);
+  if (region) query = query.eq("location", region);
+  if (joinedSince) query = query.gte("created_at", joinedSince);
+  if (verification === "verified") query = query.eq("stripe_onboarding_complete", true);
+  if (verification === "unverified")
+    query = query.or("stripe_onboarding_complete.is.null,stripe_onboarding_complete.eq.false");
+  if (tab === "banned") query = query.not("banned_at", "is", null);
+  if (tab === "sellers")
+    query = query.in("id", sellerIds && sellerIds.length ? sellerIds : ["00000000-0000-0000-0000-000000000000"]);
+  if (tab === "buyers" && sellerIds && sellerIds.length)
+    query = query.not("id", "in", `(${sellerIds.join(",")})`);
 
   const { data: profiles, error, count } = await query;
 
@@ -1195,7 +1512,7 @@ admin.get("/users", async (c) => {
     };
   });
 
-  return c.json({ items: users, users, total: count || 0, page, limit });
+  return c.json({ items: users, users, total: count || 0, counts, page, limit });
 });
 
 admin.post("/users/:id/suspend", async (c) => {
@@ -2364,7 +2681,7 @@ admin.get("/moderation/conversation/:id", async (c) => {
   // Get all messages
   const { data: messages, error: msgError } = await supabase
     .from("messages")
-    .select("id, sender_id, content, created_at")
+    .select("id, sender_id, content, created_at, moderation_hidden, moderation_hold, moderated_at")
     .eq("conversation_id", conversationId)
     .order("created_at", { ascending: true });
 
@@ -2395,17 +2712,43 @@ admin.get("/moderation/conversation/:id", async (c) => {
     }
   }
 
-  const messagesWithFlags = (messages || []).map((msg) => ({
-    ...msg,
-    flags: flagMap[msg.id] || [],
-    is_flagged: !!flagMap[msg.id] && flagMap[msg.id].length > 0,
-  }));
+  // Name lookup for enriching messages + participant labelling.
+  const profileNameMap: Record<string, string> = {};
+  for (const p of profiles || []) profileNameMap[p.id] = p.display_name || "Unknown";
+
+  const messagesWithFlags = (messages || []).map((msg) => {
+    const rawFlags = flagMap[msg.id] || [];
+    return {
+      ...msg,
+      // FE expects a display name + a flat matched_content per flag.
+      sender_name:
+        msg.sender_id === null
+          ? "System"
+          : profileNameMap[msg.sender_id] || "Unknown",
+      flags: rawFlags.map((f) => ({
+        id: f.id,
+        flag_type: f.flag_type,
+        matched_content:
+          ((f.details as Record<string, unknown> | null)?.matched_content as string) ||
+          ((f.details as Record<string, unknown> | null)?.summary as string) ||
+          "",
+      })),
+      is_flagged: rawFlags.length > 0,
+    };
+  });
 
   return c.json({
     conversation: {
       id: conversation.id,
       participants: profiles || [],
+      // Flattened fields the admin FE renders directly.
+      buyer_name: conversation.buyer_id ? profileNameMap[conversation.buyer_id] || "Buyer" : "Buyer",
+      seller_name: conversation.seller_id ? profileNameMap[conversation.seller_id] || "Seller" : "Seller",
+      buyer_id: conversation.buyer_id,
+      seller_id: conversation.seller_id,
       listing,
+      listing_title: listing?.title || "Conversation",
+      listing_photo: null,
     },
     messages: messagesWithFlags,
   });
@@ -2430,17 +2773,53 @@ admin.post("/moderation/warn", async (c) => {
     "Sharing contact info violates our terms. Keep transactions on Kifaayat for buyer protection.";
   const warningContent = parsed.data.message || defaultMessage;
 
-  // Insert system warning message
-  const { error: msgError } = await supabase.from("messages").insert({
-    conversation_id: parsed.data.conversation_id,
-    sender_id: null,
-    content: warningContent,
-  });
+  // messages.sender_id is a NOT NULL FK to profiles(id), so a warning can't be
+  // a null-sender message. Attribute it to a system profile: prefer the
+  // configured SYSTEM_SENDER_PROFILE_ID, else fall back to the seeded
+  // "Kifaayat Admin" profile. metadata flags it so the apps can style it.
+  let systemSenderId = process.env.SYSTEM_SENDER_PROFILE_ID || null;
+  if (!systemSenderId) {
+    const { data: sys } = await supabase
+      .from("profiles")
+      .select("id")
+      .eq("display_name", "Kifaayat Admin")
+      .limit(1)
+      .maybeSingle();
+    systemSenderId = sys?.id || null;
+  }
+  if (!systemSenderId) {
+    console.error("moderation/warn: no system sender profile available");
+    return c.json(
+      { error: "No system sender configured. Set SYSTEM_SENDER_PROFILE_ID to a profile id." },
+      500
+    );
+  }
 
-  if (msgError) {
+  // Insert system warning message
+  const { data: warnMsg, error: msgError } = await supabase
+    .from("messages")
+    .insert({
+      conversation_id: parsed.data.conversation_id,
+      sender_id: systemSenderId,
+      content: warningContent,
+      metadata: { system: true, moderation_warning: true },
+    })
+    .select()
+    .single();
+
+  if (msgError || !warnMsg) {
     console.error("Error inserting warning message:", msgError);
     return c.json({ error: "Failed to send warning" }, 500);
   }
+
+  // Live-push the warning into the open chat window (same channel/event the
+  // app already uses for live messages).
+  createSupabaseAdmin()
+    .channel(`conversation:${parsed.data.conversation_id}`)
+    .send({ type: "broadcast", event: "new_message", payload: warnMsg })
+    .catch((err: unknown) =>
+      console.error("warn broadcast failed:", err instanceof Error ? err.message : err)
+    );
 
   // Mark related pending flags as reviewed
   const { data: convMessages } = await supabase
@@ -2498,7 +2877,7 @@ admin.post("/moderation/redact", async (c) => {
   // Get the message
   const { data: message, error: msgError } = await supabase
     .from("messages")
-    .select("id, content")
+    .select("id, content, conversation_id")
     .eq("id", flag.entity_id)
     .single();
 
@@ -2506,14 +2885,41 @@ admin.post("/moderation/redact", async (c) => {
     return c.json({ error: "Message not found" }, 404);
   }
 
-  // Replace matched content with [redacted]
-  const matchedContent = (flag.details as Record<string, unknown>)?.matched_content as string | undefined;
-  let redactedContent = message.content;
-  if (matchedContent && redactedContent) {
-    redactedContent = redactedContent.replace(matchedContent, "[redacted]");
-  } else {
-    redactedContent = "[redacted]";
+  // Collect every offending span: the stored match(es) on the flag plus a
+  // fresh scan of the current content (covers stale/missing flag details).
+  // Engine matches are normalised (lower-cased / leet-folded), so we replace
+  // case-insensitively and globally — a case-sensitive exact replace silently
+  // no-ops on things like "PayPal" (match "paypal") or "Call me" (match "call me").
+  const details = flag.details as Record<string, unknown> | null;
+  const spans = new Set<string>();
+  const addSpan = (s: unknown) => {
+    if (typeof s === "string" && s.trim() && !/consecutive number words/i.test(s)) {
+      spans.add(s.trim());
+    }
+  };
+  addSpan(details?.matched_content);
+  if (Array.isArray(details?.reasons)) {
+    for (const r of details!.reasons as Array<{ match?: string }>) addSpan(r?.match);
   }
+  try {
+    for (const r of moderate(message.content || "").reasons) addSpan(r.match);
+  } catch {
+    /* re-scan is best-effort */
+  }
+
+  const escapeRegExp = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  let redactedContent = message.content || "";
+  let changed = false;
+  for (const span of spans) {
+    const re = new RegExp(escapeRegExp(span), "gi");
+    if (re.test(redactedContent)) {
+      redactedContent = redactedContent.replace(re, "[redacted]");
+      changed = true;
+    }
+  }
+  // Never silently no-op: if the offending span can't be located in the raw
+  // text (e.g. leet/masked obfuscation the fold caught), redact the whole message.
+  if (!changed) redactedContent = "[redacted]";
 
   // Update message content
   const { error: updateMsgError } = await supabase
@@ -2531,6 +2937,14 @@ admin.post("/moderation/redact", async (c) => {
     .from("fraud_flags")
     .update({ status: "actioned", reviewed_at: new Date().toISOString() })
     .eq("id", flag.id);
+
+  // Live-push the redacted content to the open chat window.
+  broadcastMessageModerated(message.conversation_id as string, {
+    id: message.id as string,
+    conversation_id: message.conversation_id as string,
+    moderation_hidden: false,
+    content: redactedContent,
+  });
 
   void auditFromContext(c, {
     action: "moderation.message_redact",
@@ -2602,6 +3016,231 @@ admin.post("/moderation/suspend", async (c) => {
     reason: parsed.data.reason,
   });
 
+  return c.json({ success: true });
+});
+
+// ------------------------------------------------------------
+// Comment moderation (sections: user-reported + system-flagged comments)
+// ------------------------------------------------------------
+
+/**
+ * GET /api/admin/moderation/comments?source=user|system|all&status=pending|all
+ * Flagged listing comments. `source=user` = reported by users (aggregated per
+ * comment with a report count); `source=system` = auto-detected by the engine.
+ */
+admin.get("/moderation/comments", async (c) => {
+  const supabase = createSupabaseAdmin();
+
+  const source = (c.req.query("source") || "all").toLowerCase();
+  const statusFilter = (c.req.query("status") || "pending").toLowerCase();
+  const page = Math.max(parseInt(c.req.query("page") || "1", 10) || 1, 1);
+  const limit = Math.min(Math.max(parseInt(c.req.query("limit") || "50", 10) || 50, 1), 100);
+  const offset = (page - 1) * limit;
+
+  let query = supabase
+    .from("fraud_flags")
+    .select("id, entity_id, flag_type, details, status, created_at, reviewed_at", {
+      count: "exact",
+    })
+    .eq("entity_type", "listing_comment")
+    .order("created_at", { ascending: false });
+
+  if (source === "user") query = query.eq("flag_type", "user_report");
+  else if (source === "system") query = query.eq("flag_type", "system");
+
+  if (statusFilter !== "all") query = query.eq("status", statusFilter);
+
+  const { data: flags, error, count } = await query.range(offset, offset + limit - 1);
+
+  if (error) {
+    console.error("Error loading flagged comments:", error);
+    return c.json({ error: "Failed to load flagged comments" }, 500);
+  }
+
+  const rows = flags || [];
+
+  // Enrich with the live comment's current visibility state.
+  const commentIds = [...new Set(rows.map((f) => f.entity_id).filter(Boolean))] as string[];
+  const liveMap: Record<string, { hidden_at: string | null; exists: boolean }> = {};
+  if (commentIds.length > 0) {
+    const { data: live } = await supabase
+      .from("listing_comments")
+      .select("id, hidden_at")
+      .in("id", commentIds);
+    for (const cm of live || []) liveMap[cm.id] = { hidden_at: cm.hidden_at, exists: true };
+  }
+
+  const toItem = (f: (typeof rows)[number]) => {
+    const d = (f.details || {}) as Record<string, unknown>;
+    const live = f.entity_id ? liveMap[f.entity_id] : undefined;
+    return {
+      flag_id: f.id,
+      comment_id: f.entity_id,
+      source: f.flag_type === "user_report" ? "user" : "system",
+      status: f.status,
+      verdict: (d.verdict as string) || null,
+      summary: (d.summary as string) || null,
+      reasons: (d.reasons as unknown[]) || [],
+      content: (d.content as string) || null,
+      author_id: (d.author_id as string) || null,
+      author_name: (d.author_name as string) || null,
+      listing_id: (d.listing_id as string) || null,
+      listing_title: (d.listing_title as string) || null,
+      reason: (d.reason as string) || null,
+      reporter_name: (d.reporter_name as string) || null,
+      created_at: f.created_at,
+      reviewed_at: f.reviewed_at,
+      comment_exists: !!live,
+      comment_hidden: live ? live.hidden_at !== null : false,
+    };
+  };
+
+  // Aggregate user reports per comment (multiple reporters -> one row).
+  if (source === "user") {
+    const byComment: Record<string, ReturnType<typeof toItem> & { report_count: number; reporters: string[] }> = {};
+    for (const f of rows) {
+      const item = toItem(f);
+      const key = (f.entity_id as string) || (f.id as string);
+      if (!byComment[key]) {
+        byComment[key] = { ...item, report_count: 0, reporters: [] };
+      }
+      byComment[key].report_count += 1;
+      if (item.reporter_name) byComment[key].reporters.push(item.reporter_name);
+    }
+    return c.json({
+      items: Object.values(byComment),
+      page,
+      limit,
+      total: count || 0,
+    });
+  }
+
+  return c.json({ items: rows.map(toItem), page, limit, total: count || 0 });
+});
+
+/**
+ * POST /api/admin/moderation/comment/hide
+ * Hide a comment from the app + resolve its flags. { comment_id }
+ */
+admin.post("/moderation/comment/hide", requireAdminPermission("moderation.act"), async (c) => {
+  const supabase = createSupabaseAdmin();
+  const parsed = z
+    .object({ comment_id: z.string().uuid() })
+    .safeParse(await c.req.json());
+  if (!parsed.success) {
+    return c.json({ error: "Validation failed", details: parsed.error.flatten().fieldErrors }, 400);
+  }
+  const { comment_id } = parsed.data;
+
+  const { data, error } = await supabase
+    .from("listing_comments")
+    .update({
+      hidden_at: new Date().toISOString(),
+      hidden_by: c.get("adminProfileId"),
+      flag_source: "admin",
+    })
+    .eq("id", comment_id)
+    .select("id")
+    .single();
+  if (error || !data) return c.json({ error: "Comment not found" }, 404);
+
+  await supabase
+    .from("fraud_flags")
+    .update({ status: "actioned", reviewed_by: c.get("adminUserId"), reviewed_at: new Date().toISOString() })
+    .eq("entity_type", "listing_comment")
+    .eq("entity_id", comment_id)
+    .eq("status", "pending");
+
+  void auditFromContext(c, {
+    action: "moderation.comment_hide",
+    targetType: "listing_comment",
+    targetId: comment_id,
+  });
+  return c.json({ success: true });
+});
+
+/**
+ * POST /api/admin/moderation/comment/restore
+ * Un-hide a previously hidden comment. { comment_id }
+ */
+admin.post("/moderation/comment/restore", requireAdminPermission("moderation.act"), async (c) => {
+  const supabase = createSupabaseAdmin();
+  const parsed = z
+    .object({ comment_id: z.string().uuid() })
+    .safeParse(await c.req.json());
+  if (!parsed.success) {
+    return c.json({ error: "Validation failed", details: parsed.error.flatten().fieldErrors }, 400);
+  }
+  const { comment_id } = parsed.data;
+
+  const { data, error } = await supabase
+    .from("listing_comments")
+    .update({ hidden_at: null, hidden_by: null, flagged_at: null, flag_source: null })
+    .eq("id", comment_id)
+    .select("id")
+    .single();
+  if (error || !data) return c.json({ error: "Comment not found" }, 404);
+
+  await supabase
+    .from("fraud_flags")
+    .update({ status: "reviewed", reviewed_by: c.get("adminUserId"), reviewed_at: new Date().toISOString() })
+    .eq("entity_type", "listing_comment")
+    .eq("entity_id", comment_id)
+    .eq("status", "pending");
+
+  void auditFromContext(c, {
+    action: "moderation.comment_restore",
+    targetType: "listing_comment",
+    targetId: comment_id,
+  });
+  return c.json({ success: true });
+});
+
+/**
+ * POST /api/admin/moderation/flag/dismiss
+ * Dismiss a flag without acting on the content (mark reviewed). { flag_id }
+ * Works for any flag (comment or message) — e.g. a false user report.
+ */
+admin.post("/moderation/flag/dismiss", requireAdminPermission("moderation.act"), async (c) => {
+  const supabase = createSupabaseAdmin();
+  const parsed = z
+    .object({ flag_id: z.string().uuid() })
+    .safeParse(await c.req.json());
+  if (!parsed.success) {
+    return c.json({ error: "Validation failed", details: parsed.error.flatten().fieldErrors }, 400);
+  }
+  const { flag_id } = parsed.data;
+
+  const { data, error } = await supabase
+    .from("fraud_flags")
+    .update({ status: "reviewed", reviewed_by: c.get("adminUserId"), reviewed_at: new Date().toISOString() })
+    .eq("id", flag_id)
+    .select("id, entity_type, entity_id")
+    .single();
+  if (error || !data) return c.json({ error: "Flag not found" }, 404);
+
+  // If no other pending flags on a comment, clear its flagged marker.
+  if (data.entity_type === "listing_comment" && data.entity_id) {
+    const { count } = await supabase
+      .from("fraud_flags")
+      .select("id", { count: "exact", head: true })
+      .eq("entity_type", "listing_comment")
+      .eq("entity_id", data.entity_id)
+      .eq("status", "pending");
+    if (!count) {
+      await supabase
+        .from("listing_comments")
+        .update({ flagged_at: null, flag_source: null })
+        .eq("id", data.entity_id)
+        .is("hidden_at", null);
+    }
+  }
+
+  void auditFromContext(c, {
+    action: "moderation.flag_dismiss",
+    targetType: data.entity_type === "listing_comment" ? "listing_comment" : "message",
+    targetId: (data.entity_id as string) || flag_id,
+  });
   return c.json({ success: true });
 });
 
@@ -3997,7 +4636,57 @@ admin.get("/transactions/:id", async (c) => {
   if (o.status === "cancelled") push(o.updated_at, "Cancelled / refunded");
   const timeline = events.sort((a, b) => b.at.localeCompare(a.at));
 
-  return c.json({ transaction: order, money, shipment, timeline });
+  // Private messages: the buyer↔seller conversation on this listing.
+  const buyer = o.buyer as { id?: string; display_name?: string } | null;
+  const seller = o.seller as { id?: string; display_name?: string } | null;
+  const listingId = o.listing_id as string | undefined;
+  let conversationId: string | null = null;
+  let messages: Array<{ id: string; sender_id: string | null; sender_name: string; content: string | null; created_at: string }> = [];
+  if (buyer?.id && seller?.id && listingId) {
+    const { data: conv } = await supabase
+      .from("conversations")
+      .select("id")
+      .eq("listing_id", listingId)
+      .eq("buyer_id", buyer.id)
+      .eq("seller_id", seller.id)
+      .maybeSingle();
+    if (conv) {
+      conversationId = conv.id as string;
+      const { data: msgs } = await supabase
+        .from("messages")
+        .select("id, sender_id, content, created_at")
+        .eq("conversation_id", conv.id)
+        .order("created_at", { ascending: true })
+        .limit(50);
+      const nameFor = (sid: string | null) =>
+        sid === null ? "System" : sid === buyer.id ? buyer.display_name || "Buyer" : sid === seller.id ? seller.display_name || "Seller" : "Unknown";
+      messages = (msgs || []).map((m) => ({
+        id: m.id as string,
+        sender_id: (m.sender_id as string) ?? null,
+        sender_name: nameFor((m.sender_id as string) ?? null),
+        content: (m.content as string) ?? null,
+        created_at: m.created_at as string,
+      }));
+    }
+  }
+
+  // Shape the transaction to what the detail page reads (state/ref/listing),
+  // mapped off the raw order columns (status/order_number/listings).
+  const listRel = o.listings as { id?: string; title?: string } | { id?: string; title?: string }[] | null;
+  const listObj = Array.isArray(listRel) ? listRel[0] : listRel;
+  return c.json({
+    transaction: {
+      ...o,
+      state: o.status,
+      ref: o.order_number,
+      listing: listObj ? { id: listObj.id, title: listObj.title } : null,
+    },
+    money,
+    shipment,
+    timeline,
+    conversation_id: conversationId,
+    messages,
+  });
 });
 
 // The forward order lifecycle. force-advance steps to the next state.
@@ -4175,19 +4864,26 @@ admin.post("/transactions/:id/force-advance", requireAdminPermission("transactio
 
   const { data: order, error } = await supabase
     .from("orders")
-    .select("id, status, seller_id, listing_id")
+    .select("id, status, seller_id, buyer_id, listing_id, delivery_method, seller_payout, listings!orders_listing_id_fkey(title)")
     .eq("id", orderId)
     .single();
   if (error || !order) return c.json({ error: "Transaction not found" }, 404);
 
-  const idx = ORDER_PROGRESSION.indexOf(order.status as (typeof ORDER_PROGRESSION)[number]);
-  if (idx === -1 || idx >= ORDER_PROGRESSION.length - 1) {
+  // Pickup orders have no shipping/delivery leg — the buyer collects in person,
+  // so they step straight paid → complete. Shipped orders use the full lifecycle.
+  const isPickup = order.delivery_method === "pickup";
+  const progression: readonly string[] = isPickup
+    ? ["paid", "complete"]
+    : ORDER_PROGRESSION;
+
+  const idx = progression.indexOf(order.status as string);
+  if (idx === -1 || idx >= progression.length - 1) {
     return c.json(
       { error: `Cannot advance from '${order.status}' (terminal or off-lifecycle)` },
       400
     );
   }
-  const nextStatus = ORDER_PROGRESSION[idx + 1];
+  const nextStatus = progression[idx + 1];
 
   const now = new Date().toISOString();
   const updates: Record<string, unknown> = { status: nextStatus, updated_at: now };
@@ -4204,6 +4900,39 @@ admin.post("/transactions/:id/force-advance", requireAdminPermission("transactio
   if (updErr) {
     console.error("[admin] force-advance failed:", updErr);
     return c.json({ error: "Failed to advance order" }, 500);
+  }
+
+  // Notify buyer + seller exactly like the normal lifecycle does (these calls
+  // also fire the transactional email bridge, keyed on data.order_id).
+  const listingRel = order.listings as unknown as { title?: string } | { title?: string }[] | null;
+  const listingTitle =
+    (Array.isArray(listingRel) ? listingRel[0]?.title : listingRel?.title) || "the item";
+  const buyerId = order.buyer_id as string | null;
+  const sellerId = order.seller_id as string | null;
+  const notifData = (role: "buyer" | "seller") => ({
+    order_id: orderId,
+    listing_id: order.listing_id,
+    role,
+  });
+  if (nextStatus === "shipped" && buyerId) {
+    createNotification({ user_id: buyerId, type: "order_shipped", ...orderShippedNotification(listingTitle), data: notifData("buyer") })
+      .catch((e) => console.error("[admin] force-advance ship notif:", e));
+  } else if (nextStatus === "delivered" && sellerId) {
+    createNotification({ user_id: sellerId, type: "order_delivered", ...orderDeliveredNotification(listingTitle), data: notifData("seller") })
+      .catch((e) => console.error("[admin] force-advance delivered notif:", e));
+  } else if (nextStatus === "complete") {
+    if (buyerId) {
+      createNotification({ user_id: buyerId, type: "order_complete", ...orderCompleteNotification(listingTitle, "buyer"), data: notifData("buyer") })
+        .catch((e) => console.error("[admin] force-advance complete buyer notif:", e));
+    }
+    if (sellerId) {
+      createNotification({
+        user_id: sellerId,
+        type: "order_complete",
+        ...orderCompleteNotification(listingTitle, "seller", (order.seller_payout as number) ?? undefined),
+        data: notifData("seller"),
+      }).catch((e) => console.error("[admin] force-advance complete seller notif:", e));
+    }
   }
 
   // Advancing to complete releases the seller payout, same as normal completion.
@@ -4309,6 +5038,13 @@ admin.post("/moderation/publish", requireAdminPermission("moderation.act"), asyn
     .eq("entity_id", message_id)
     .eq("status", "pending");
 
+  // Live-push the state change to the open chat window.
+  broadcastMessageModerated(data.conversation_id, {
+    id: message_id,
+    conversation_id: data.conversation_id,
+    moderation_hidden: action === "hide",
+  });
+
   void auditFromContext(c, {
     action: action === "publish" ? "moderation.message_publish" : "moderation.message_redact",
     targetType: "message",
@@ -4373,6 +5109,31 @@ admin.post("/reviews/:id/hide", requireAdminPermission("moderation.act"), async 
 });
 
 /**
+ * POST /api/admin/reviews/:id/keep
+ * Dismiss the flag on a review — it stays public; just clears the flag markers
+ * so it drops out of the reported-reviews queue. Audited.
+ */
+admin.post("/reviews/:id/keep", requireAdminPermission("moderation.act"), async (c) => {
+  const reviewId = c.req.param("id");
+  const supabase = createSupabaseAdmin();
+
+  const { data, error } = await supabase
+    .from("reviews")
+    .update({ flagged_at: null, flag_reason: null, flag_source: null })
+    .eq("id", reviewId)
+    .select("id")
+    .single();
+  if (error || !data) return c.json({ error: "Review not found" }, 404);
+
+  void auditFromContext(c, {
+    action: "review.keep",
+    targetType: "review",
+    targetId: reviewId,
+  });
+  return c.json({ success: true });
+});
+
+/**
  * POST /api/admin/reviews/:id/dispute
  * Open or resolve an in-console dispute on a review.
  */
@@ -4424,13 +5185,49 @@ admin.get("/users/:id", async (c) => {
     .single();
   if (error || !profile) return c.json({ error: "User not found" }, 404);
 
-  const [listings, purchases, sales, reviews, refCode] = await Promise.all([
-    supabase.from("listings").select("id", { count: "exact", head: true }).eq("seller_id", userId),
-    supabase.from("orders").select("id", { count: "exact", head: true }).eq("buyer_id", userId),
-    supabase.from("orders").select("id", { count: "exact", head: true }).eq("seller_id", userId),
-    supabase.from("reviews").select("id", { count: "exact", head: true }).eq("reviewee_id", userId),
-    supabase.from("referral_codes").select("code, disabled").eq("user_id", userId).maybeSingle(),
-  ]);
+  const [listings, purchases, sales, reviews, refCode, listingRows, saleRows, reviewRows] =
+    await Promise.all([
+      supabase.from("listings").select("id", { count: "exact", head: true }).eq("seller_id", userId),
+      supabase.from("orders").select("id", { count: "exact", head: true }).eq("buyer_id", userId),
+      supabase.from("orders").select("id", { count: "exact", head: true }).eq("seller_id", userId),
+      supabase.from("reviews").select("id", { count: "exact", head: true }).eq("reviewee_id", userId),
+      supabase.from("referral_codes").select("code, disabled").eq("user_id", userId).maybeSingle(),
+      // Cross-linked rows the User-detail screen renders (Screen 12).
+      supabase
+        .from("listings")
+        .select("id, title, price_amount, price_currency, status, created_at")
+        .eq("seller_id", userId)
+        .order("created_at", { ascending: false })
+        .limit(20),
+      supabase
+        .from("orders")
+        .select("id, amount, status, created_at, buyer_id")
+        .eq("seller_id", userId)
+        .order("created_at", { ascending: false })
+        .limit(20),
+      supabase
+        .from("reviews")
+        .select("id, rating, comment, created_at, reviewer_id")
+        .eq("reviewee_id", userId)
+        .order("created_at", { ascending: false })
+        .limit(10),
+    ]);
+
+  // Resolve counterparty / reviewer display names in one lookup.
+  const partyIds = [
+    ...new Set([
+      ...(saleRows.data || []).map((o) => o.buyer_id).filter(Boolean),
+      ...(reviewRows.data || []).map((r) => r.reviewer_id).filter(Boolean),
+    ]),
+  ] as string[];
+  const nameMap: Record<string, string> = {};
+  if (partyIds.length > 0) {
+    const { data: parties } = await supabase
+      .from("profiles")
+      .select("id, display_name")
+      .in("id", partyIds);
+    for (const pr of parties || []) nameMap[pr.id] = pr.display_name || "Unknown";
+  }
 
   const p = profile as Record<string, unknown>;
   return c.json({
@@ -4449,6 +5246,21 @@ admin.get("/users/:id", async (c) => {
       sales: sales.count ?? 0,
       reviews: reviews.count ?? 0,
     },
+    listings: listingRows.data ?? [],
+    transactions: (saleRows.data ?? []).map((o) => ({
+      id: o.id,
+      amount: o.amount,
+      status: o.status,
+      created_at: o.created_at,
+      counterparty: o.buyer_id ? nameMap[o.buyer_id] || "Unknown" : null,
+    })),
+    reviews: (reviewRows.data ?? []).map((r) => ({
+      id: r.id,
+      rating: r.rating,
+      comment: r.comment,
+      created_at: r.created_at,
+      reviewer: r.reviewer_id ? nameMap[r.reviewer_id] || "Unknown" : null,
+    })),
     referral_code: refCode.data ?? null,
   });
 });
@@ -4887,28 +5699,106 @@ admin.post("/content/push/:id/send", requireAdminPermission("content.edit"), asy
     return c.json({ error: "OneSignal not configured" }, 503);
   }
 
-  // Broadcast to subscribed users. Market/segment targeting can be refined
-  // later via OneSignal tag filters once devices carry a market tag.
-  let onesignalId: string | null = null;
-  try {
-    const payload: Record<string, unknown> = {
-      app_id: appId,
-      included_segments: ["Subscribed Users"],
-      headings: { en: camp.title },
-      contents: { en: camp.body },
+  // Target the OneSignal player ids stored on profiles — the SAME mechanism the
+  // per-user order notifications use. The app registers each device and saves
+  // its player id to profiles.onesignal_player_id; the legacy "Subscribed Users"
+  // segment doesn't map to this app's OneSignal (User Model) setup.
+  //
+  // Personalization is done HERE (backend), not via OneSignal tags: we pull each
+  // recipient's values from their profile, substitute the {{ var | default: x }}
+  // tokens in the title/body, then group identical results into batched sends.
+  const { data: profs } = await supabase
+    .from("profiles")
+    .select("onesignal_player_id, display_name, location, size_preferences")
+    .not("onesignal_player_id", "is", null);
+
+  const REGION_NAMES: Record<string, string> = {
+    AU: "Australia", US: "the US", NZ: "New Zealand", CA: "Canada", GB: "the UK",
+  };
+  // Resolve the personalization variables for one profile from the DB.
+  const varsFor = (p: {
+    display_name?: string | null;
+    location?: string | null;
+    size_preferences?: Record<string, unknown> | null;
+  }): Record<string, string> => {
+    const first = (p.display_name || "").trim().split(/\s+/)[0] || "";
+    const size = (p.size_preferences?.clothing_size as string | undefined) || "";
+    return {
+      first_name: first,
+      region: p.location ? REGION_NAMES[p.location] || p.location : "",
+      size,
+      saved_search: "", // no source yet → always uses the token's default
     };
-    if (camp.deep_link) payload.url = camp.deep_link;
-    const res = await fetch("https://onesignal.com/api/v1/notifications", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Basic ${restKey}` },
-      body: JSON.stringify(payload),
-    });
-    const json = (await res.json()) as { id?: string; errors?: unknown };
-    if (!res.ok) {
-      console.error("[admin] push send failed:", json);
-      return c.json({ error: "Push send failed" }, 502);
+  };
+  // Replace {{ var | default: 'x' }} and {{ var }} using the resolved values;
+  // an empty/missing value falls back to the token's default (or "").
+  const substitute = (tmpl: string, vars: Record<string, string>): string =>
+    (tmpl || "")
+      .replace(/\{\{\s*([\w.]+)\s*\|\s*default:\s*'([^']*)'\s*\}\}/g, (_m, key: string, def: string) =>
+        vars[key] ? vars[key] : def)
+      .replace(/\{\{\s*([\w.]+)\s*\}\}/g, (_m, key: string) => vars[key] || "");
+
+  // One device (player id) may back several profile logins. Keep the single most
+  // complete profile per device so we send each device exactly one push.
+  const completeness = (v: Record<string, string>) =>
+    (v.first_name ? 1 : 0) + (v.region ? 1 : 0) + (v.size ? 1 : 0);
+  const byDevice = new Map<string, Record<string, string>>();
+  for (const p of profs || []) {
+    const pid = p.onesignal_player_id as string;
+    if (!pid) continue;
+    const v = varsFor(p as never);
+    const existing = byDevice.get(pid);
+    if (!existing || completeness(v) > completeness(existing)) byDevice.set(pid, v);
+  }
+  if (byDevice.size === 0) {
+    return c.json({ error: "No subscribed devices to send to" }, 400);
+  }
+
+  // Group devices by their FINAL (substituted) title+body so identical messages
+  // go out in one OneSignal request instead of one-per-device.
+  const groups = new Map<string, { title: string; body: string; ids: string[] }>();
+  for (const [pid, v] of byDevice) {
+    const title = substitute(camp.title, v);
+    const body = substitute(camp.body, v);
+    const key = `${title} ${body}`;
+    const g = groups.get(key);
+    if (g) g.ids.push(pid);
+    else groups.set(key, { title, body, ids: [pid] });
+  }
+
+  let onesignalId: string | null = null;
+  let recipients = 0;
+  try {
+    for (const g of groups.values()) {
+      // OneSignal caps include_player_ids at 2000 per request; batch if needed.
+      for (let i = 0; i < g.ids.length; i += 2000) {
+        const chunk = g.ids.slice(i, i + 2000);
+        const payload: Record<string, unknown> = {
+          app_id: appId,
+          include_player_ids: chunk,
+          headings: { en: g.title },
+          contents: { en: g.body },
+        };
+        if (camp.deep_link) payload.url = camp.deep_link;
+        const res = await fetch("https://onesignal.com/api/v1/notifications", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Basic ${restKey}` },
+          body: JSON.stringify(payload),
+        });
+        const json = (await res.json()) as { id?: string; recipients?: number; errors?: unknown };
+        if (!res.ok) {
+          console.error("[admin] push send failed:", json);
+          return c.json({ error: "Push send failed" }, 502);
+        }
+        if (!json.id) {
+          console.error("[admin] push not delivered:", json);
+          const detail = json.errors ? `: ${JSON.stringify(json.errors)}` : " (0 devices reached)";
+          return c.json({ error: `Not delivered${detail}` }, 502);
+        }
+        onesignalId = onesignalId || json.id;
+        recipients += typeof json.recipients === "number" ? json.recipients : 0;
+      }
     }
-    onesignalId = json.id ?? null;
   } catch (err) {
     console.error("[admin] push send error:", err);
     return c.json({ error: "Push send failed" }, 502);
@@ -4916,37 +5806,223 @@ admin.post("/content/push/:id/send", requireAdminPermission("content.edit"), asy
 
   await supabase
     .from("push_campaigns")
-    .update({ status: "sent", sent_at: new Date().toISOString(), onesignal_id: onesignalId })
+    .update({ status: "sent", sent_at: new Date().toISOString(), onesignal_id: onesignalId, recipients })
     .eq("id", id);
 
   void auditFromContext(c, {
     action: "content.publish",
     targetType: "content",
     targetId: id,
-    metadata: { kind: "push", onesignal_id: onesignalId },
+    metadata: { kind: "push", onesignal_id: onesignalId, recipients },
   });
-  return c.json({ success: true, onesignal_id: onesignalId });
+  return c.json({ success: true, onesignal_id: onesignalId, recipients });
+});
+
+/**
+ * GET /api/admin/content/push/estimate
+ * Live subscribed-device estimate from OneSignal, for the composer's
+ * "sends to ~N devices" line. Returns { count } (0 / null if unavailable).
+ */
+admin.get("/content/push/estimate", async (c) => {
+  const configured = !!process.env.ONESIGNAL_APP_ID && !!process.env.ONESIGNAL_REST_API_KEY;
+  // Profiles carrying a OneSignal player id. (The send dedupes to distinct
+  // devices, so actual delivered count can be lower.)
+  const supabase = createSupabaseAdmin();
+  const { count } = await supabase
+    .from("profiles")
+    .select("onesignal_player_id", { count: "exact", head: true })
+    .not("onesignal_player_id", "is", null);
+  return c.json({ count: count ?? 0, configured });
 });
 
 // ---- Email templates (Screen 17) ----
+
+// Per-template metadata that isn't stored in the DB: a display label, the CTA
+// button, and the merge tags this template supports. Also the seed content for
+// first run. Body/subject/heading are editable (and versioned) in the DB; this
+// map only seeds them and supplies the non-editable label/cta/tags.
+const EMAIL_TEMPLATE_META: Record<
+  string,
+  { label: string; cta: string; ctaUrl: string; tags: string[]; subject: string; heading: string; body: string }
+> = {
+  order_shipped: {
+    label: "Order shipped",
+    cta: "Track my order",
+    ctaUrl: "kifaayat://orders",
+    tags: ["first_name", "seller_name", "item_title", "tracking_id", "carrier"],
+    subject: "Your Kifaayat order is on its way 📦",
+    heading: "It's on the way, {first_name}!",
+    body: "Good news — {seller_name} has shipped your {item_title}. You can follow it any time from your orders.",
+  },
+  welcome: {
+    label: "Welcome · Join Kifaayat",
+    cta: "Start browsing",
+    ctaUrl: "kifaayat://home",
+    tags: ["first_name"],
+    subject: "Welcome to Kifaayat 💚",
+    heading: "Welcome, {first_name}!",
+    body: "You're all set. Discover pre-loved South Asian fashion from sellers across the community — and list your own pieces any time.",
+  },
+  payout_released: {
+    label: "Payout released",
+    cta: "View payout",
+    ctaUrl: "kifaayat://payouts",
+    tags: ["first_name", "amount", "item_title"],
+    subject: "Your payout is on the way 💸",
+    heading: "Payout released, {first_name}",
+    body: "We've released {amount} for your sale of {item_title}. It should land in your account within 1–3 business days.",
+  },
+  listing_approved: {
+    label: "Listing approved",
+    cta: "View listing",
+    ctaUrl: "kifaayat://listings",
+    tags: ["first_name", "item_title"],
+    subject: "Your listing is live ✨",
+    heading: "You're live, {first_name}!",
+    body: "Your listing {item_title} has been approved and is now visible to buyers on Kifaayat.",
+  },
+  offer_received: {
+    label: "Offer received",
+    cta: "View offer",
+    ctaUrl: "kifaayat://offers",
+    tags: ["first_name", "buyer_name", "offer_amount", "item_title"],
+    subject: "You've got a new offer 🎉",
+    heading: "New offer, {first_name}",
+    body: "{buyer_name} offered {offer_amount} for your {item_title}. Respond from the app to accept, decline, or counter.",
+  },
+};
+
+// Sample values used for the send-test and the live preview so merge tags
+// render as realistic content instead of literal {tokens}.
+const EMAIL_MERGE_SAMPLES: Record<string, string> = {
+  first_name: "Nida",
+  seller_name: "Priya Kapoor",
+  buyer_name: "Nida Khan",
+  item_title: "Emerald banarasi silk saree",
+  tracking_id: "AB1234567AU",
+  carrier: "Australia Post",
+  amount: "A$120.00",
+  offer_amount: "A$95.00",
+};
+
+// Replace {tag} single-brace merge tags with values (unknown tags left as-is).
+function substituteMergeTags(text: string, vars: Record<string, string>): string {
+  return (text || "").replace(/\{(\w+)\}/g, (m, key: string) =>
+    Object.prototype.hasOwnProperty.call(vars, key) ? vars[key] : m
+  );
+}
+
+// Branded HTML wrapper — matches the prototype's email design: emerald header
+// with a wide-tracked serif wordmark, magenta CTA, ivory footer. Scaled up from
+// the wireframe preview to inbox-appropriate sizes.
+function renderEmailHtml(opts: { heading: string; body: string; cta: string; ctaUrl: string }): string {
+  const EMERALD = "#084733";
+  const MAGENTA = "#D6258A";
+  const IVORY = "#FBF7EE";
+  const bodyHtml = opts.body
+    .split(/\n{2,}/)
+    .map((p) => `<p style="margin:0 0 16px;color:#4A5651;font-size:15px;line-height:1.6;">${p.replace(/\n/g, "<br>")}</p>`)
+    .join("");
+  return `<!DOCTYPE html><html><body style="margin:0;padding:0;background:${IVORY};font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:${IVORY};"><tr><td align="center" style="padding:24px 16px;">
+<table role="presentation" width="600" cellpadding="0" cellspacing="0" style="max-width:600px;width:100%;background:#fff;border:1px solid #E8E0D2;border-radius:9px;overflow:hidden;">
+<tr><td style="background:${EMERALD};padding:26px 32px;text-align:center;"><span style="font-family:'Belleza',Georgia,serif;color:#fff;font-size:26px;letter-spacing:0.2em;text-transform:uppercase;">Kifaayat</span></td></tr>
+<tr><td style="padding:32px 32px 12px;"><h2 style="margin:0 0 16px;color:#1F2A24;font-size:22px;font-weight:600;letter-spacing:-0.01em;">${opts.heading}</h2>${bodyHtml}
+<table role="presentation" cellpadding="0" cellspacing="0" style="margin:10px 0 6px;"><tr><td style="background:${MAGENTA};border-radius:6px;"><a href="${opts.ctaUrl}" style="display:inline-block;padding:12px 24px;color:#fff;font-size:15px;font-weight:600;text-decoration:none;">${opts.cta}</a></td></tr></table>
+</td></tr>
+<tr><td style="padding:18px 32px 24px;background:${IVORY};text-align:center;"><p style="margin:0 0 4px;color:#8A9590;font-size:13px;line-height:1.6;">Kifaayat · pre-loved South Asian fashion</p><p style="margin:0;color:#8A9590;font-size:11px;">You're receiving this because you placed an order.</p></td></tr>
+</table></td></tr></table></body></html>`;
+}
+
+// Ensure the seed templates exist (first-run). Inserts only missing keys, so
+// admin edits are never overwritten.
+async function seedEmailTemplates(supabase: ReturnType<typeof createSupabaseAdmin>) {
+  const { data: existing } = await supabase.from("email_templates").select("key");
+  const have = new Set((existing ?? []).map((r) => r.key as string));
+  const missing = Object.entries(EMAIL_TEMPLATE_META)
+    .filter(([key]) => !have.has(key))
+    .map(([key, m]) => ({ key, subject: m.subject, heading: m.heading, body: m.body }));
+  if (missing.length) {
+    await supabase.from("email_templates").insert(missing);
+  }
+}
+
 admin.get("/content/email-templates", async (c) => {
   const supabase = createSupabaseAdmin();
+  await seedEmailTemplates(supabase);
   const { data } = await supabase
     .from("email_templates")
     .select("id, key, subject, version, updated_at")
     .order("key", { ascending: true });
-  return c.json({ templates: data ?? [] });
+  const templates = (data ?? []).map((t) => ({
+    ...t,
+    label: EMAIL_TEMPLATE_META[t.key as string]?.label ?? (t.key as string),
+  }));
+  return c.json({ templates });
 });
 
 admin.get("/content/email-templates/:key", async (c) => {
+  const key = c.req.param("key");
   const supabase = createSupabaseAdmin();
+  await seedEmailTemplates(supabase);
   const { data, error } = await supabase
     .from("email_templates")
     .select("*")
-    .eq("key", c.req.param("key"))
+    .eq("key", key)
     .maybeSingle();
   if (error) return c.json({ error: "Failed to load template" }, 500);
-  return c.json({ template: data });
+  const meta = EMAIL_TEMPLATE_META[key];
+  return c.json({
+    template: data
+      ? { ...data, label: meta?.label ?? key, cta: meta?.cta ?? "Open Kifaayat", tags: meta?.tags ?? [] }
+      : null,
+  });
+});
+
+// Send a test email to the current admin (or an override address), rendering
+// the template with sample merge values through the branded wrapper.
+admin.post("/content/email-templates/:key/test", requireAdminPermission("content.edit"), async (c) => {
+  const key = c.req.param("key");
+  const supabase = createSupabaseAdmin();
+  const parsed = z
+    .object({
+      subject: z.string().min(1).max(300),
+      heading: z.string().max(300).optional(),
+      body: z.string().min(1),
+      to: z.string().email().optional(),
+    })
+    .safeParse(await c.req.json().catch(() => ({})));
+  if (!parsed.success) {
+    return c.json({ error: "Validation failed", details: parsed.error.flatten().fieldErrors }, 400);
+  }
+
+  // TEMP: admin accounts are dummy emails during testing, so route test sends to
+  // a known inbox. Override with `to` in the body, else fall back to admin email.
+  const TEST_RECIPIENT = "arathi481@gmail.com";
+  const to = parsed.data.to || TEST_RECIPIENT || (c.get("adminEmail") as string | undefined);
+  if (!to) return c.json({ error: "No recipient — your admin account has no email on file" }, 400);
+
+  const meta = EMAIL_TEMPLATE_META[key];
+  const subject = `[TEST] ${substituteMergeTags(parsed.data.subject, EMAIL_MERGE_SAMPLES)}`;
+  const html = renderEmailHtml({
+    heading: substituteMergeTags(parsed.data.heading || "", EMAIL_MERGE_SAMPLES),
+    body: substituteMergeTags(parsed.data.body, EMAIL_MERGE_SAMPLES),
+    cta: meta?.cta ?? "Open Kifaayat",
+    ctaUrl: meta?.ctaUrl ?? "kifaayat://home",
+  });
+
+  const sent = await sendEmail({ to, subject, html });
+  if (!sent) {
+    return c.json({ error: "Send failed — check RESEND_API_KEY / from-domain verification" }, 502);
+  }
+
+  void auditFromContext(c, {
+    action: "content.publish",
+    targetType: "content",
+    targetId: key,
+    metadata: { kind: "email_template_test", to },
+  });
+  return c.json({ success: true, to, id: sent.id });
 });
 
 admin.put("/content/email-templates/:key", requireAdminPermission("content.edit"), async (c) => {
@@ -5074,8 +6150,59 @@ admin.post("/content/email-templates/:key/rollback", requireAdminPermission("con
 });
 
 // ---- Website / help pages (Screen 18) ----
+
+// Canonical marketing/help pages (matches the prototype's Page dropdown). Seeded
+// on first load so the admin has something to edit; the website renders these by
+// slug at /p/<slug> once published. Insert-only, never overwrites admin edits.
+const WEBSITE_PAGE_SEED: Array<{ slug: string; title: string; body_md: string }> = [
+  {
+    slug: "how-selling-works",
+    title: "How selling on Kifaayat works",
+    body_md:
+      "## List in minutes\nSnap a few photos and our AI fills in the details — you just confirm.\n\n## Get paid safely\nFunds release 10 days after delivery, straight to Stripe, PayPal or Wise.\n\n## We're not authenticators\nFor designer pieces, attach your proof of purchase so buyers can shop with confidence.",
+  },
+  {
+    slug: "how-buying-works",
+    title: "How buying on Kifaayat works",
+    body_md:
+      "## Find your piece\nBrowse pre-loved South Asian fashion from sellers across the community.\n\n## Buy with confidence\nYour payment is held securely until you've received your order.\n\n## Make an offer\nNot quite the right price? Send the seller an offer right from the listing.",
+  },
+  {
+    slug: "about",
+    title: "About Kifaayat",
+    body_md:
+      "## Pre-loved, re-loved\nKifaayat is a marketplace for pre-loved South Asian fashion — giving beautiful pieces a second life.\n\n## Built for the community\nFrom bridal lehengas to everyday kurtas, buy and sell with people who value the craft.",
+  },
+  {
+    slug: "authentication-policy",
+    title: "Authentication policy",
+    body_md:
+      "## We're not professional authenticators\nKifaayat does not independently authenticate designer items.\n\n## Proof of purchase\nFor designer listings we ask sellers to attach proof of purchase so buyers can shop with confidence.",
+  },
+  {
+    slug: "returns-refunds",
+    title: "Returns & refunds",
+    body_md:
+      "## Item not as described\nIf your item arrives significantly not as described, open a dispute within 48 hours of delivery.\n\n## How refunds work\nApproved refunds are returned to your original payment method once the item is back with the seller.",
+  },
+  {
+    slug: "faq",
+    title: "Frequently asked questions",
+    body_md:
+      "## How do payouts work?\nFunds release 10 days after delivery, straight to Stripe, PayPal or Wise.\n\n## Is my payment protected?\nYes — we hold your payment securely until your order is confirmed delivered.",
+  },
+];
+
+async function seedWebsitePages(supabase: ReturnType<typeof createSupabaseAdmin>) {
+  const { data: existing } = await supabase.from("website_pages").select("slug");
+  const have = new Set((existing ?? []).map((r) => r.slug as string));
+  const missing = WEBSITE_PAGE_SEED.filter((p) => !have.has(p.slug));
+  if (missing.length) await supabase.from("website_pages").insert(missing);
+}
+
 admin.get("/content/pages", async (c) => {
   const supabase = createSupabaseAdmin();
+  await seedWebsitePages(supabase);
   const { data } = await supabase
     .from("website_pages")
     .select("id, slug, title, status, version, published_at, updated_at")
@@ -5176,6 +6303,13 @@ admin.get("/content/blog", async (c) => {
     .order("created_at", { ascending: false })
     .limit(200);
   return c.json({ posts: data ?? [] });
+});
+
+admin.get("/content/blog/:id", async (c) => {
+  const supabase = createSupabaseAdmin();
+  const { data } = await supabase.from("blog_posts").select("*").eq("id", c.req.param("id")).maybeSingle();
+  if (!data) return c.json({ error: "Post not found" }, 404);
+  return c.json({ post: data });
 });
 
 admin.post("/content/blog", requireAdminPermission("content.edit"), async (c) => {
@@ -5497,14 +6631,38 @@ admin.get("/team", async (c) => {
   const supabase = createSupabaseAdmin();
   const { data, error } = await supabase
     .from("admin_users")
-    .select("id, email, role, status, two_factor_enabled, invited_by, created_at, last_login_at")
+    .select("id, email, role, status, two_factor_enabled, invited_by, created_at, last_login_at, supabase_user_id")
     .order("created_at", { ascending: true });
   if (error) {
     console.error("Error loading team:", error);
     return c.json({ error: "Failed to load team" }, 500);
   }
+
+  // The admin_users.two_factor_enabled / last_login_at columns are never
+  // populated — the source of truth lives in Supabase Auth. Enrich each member
+  // with their REAL verified-MFA state and last sign-in. One getUserById per
+  // member; the admin team is small so this stays cheap.
+  const members = await Promise.all(
+    (data ?? []).map(async (m) => {
+      const { supabase_user_id, ...rest } = m as typeof m & { supabase_user_id?: string };
+      let two_factor_enabled = false;
+      let last_login_at = (m.last_login_at as string | null) ?? null;
+      if (supabase_user_id) {
+        try {
+          const { data: u } = await supabase.auth.admin.getUserById(supabase_user_id);
+          const factors = (u?.user?.factors ?? []) as Array<{ status?: string }>;
+          two_factor_enabled = factors.some((f) => f.status === "verified");
+          last_login_at = u?.user?.last_sign_in_at ?? last_login_at;
+        } catch {
+          /* fall back to stored values on lookup failure */
+        }
+      }
+      return { ...rest, two_factor_enabled, last_login_at };
+    })
+  );
+
   return c.json({
-    members: data ?? [],
+    members,
     permissions: ADMIN_PERMISSIONS,
     role_matrix: ROLE_PERMISSIONS,
   });
@@ -5529,42 +6687,51 @@ admin.post("/team/invite", requireAdminPermission("team.manage"), async (c) => {
 
   const email = parsed.data.email.toLowerCase();
 
-  // Create (or find) the Supabase Auth user so they can actually log in.
-  // inviteUserByEmail emails them a link to set a password. redirectTo makes
-  // the link land on the admin FE's accept-invite page (else it falls back
-  // to Supabase's Site URL, which defaults to localhost:3000).
-  const adminAppUrl = process.env.ADMIN_APP_URL; // e.g. https://admin.kifaayat.shop
-  const inviteOpts = adminAppUrl
-    ? { redirectTo: `${adminAppUrl.replace(/\/$/, "")}/accept-invite` }
-    : undefined;
-  let supabaseUserId: string;
-  try {
-    const { data: invited, error: inviteErr } =
-      await supabase.auth.admin.inviteUserByEmail(email, inviteOpts);
-    if (inviteErr || !invited?.user) throw inviteErr ?? new Error("no user");
-    supabaseUserId = invited.user.id;
-  } catch {
-    // Already a Supabase user (e.g. they signed in before) — find them.
-    const { data: list } = await supabase.auth.admin.listUsers();
-    const existing = list?.users?.find(
-      (u) => u.email?.toLowerCase() === email
-    );
-    if (!existing) {
-      return c.json({ error: "Could not create or find the auth user" }, 500);
-    }
-    supabaseUserId = existing.id;
+  // The admin FE URL the invite link lands on. Must be allowlisted in Supabase
+  // Auth → URL Configuration → Redirect URLs, or Supabase rejects the redirect.
+  const adminAppUrl = (process.env.ADMIN_APP_URL || "").replace(/\/$/, "");
+  if (!adminAppUrl) {
+    return c.json({ error: "ADMIN_APP_URL is not configured on the server" }, 500);
   }
+  const redirectTo = `${adminAppUrl}/accept-invite`;
 
-  // Upsert by email so re-inviting a not-yet-activated member just re-sends
-  // (and refreshes their Supabase id + role) instead of erroring.
+  // Guard early: don't touch auth for an already-active member.
   const { data: existingRow } = await supabase
     .from("admin_users")
     .select("id, status")
     .ilike("email", email)
     .maybeSingle();
-
   if (existingRow && existingRow.status === "active") {
     return c.json({ error: "That email is already an active team member" }, 409);
+  }
+
+  // Does a Supabase Auth user already exist for this email?
+  const { data: list } = await supabase.auth.admin.listUsers();
+  const existingAuth = list?.users?.find((u) => u.email?.toLowerCase() === email);
+
+  // Generate a SINGLE-USE, time-limited action link WITHOUT letting Supabase
+  // send its own email — we deliver a branded link via Resend instead. 'invite'
+  // provisions a brand-new user; 'recovery' re-links an existing (pending) user
+  // so they can set a password. Either link drops a one-time session on
+  // /accept-invite where the invitee creates their password. The token is
+  // consumed on first use and expires (Supabase default ~24h), so a used or
+  // stale link can't be replayed.
+  let actionLink: string;
+  let supabaseUserId: string;
+  try {
+    const { data: gen, error: genErr } = await supabase.auth.admin.generateLink({
+      type: existingAuth ? "recovery" : "invite",
+      email,
+      options: { redirectTo },
+    });
+    if (genErr || !gen?.properties?.action_link || !gen.user) {
+      throw genErr ?? new Error("no action_link returned");
+    }
+    actionLink = gen.properties.action_link;
+    supabaseUserId = gen.user.id;
+  } catch (err) {
+    console.error("[team/invite] generateLink failed:", err);
+    return c.json({ error: "Could not generate the invite link" }, 500);
   }
 
   let data;
@@ -5600,13 +6767,37 @@ admin.post("/team/invite", requireAdminPermission("team.manage"), async (c) => {
     data = ins;
   }
 
+  // Deliver the invite ourselves via Resend (branded + reliable), carrying the
+  // single-use action link. Reuses the same branded wrapper as email templates.
+  const roleLabel = parsed.data.role.charAt(0).toUpperCase() + parsed.data.role.slice(1);
+  const inviteHtml = renderEmailHtml({
+    heading: "You've been invited to Kifaayat Admin",
+    body:
+      `You've been added as ${roleLabel} on the Kifaayat admin console (${adminAppUrl}).\n\n` +
+      `Click below to set your password and get access. This link is single-use and expires in 24 hours — it stops working the moment you've set your password.`,
+    cta: "Set my password",
+    ctaUrl: actionLink,
+  });
+  const sent = await sendEmail({
+    to: email,
+    subject: "Your Kifaayat Admin invite",
+    html: inviteHtml,
+  });
+  if (!sent) {
+    // The member row exists; surface that delivery failed so the owner can retry.
+    return c.json(
+      { error: "Member saved, but the invite email failed to send — check Resend config, then re-invite.", member: data },
+      502
+    );
+  }
+
   void auditFromContext(c, {
     action: "team.invite",
     targetType: "team",
     targetId: (data as Record<string, unknown>).id as string,
-    metadata: { email: parsed.data.email, role: parsed.data.role },
+    metadata: { email: parsed.data.email, role: parsed.data.role, delivered: true },
   });
-  return c.json({ member: data }, 201);
+  return c.json({ member: data, invited_email: email }, 201);
 });
 
 /**
@@ -5662,6 +6853,40 @@ admin.post("/team/:id/disable", requireAdminPermission("team.manage"), async (c)
     metadata: { status: "disabled" },
   });
   return c.json({ member: data });
+});
+
+/**
+ * POST /api/admin/team/:id/reset-2fa  (owner only)
+ * Un-enrolls all of a member's MFA factors so they can set up two-factor again
+ * on a new device. With hard 2FA enforcement on, they'll be prompted to
+ * re-enroll on their next sign-in.
+ */
+admin.post("/team/:id/reset-2fa", requireAdminPermission("team.manage"), async (c) => {
+  const memberId = c.req.param("id");
+  const supabase = createSupabaseAdmin();
+  const { data: row } = await supabase
+    .from("admin_users")
+    .select("id, email, supabase_user_id")
+    .eq("id", memberId)
+    .maybeSingle();
+  const supabaseUserId = (row as { supabase_user_id?: string } | null)?.supabase_user_id;
+  if (!row || !supabaseUserId) return c.json({ error: "Member not found" }, 404);
+
+  const { data: u } = await supabase.auth.admin.getUserById(supabaseUserId);
+  const factors = (u?.user?.factors ?? []) as Array<{ id: string }>;
+  let removed = 0;
+  for (const f of factors) {
+    const { error } = await supabase.auth.admin.mfa.deleteFactor({ id: f.id, userId: supabaseUserId });
+    if (!error) removed++;
+  }
+
+  void auditFromContext(c, {
+    action: "team.reset_2fa",
+    targetType: "team",
+    targetId: memberId,
+    metadata: { email: (row as { email?: string }).email, factors_removed: removed },
+  });
+  return c.json({ success: true, factors_removed: removed });
 });
 
 export default admin;

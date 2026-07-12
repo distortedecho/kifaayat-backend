@@ -205,6 +205,38 @@ export async function sendMessage(
 }
 
 /**
+ * Broadcast a moderation state change for a single message on the same
+ * `conversation:<id>` channel the app already subscribes to for live messages.
+ * The app handles the `message_moderated` event to hide/restore/update a
+ * message without waiting for a poll or focus-refetch. Fire-and-forget.
+ *
+ * payload: { id, conversation_id, moderation_hidden, content? }
+ */
+export function broadcastMessageModerated(
+  conversationId: string,
+  payload: {
+    id: string;
+    conversation_id: string;
+    moderation_hidden: boolean;
+    content?: string;
+  }
+): void {
+  createSupabaseAdmin()
+    .channel(`conversation:${conversationId}`)
+    .send({
+      type: "broadcast",
+      event: "message_moderated",
+      payload,
+    })
+    .catch((err: unknown) =>
+      logger.error("conversationService.moderation_broadcast_failed", {
+        conversation_id: conversationId,
+        error: err instanceof Error ? err.message : String(err),
+      })
+    );
+}
+
+/**
  * Find-or-create the conversation between (listing, buyer, seller) and
  * post a system-style message into it as the seller. Used for order
  * lifecycle messages — e.g. "tracking added, your order is on its way."

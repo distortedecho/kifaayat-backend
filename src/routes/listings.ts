@@ -7,6 +7,8 @@ import { createSupabaseAdmin } from "../lib/supabase.js";
 import { computeRiskScore } from "../lib/risk-scoring.js";
 import { computeQualityScore } from "../lib/quality-score.js";
 import { summarizeZodError } from "../lib/validation.js";
+import { moderate } from "../lib/moderation.js";
+import { summarizeReasons } from "../lib/content-scanner.js";
 import { ACCEPTED_OFFER_PAYMENT_HOURS } from "../types/transactions.js";
 import {
   LISTING_CATEGORIES,
@@ -1745,6 +1747,7 @@ listings.get("/:id/comments", optionalClerkMiddleware, async (c) => {
       "id, listing_id, author_id, content, parent_comment_id, reply_to_comment_id, created_at, profiles!listing_comments_author_id_fkey(id, display_name, avatar_url)"
     )
     .eq("listing_id", listingId)
+    .is("hidden_at", null)
     .order("created_at", { ascending: true })
     .limit(limit + 1);
 
@@ -1796,7 +1799,8 @@ listings.get("/:id/comments/count", async (c) => {
   const { count, error } = await supabase
     .from("listing_comments")
     .select("id", { count: "exact", head: true })
-    .eq("listing_id", listingId);
+    .eq("listing_id", listingId)
+    .is("hidden_at", null);
 
   if (error) {
     return c.json({ count: 0 });
@@ -1881,6 +1885,46 @@ listings.post("/:id/comments", clerkMiddleware, requireProfile, async (c) => {
     }
   }
 
+  // Moderation gate. BLOCK content never posts (rejected + logged as a
+  // system flag so admins see the attempt); REVIEW content posts but is
+  // flagged for review; ALLOW posts clean.
+  const verdictResult = moderate(content);
+  if (verdictResult.verdict === "BLOCK") {
+    void supabase
+      .from("fraud_flags")
+      .insert({
+        entity_type: "listing_comment",
+        entity_id: null,
+        flag_type: "system",
+        status: "pending",
+        details: {
+          source: "system",
+          verdict: "BLOCK",
+          action: "rejected",
+          reasons: verdictResult.reasons,
+          summary: summarizeReasons(verdictResult.reasons),
+          content,
+          author_id: profile.id,
+          author_name: profile.display_name || null,
+          listing_id: listingId,
+          listing_title: listing.title || null,
+        },
+      })
+      .then(({ error }) => {
+        if (error) console.error("Error logging blocked comment:", error);
+      });
+    return c.json(
+      {
+        error:
+          "Your comment couldn't be posted. Keep it respectful and keep contact details on Kifaayat.",
+        blocked: true,
+      },
+      422
+    );
+  }
+
+  const isReview = verdictResult.verdict === "REVIEW";
+
   const { data: comment, error: insertError } = await supabase
     .from("listing_comments")
     .insert({
@@ -1889,6 +1933,8 @@ listings.post("/:id/comments", clerkMiddleware, requireProfile, async (c) => {
       content,
       parent_comment_id: threadRootId,
       reply_to_comment_id: tappedTargetIdResolved,
+      flagged_at: isReview ? new Date().toISOString() : null,
+      flag_source: isReview ? "auto" : null,
     })
     .select()
     .single();
@@ -1896,6 +1942,32 @@ listings.post("/:id/comments", clerkMiddleware, requireProfile, async (c) => {
   if (insertError) {
     console.error("Error creating listing comment:", insertError);
     return c.json({ error: "Failed to create comment" }, 500);
+  }
+
+  // REVIEW-tier comments post but land in the moderation queue.
+  if (isReview) {
+    void supabase
+      .from("fraud_flags")
+      .insert({
+        entity_type: "listing_comment",
+        entity_id: comment.id,
+        flag_type: "system",
+        status: "pending",
+        details: {
+          source: "system",
+          verdict: "REVIEW",
+          reasons: verdictResult.reasons,
+          summary: summarizeReasons(verdictResult.reasons),
+          content,
+          author_id: profile.id,
+          author_name: profile.display_name || null,
+          listing_id: listingId,
+          listing_title: listing.title || null,
+        },
+      })
+      .then(({ error }) => {
+        if (error) console.error("Error flagging review comment:", error);
+      });
   }
 
   // Fire-and-forget: notify relevant parties
@@ -2024,6 +2096,109 @@ listings.delete("/:id/comments/:commentId", clerkMiddleware, requireProfile, asy
 
   return c.body(null, 204);
 });
+
+/**
+ * POST /api/listings/:id/comments/:commentId/report
+ * Report a comment for moderation. Auth required. Idempotent per reporter —
+ * a user reporting the same comment twice does not create a second flag.
+ * Feeds the admin "Flagged comments (by user)" queue.
+ */
+listings.post(
+  "/:id/comments/:commentId/report",
+  clerkMiddleware,
+  requireProfile,
+  async (c) => {
+    const listingId = c.req.param("id");
+    const commentId = c.req.param("commentId");
+    const profile = c.get("profile");
+    const supabase = createSupabaseAdmin();
+
+    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (!uuidRegex.test(listingId) || !uuidRegex.test(commentId)) {
+      return c.json({ error: "Invalid ID format" }, 400);
+    }
+
+    const reportSchema = z.object({
+      reason: z.string().trim().max(500).optional(),
+    });
+    const body = await c.req.json().catch(() => ({}));
+    const parsed = reportSchema.safeParse(body);
+    if (!parsed.success) {
+      return c.json({ error: "Validation failed" }, 400);
+    }
+
+    // Confirm the comment exists on this listing.
+    const { data: comment, error: commentError } = await supabase
+      .from("listing_comments")
+      .select("id, author_id, content, listing_id")
+      .eq("id", commentId)
+      .eq("listing_id", listingId)
+      .single();
+
+    if (commentError || !comment) {
+      return c.json({ error: "Comment not found" }, 404);
+    }
+
+    // Can't report your own comment.
+    if (comment.author_id === profile.id) {
+      return c.json({ error: "You can't report your own comment" }, 400);
+    }
+
+    // Idempotency: has this reporter already flagged this comment?
+    const { data: existing } = await supabase
+      .from("fraud_flags")
+      .select("id")
+      .eq("entity_type", "listing_comment")
+      .eq("entity_id", commentId)
+      .eq("flag_type", "user_report")
+      .contains("details", { reporter_id: profile.id })
+      .maybeSingle();
+
+    if (existing) {
+      return c.json({ success: true, already_reported: true });
+    }
+
+    const { data: listingRow } = await supabase
+      .from("listings")
+      .select("title")
+      .eq("id", listingId)
+      .single();
+
+    const { error: flagError } = await supabase.from("fraud_flags").insert({
+      entity_type: "listing_comment",
+      entity_id: commentId,
+      flag_type: "user_report",
+      status: "pending",
+      details: {
+        source: "user",
+        reporter_id: profile.id,
+        reporter_name: profile.display_name || null,
+        reason: parsed.data.reason || null,
+        content: comment.content,
+        author_id: comment.author_id,
+        listing_id: listingId,
+        listing_title: listingRow?.title || null,
+      },
+    });
+
+    if (flagError) {
+      console.error("Error reporting comment:", flagError);
+      return c.json({ error: "Failed to report comment" }, 500);
+    }
+
+    // Mark the comment as user-flagged (surfaces flag_source in admin).
+    void supabase
+      .from("listing_comments")
+      .update({ flagged_at: new Date().toISOString(), flag_source: "user" })
+      .eq("id", commentId)
+      .is("hidden_at", null)
+      .then(({ error }) => {
+        if (error) console.error("Error marking comment flagged:", error);
+      });
+
+    return c.json({ success: true });
+  }
+);
 
 /**
  * GET /api/listings/:id/stats

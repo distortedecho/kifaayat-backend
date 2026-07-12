@@ -16,7 +16,7 @@ import {
 } from "../lib/notifications.js";
 import { emit } from "../lib/events.js";
 import { acceptOffer, declineOffer, OfferServiceError } from "../services/offerService.js";
-import { findContactInfo } from "../lib/validation.js";
+import { moderate } from "../lib/moderation.js";
 
 const offers = new Hono();
 
@@ -423,17 +423,28 @@ offers.post("/:id/counter", clerkMiddleware, requireProfile, async (c) => {
 
   const { amount: counterAmount, message: counterMessage } = parsed.data;
 
-  // Authoritative off-platform-contact block. Keep negotiation in-app so
+  // Authoritative moderation block. Keep negotiation in-app so
   // orders/disputes/payments stay traceable — reject counter messages that
-  // smuggle in a phone/email/social handle (the FE deterrent is bypassable).
-  const contactReason = findContactInfo(counterMessage);
-  if (contactReason) {
-    return c.json(
-      {
-        error: `For your safety, keep the conversation in Kifaayat — messages can't include ${contactReason}.`,
-      },
-      400
-    );
+  // smuggle in a phone/email/social handle, or carry abuse/threats
+  // (the FE deterrent is bypassable). REVIEW-tier text is allowed through;
+  // the message it becomes is separately scanned when it lands in the thread.
+  if (counterMessage) {
+    const modResult = moderate(counterMessage);
+    if (modResult.verdict === "BLOCK") {
+      const hasContact = modResult.reasons.some((r) =>
+        ["off_platform", "platform_name", "phone", "email", "handle", "url"].includes(
+          r.category
+        )
+      );
+      return c.json(
+        {
+          error: hasContact
+            ? "For your safety, keep the conversation in Kifaayat — messages can't include contact details."
+            : "Your message couldn't be sent. Please keep it respectful.",
+        },
+        400
+      );
+    }
   }
 
   // Fetch the offer

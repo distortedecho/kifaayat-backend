@@ -35,15 +35,18 @@ export const adminAuthMiddleware: MiddlewareHandler = async (c, next) => {
 
   try {
     const supabase = createSupabaseAdmin();
-    const claims = getJwtClaims(token);
 
-    const { data: { user }, error } = await supabase.auth.admin.getUserById(
-      claims.sub
-    );
-
+    // Verify the JWT's signature + expiry with Supabase Auth BEFORE trusting any
+    // of its claims. Decoding alone (the previous approach) would let a forged
+    // token set an arbitrary `sub` (impersonation) or `aal: aal2` (2FA bypass).
+    // getUser(token) validates the token server-side and returns the real user.
+    const { data: { user }, error } = await supabase.auth.getUser(token);
     if (error || !user) {
       return c.json({ error: "Invalid or expired token" }, 401);
     }
+    // Token is now verified — its claims (incl. `aal` for 2FA enforcement) are
+    // safe to read.
+    const claims = getJwtClaims(token);
 
     const adminEmails = (process.env.ADMIN_EMAILS || "")
       .split(",")
