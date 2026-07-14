@@ -5998,7 +5998,7 @@ admin.post("/content/email-templates/:key/test", requireAdminPermission("content
 
   // TEMP: admin accounts are dummy emails during testing, so route test sends to
   // a known inbox. Override with `to` in the body, else fall back to admin email.
-  const TEST_RECIPIENT = "arathi481@gmail.com";
+  const TEST_RECIPIENT = "devs.kifaayat@kifaayat.shop";
   const to = parsed.data.to || TEST_RECIPIENT || (c.get("adminEmail") as string | undefined);
   if (!to) return c.json({ error: "No recipient — your admin account has no email on file" }, 400);
 

@@ -11,7 +11,7 @@ import { Resend } from "resend";
 
 const testEmail = new Hono();
 
-const TEST_RECIPIENT = "arathi481@gmail.com";
+const TEST_RECIPIENT = "devs.kifaayat@kifaayat.shop";
 
 testEmail.get("/", async (c) => {
   const apiKey = process.env.RESEND_API_KEY;
